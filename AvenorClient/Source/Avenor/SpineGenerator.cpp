@@ -170,7 +170,10 @@ FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
 
     // Sampling nearby effected locations makes rotation follow effector bends.
     const float Probe = FMath::Max(100.0f, GenerationSegmentLength * 0.25f);
-    const float AheadChainage = FMath::Min(Chainage + Probe, GetMaximumChainage());
+    // Terrain and other systems may query well beyond the currently generated
+    // road blocks. Never clamp this orientation probe to the road extent:
+    // doing so reverses the tangent beyond BlocksEast and folds spine-space.
+    const float AheadChainage = Chainage + Probe;
     if (!FMath::IsNearlyEqual(AheadChainage, Chainage))
     {
         FVector Ahead;
