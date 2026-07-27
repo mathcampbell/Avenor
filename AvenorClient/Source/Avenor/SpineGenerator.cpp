@@ -228,6 +228,39 @@ FVector ASpineGenerator::GetSpineLocationAtChainage(
         + FVector::UpVector * VerticalOffset;
 }
 
+void ASpineGenerator::GetSpineSpaceForWorldLocation(
+    const FVector& WorldLocation,
+    float& OutChainage,
+    float& OutLateral,
+    float& OutVertical
+) const
+{
+    if (!GuideSpline || GuideSpline->GetSplineLength() <= KINDA_SMALL_NUMBER)
+    {
+        const FVector Local = GetActorTransform().InverseTransformPosition(
+            WorldLocation
+        );
+        OutChainage = Local.X;
+        OutLateral = Local.Y;
+        OutVertical = Local.Z;
+        return;
+    }
+
+    const float InputKey =
+        GuideSpline->FindInputKeyClosestToWorldLocation(WorldLocation);
+    const float Distance =
+        GuideSpline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+    OutChainage = Distance - StationZeroSplineDistance;
+
+    const FTransform Frame = GetSpineTransformAtChainage(OutChainage);
+    const FVector Delta = WorldLocation - Frame.GetLocation();
+    OutLateral = FVector::DotProduct(
+        Delta,
+        Frame.GetUnitAxis(EAxis::Y)
+    );
+    OutVertical = FVector::DotProduct(Delta, FVector::UpVector);
+}
+
 void ASpineGenerator::AddBox(
     UInstancedStaticMeshComponent* Component,
     const FVector& Location,
