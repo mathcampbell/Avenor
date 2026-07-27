@@ -64,6 +64,14 @@ public:
     UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
     USplineComponent* GetGuideSpline() const { return GuideSpline; }
 
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    void GetSpineSpaceForWorldLocation(
+        const FVector& WorldLocation,
+        float& OutChainage,
+        float& OutLateral,
+        float& OutVertical
+    ) const;
+
 protected:
     virtual void OnConstruction(const FTransform& Transform) override;
 
