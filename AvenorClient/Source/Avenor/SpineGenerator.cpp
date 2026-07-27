@@ -2,6 +2,7 @@
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SplineComponent.h"
 #include "Engine/StaticMesh.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -12,55 +13,35 @@ ASpineGenerator::ASpineGenerator()
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
 
-    RoadInstances =
-        CreateDefaultSubobject<UInstancedStaticMeshComponent>(
-            TEXT("RoadInstances")
-        );
-    RoadInstances->SetupAttachment(SceneRoot);
-
-    MedianInstances =
-        CreateDefaultSubobject<UInstancedStaticMeshComponent>(
-            TEXT("MedianInstances")
-        );
-    MedianInstances->SetupAttachment(SceneRoot);
-
-    PavementInstances =
-        CreateDefaultSubobject<UInstancedStaticMeshComponent>(
-            TEXT("PavementInstances")
-        );
-    PavementInstances->SetupAttachment(SceneRoot);
-
-    ParcelInstances =
-        CreateDefaultSubobject<UInstancedStaticMeshComponent>(
-            TEXT("ParcelInstances")
-        );
-    ParcelInstances->SetupAttachment(SceneRoot);
-
-    MonorailInstances =
-        CreateDefaultSubobject<UInstancedStaticMeshComponent>(
-            TEXT("MonorailInstances")
-        );
-    MonorailInstances->SetupAttachment(SceneRoot);
-
-    RoadInstances->SetCollisionEnabled(
-        ECollisionEnabled::QueryAndPhysics
+    GuideSpline = CreateDefaultSubobject<USplineComponent>(TEXT("GuideSpline"));
+    GuideSpline->SetupAttachment(SceneRoot);
+    GuideSpline->SetClosedLoop(false);
+    GuideSpline->ClearSplinePoints(false);
+    GuideSpline->AddSplinePoint(
+        FVector(-50000.0f, 0.0f, 0.0f),
+        ESplineCoordinateSpace::Local,
+        false
+    );
+    GuideSpline->AddSplinePoint(
+        FVector(50000.0f, 0.0f, 0.0f),
+        ESplineCoordinateSpace::Local,
+        true
     );
 
-    MedianInstances->SetCollisionEnabled(
-        ECollisionEnabled::QueryAndPhysics
-    );
+    auto CreateInstances = [this](const TCHAR* Name)
+    {
+        UInstancedStaticMeshComponent* Component =
+            CreateDefaultSubobject<UInstancedStaticMeshComponent>(Name);
+        Component->SetupAttachment(SceneRoot);
+        Component->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        return Component;
+    };
 
-    PavementInstances->SetCollisionEnabled(
-        ECollisionEnabled::QueryAndPhysics
-    );
-
-    ParcelInstances->SetCollisionEnabled(
-        ECollisionEnabled::QueryAndPhysics
-    );
-
-    MonorailInstances->SetCollisionEnabled(
-        ECollisionEnabled::QueryAndPhysics
-    );
+    RoadInstances = CreateInstances(TEXT("RoadInstances"));
+    MedianInstances = CreateInstances(TEXT("MedianInstances"));
+    PavementInstances = CreateInstances(TEXT("PavementInstances"));
+    ParcelInstances = CreateInstances(TEXT("ParcelInstances"));
+    MonorailInstances = CreateInstances(TEXT("MonorailInstances"));
 
     static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(
         TEXT("/Engine/BasicShapes/Cube.Cube")
@@ -69,7 +50,6 @@ ASpineGenerator::ASpineGenerator()
     if (CubeMeshFinder.Succeeded())
     {
         CubeMesh = CubeMeshFinder.Object;
-
         RoadInstances->SetStaticMesh(CubeMesh);
         MedianInstances->SetStaticMesh(CubeMesh);
         PavementInstances->SetStaticMesh(CubeMesh);
@@ -81,28 +61,194 @@ ASpineGenerator::ASpineGenerator()
 void ASpineGenerator::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-
     RebuildStrip();
+}
+
+float ASpineGenerator::GetMinimumChainage() const
+{
+    return -static_cast<float>(BlocksWest) * BlockSize;
+}
+
+float ASpineGenerator::GetMaximumChainage() const
+{
+    return static_cast<float>(BlocksEast) * BlockSize;
+}
+
+FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
+{
+    if (!GuideSpline || GuideSpline->GetSplineLength() <= KINDA_SMALL_NUMBER)
+    {
+        return GetActorTransform();
+    }
+
+    const float SplineDistance = FMath::Clamp(
+        StationZeroSplineDistance + Chainage,
+        0.0f,
+        GuideSpline->GetSplineLength()
+    );
+
+    FVector Location = GuideSpline->GetLocationAtDistanceAlongSpline(
+        SplineDistance,
+        ESplineCoordinateSpace::World
+    );
+    FVector Forward = GuideSpline->GetDirectionAtDistanceAlongSpline(
+        SplineDistance,
+        ESplineCoordinateSpace::World
+    ).GetSafeNormal();
+
+    FVector Right = FVector::CrossProduct(FVector::UpVector, Forward)
+        .GetSafeNormal();
+    if (Right.IsNearlyZero())
+    {
+        Right = FVector::RightVector;
+    }
+
+    float AppliedLateralOffset = 0.0f;
+    float AppliedVerticalOffset = 0.0f;
+
+    for (const FSpineEffector& Effector : Effectors)
+    {
+        if (!Effector.bEnabled || Effector.InfluenceRadius <= 0.0f)
+        {
+            continue;
+        }
+
+        const float NormalisedDistance =
+            FMath::Abs(Chainage - Effector.Chainage) /
+            Effector.InfluenceRadius;
+
+        if (NormalisedDistance >= 1.0f)
+        {
+            continue;
+        }
+
+        const float SmoothFalloff =
+            FMath::SmoothStep(0.0f, 1.0f, 1.0f - NormalisedDistance);
+        const float Weight = FMath::Pow(
+            SmoothFalloff,
+            FMath::Max(0.1f, Effector.FalloffExponent)
+        );
+
+        AppliedLateralOffset += Effector.LateralOffset * Weight;
+        AppliedVerticalOffset += Effector.VerticalOffset * Weight;
+    }
+
+    Location += Right * AppliedLateralOffset;
+    Location.Z += AppliedVerticalOffset;
+
+    // Sampling nearby effected locations makes rotation follow effector bends.
+    const float Probe = FMath::Max(100.0f, GenerationSegmentLength * 0.25f);
+    const float AheadChainage = FMath::Min(Chainage + Probe, GetMaximumChainage());
+    if (!FMath::IsNearlyEqual(AheadChainage, Chainage))
+    {
+        const float AheadDistance = FMath::Clamp(
+            StationZeroSplineDistance + AheadChainage,
+            0.0f,
+            GuideSpline->GetSplineLength()
+        );
+        FVector Ahead = GuideSpline->GetLocationAtDistanceAlongSpline(
+            AheadDistance,
+            ESplineCoordinateSpace::World
+        );
+        const FVector AheadBaseForward =
+            GuideSpline->GetDirectionAtDistanceAlongSpline(
+                AheadDistance,
+                ESplineCoordinateSpace::World
+            ).GetSafeNormal();
+        FVector AheadRight = FVector::CrossProduct(
+            FVector::UpVector,
+            AheadBaseForward
+        ).GetSafeNormal();
+
+        float AheadLateral = 0.0f;
+        float AheadVertical = 0.0f;
+        for (const FSpineEffector& Effector : Effectors)
+        {
+            if (!Effector.bEnabled || Effector.InfluenceRadius <= 0.0f)
+            {
+                continue;
+            }
+            const float D = FMath::Abs(AheadChainage - Effector.Chainage) /
+                Effector.InfluenceRadius;
+            if (D < 1.0f)
+            {
+                const float W = FMath::Pow(
+                    FMath::SmoothStep(0.0f, 1.0f, 1.0f - D),
+                    FMath::Max(0.1f, Effector.FalloffExponent)
+                );
+                AheadLateral += Effector.LateralOffset * W;
+                AheadVertical += Effector.VerticalOffset * W;
+            }
+        }
+        Ahead += AheadRight * AheadLateral;
+        Ahead.Z += AheadVertical;
+        Forward = (Ahead - Location).GetSafeNormal();
+    }
+
+    return FTransform(Forward.Rotation(), Location);
+}
+
+FVector ASpineGenerator::GetSpineLocationAtChainage(
+    float Chainage,
+    float LateralOffset,
+    float VerticalOffset
+) const
+{
+    const FTransform SpineTransform = GetSpineTransformAtChainage(Chainage);
+    return SpineTransform.GetLocation()
+        + SpineTransform.GetUnitAxis(EAxis::Y) * LateralOffset
+        + FVector::UpVector * VerticalOffset;
 }
 
 void ASpineGenerator::AddBox(
     UInstancedStaticMeshComponent* Component,
     const FVector& Location,
-    const FVector& Size
+    const FVector& Size,
+    const FQuat& Rotation
 )
 {
     if (!Component)
     {
         return;
     }
-
-    const FTransform BoxTransform(
-        FRotator::ZeroRotator,
-        Location,
-        Size / 100.0f
+    Component->AddInstance(
+        FTransform(Rotation, Location, Size / 100.0f),
+        true
     );
+}
 
-    Component->AddInstance(BoxTransform);
+void ASpineGenerator::AddStripSegment(
+    UInstancedStaticMeshComponent* Component,
+    float StartChainage,
+    float EndChainage,
+    float LateralOffset,
+    float CentreHeight,
+    float Width,
+    float Thickness
+)
+{
+    const FTransform Start = GetSpineTransformAtChainage(StartChainage);
+    const FTransform End = GetSpineTransformAtChainage(EndChainage);
+    FVector StartLocation = Start.GetLocation()
+        + Start.GetUnitAxis(EAxis::Y) * LateralOffset;
+    FVector EndLocation = End.GetLocation()
+        + End.GetUnitAxis(EAxis::Y) * LateralOffset;
+    StartLocation.Z += CentreHeight;
+    EndLocation.Z += CentreHeight;
+
+    const FVector Delta = EndLocation - StartLocation;
+    const float Length = Delta.Size();
+    if (Length <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    AddBox(
+        Component,
+        (StartLocation + EndLocation) * 0.5f,
+        FVector(Length, Width, Thickness),
+        Delta.Rotation().Quaternion()
+    );
 }
 
 void ASpineGenerator::RebuildStrip()
@@ -113,238 +259,99 @@ void ASpineGenerator::RebuildStrip()
     ParcelInstances->ClearInstances();
     MonorailInstances->ClearInstances();
 
-    if (!CubeMesh)
+    if (!CubeMesh || !GuideSpline)
     {
         return;
     }
 
-    const float StartX =
-        -static_cast<float>(BlocksWest) * BlockSize;
-
-    const float EndX =
-        static_cast<float>(BlocksEast) * BlockSize;
-
-    const float GeneratedLength = EndX - StartX;
-
-    if (GeneratedLength <= 0.0f)
+    const float Start = GetMinimumChainage();
+    const float End = GetMaximumChainage();
+    if (End <= Start)
     {
         return;
     }
 
-    const float CentreX = (StartX + EndX) * 0.5f;
-
-    const float HalfMedianWidth = MedianWidth * 0.5f;
-    const float HalfCarriagewayWidth = CarriagewayWidth * 0.5f;
-    const float HalfPavementWidth = PavementWidth * 0.5f;
-
-    const float CarriagewayOffset =
-        HalfMedianWidth +
-        HalfCarriagewayWidth;
-
+    const float HalfMedian = MedianWidth * 0.5f;
+    const float CarriagewayOffset = HalfMedian + CarriagewayWidth * 0.5f;
     const float PavementOffset =
-        HalfMedianWidth +
-        CarriagewayWidth +
-        HalfPavementWidth;
+        HalfMedian + CarriagewayWidth + PavementWidth * 0.5f;
+    const float HalfCorridor =
+        HalfMedian + CarriagewayWidth + PavementWidth;
 
-    const float HalfCorridorWidth =
-        HalfMedianWidth +
-        CarriagewayWidth +
-        PavementWidth;
-
-    /*
-     * Central median.
-     */
-    AddBox(
-        MedianInstances,
-        FVector(
-            CentreX,
-            0.0f,
-            RoadThickness * 0.5f
-        ),
-        FVector(
-            GeneratedLength,
-            MedianWidth,
-            RoadThickness
-        )
-    );
-
-    /*
-     * North and south carriageways.
-     */
-    AddBox(
-        RoadInstances,
-        FVector(
-            CentreX,
-            CarriagewayOffset,
-            RoadThickness * 0.5f
-        ),
-        FVector(
-            GeneratedLength,
-            CarriagewayWidth,
-            RoadThickness
-        )
-    );
-
-    AddBox(
-        RoadInstances,
-        FVector(
-            CentreX,
-            -CarriagewayOffset,
-            RoadThickness * 0.5f
-        ),
-        FVector(
-            GeneratedLength,
-            CarriagewayWidth,
-            RoadThickness
-        )
-    );
-
-    /*
-     * Five-metre pavements at the outer edges.
-     */
-    AddBox(
-        PavementInstances,
-        FVector(
-            CentreX,
-            PavementOffset,
-            PavementThickness * 0.5f
-        ),
-        FVector(
-            GeneratedLength,
-            PavementWidth,
-            PavementThickness
-        )
-    );
-
-    AddBox(
-        PavementInstances,
-        FVector(
-            CentreX,
-            -PavementOffset,
-            PavementThickness * 0.5f
-        ),
-        FVector(
-            GeneratedLength,
-            PavementWidth,
-            PavementThickness
-        )
-    );
-
-    /*
-     * The underlying 100 m parcel registry grid.
-     *
-     * Positive Y is north.
-     * Negative Y is south.
-     */
-    const float ParcelCellSize =
-        FMath::Max(100.0f, BlockSize - ParcelGridGap);
-
-    for (
-        int32 AlongIndex = -BlocksWest;
-        AlongIndex < BlocksEast;
-        ++AlongIndex
-    )
+    const float Step = FMath::Max(100.0f, GenerationSegmentLength);
+    for (float S = Start; S < End; S += Step)
     {
-        const float ParcelX =
-            (static_cast<float>(AlongIndex) + 0.5f) *
-            BlockSize;
+        const float Next = FMath::Min(S + Step, End);
+        AddStripSegment(
+            MedianInstances, S, Next, 0.0f,
+            RoadThickness * 0.5f, MedianWidth, RoadThickness
+        );
+        AddStripSegment(
+            RoadInstances, S, Next, CarriagewayOffset,
+            RoadThickness * 0.5f, CarriagewayWidth, RoadThickness
+        );
+        AddStripSegment(
+            RoadInstances, S, Next, -CarriagewayOffset,
+            RoadThickness * 0.5f, CarriagewayWidth, RoadThickness
+        );
+        AddStripSegment(
+            PavementInstances, S, Next, PavementOffset,
+            PavementThickness * 0.5f, PavementWidth, PavementThickness
+        );
+        AddStripSegment(
+            PavementInstances, S, Next, -PavementOffset,
+            PavementThickness * 0.5f, PavementWidth, PavementThickness
+        );
+        AddStripSegment(
+            MonorailInstances, S, Next, 0.0f,
+            MonorailBeamCentreHeight,
+            MonorailGuidewayWidth, MonorailBeamDepth
+        );
+    }
 
-        for (
-            int32 DepthIndex = 0;
-            DepthIndex < ParcelRowsPerSide;
-            ++DepthIndex
-        )
+    const float ParcelSize = FMath::Max(100.0f, BlockSize - ParcelGridGap);
+    for (int32 Along = -BlocksWest; Along < BlocksEast; ++Along)
+    {
+        const float Chainage = (static_cast<float>(Along) + 0.5f) * BlockSize;
+        const FTransform Spine = GetSpineTransformAtChainage(Chainage);
+        for (int32 Depth = 0; Depth < ParcelRowsPerSide; ++Depth)
         {
-            const float DistanceFromMain =
-                HalfCorridorWidth +
-                (static_cast<float>(DepthIndex) + 0.5f) *
-                BlockSize;
-
-            AddBox(
-                ParcelInstances,
-                FVector(
-                    ParcelX,
-                    DistanceFromMain,
+            const float Offset =
+                HalfCorridor + (static_cast<float>(Depth) + 0.5f) * BlockSize;
+            for (const float Side : {-1.0f, 1.0f})
+            {
+                FVector Location = GetSpineLocationAtChainage(
+                    Chainage,
+                    Side * Offset,
                     ParcelPadThickness * 0.5f
-                ),
-                FVector(
-                    ParcelCellSize,
-                    ParcelCellSize,
-                    ParcelPadThickness
-                )
-            );
-
-            AddBox(
-                ParcelInstances,
-                FVector(
-                    ParcelX,
-                    -DistanceFromMain,
-                    ParcelPadThickness * 0.5f
-                ),
-                FVector(
-                    ParcelCellSize,
-                    ParcelCellSize,
-                    ParcelPadThickness
-                )
-            );
+                );
+                AddBox(
+                    ParcelInstances,
+                    Location,
+                    FVector(ParcelSize, ParcelSize, ParcelPadThickness),
+                    Spine.GetRotation()
+                );
+            }
         }
     }
 
-    /*
-     * Temporary elevated monorail guideway.
-     */
-    AddBox(
-        MonorailInstances,
-        FVector(
-            CentreX,
-            0.0f,
-            MonorailBeamCentreHeight
-        ),
-        FVector(
-            GeneratedLength,
-            MonorailGuidewayWidth,
-            MonorailBeamDepth
-        )
+    const float SupportHeight = FMath::Max(
+        100.0f,
+        MonorailBeamCentreHeight - MonorailBeamDepth * 0.5f
     );
-
-    /*
-     * Columns rise from the median to the underside of the beam.
-     */
-    const float SupportHeight =
-        FMath::Max(
-            100.0f,
-            MonorailBeamCentreHeight -
-            MonorailBeamDepth * 0.5f
-        );
-
-    const int32 FirstSupportIndex =
-        FMath::CeilToInt(StartX / SupportSpacing);
-
-    const int32 LastSupportIndex =
-        FMath::FloorToInt(EndX / SupportSpacing);
-
-    for (
-        int32 SupportIndex = FirstSupportIndex;
-        SupportIndex <= LastSupportIndex;
-        ++SupportIndex
-    )
+    const int32 FirstSupport = FMath::CeilToInt(Start / SupportSpacing);
+    const int32 LastSupport = FMath::FloorToInt(End / SupportSpacing);
+    for (int32 Index = FirstSupport; Index <= LastSupport; ++Index)
     {
-        const float SupportX =
-            static_cast<float>(SupportIndex) *
-            SupportSpacing;
-
+        const float Chainage = static_cast<float>(Index) * SupportSpacing;
+        const FTransform Spine = GetSpineTransformAtChainage(Chainage);
+        FVector Location = Spine.GetLocation();
+        Location.Z += SupportHeight * 0.5f;
         AddBox(
             MonorailInstances,
-            FVector(
-                SupportX,
-                0.0f,
-                SupportHeight * 0.5f
-            ),
-            FVector(
-                SupportWidth,
-                SupportWidth,
-                SupportHeight
-            )
+            Location,
+            FVector(SupportWidth, SupportWidth, SupportHeight),
+            Spine.GetRotation()
         );
     }
 }
