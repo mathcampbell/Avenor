@@ -74,6 +74,49 @@ float ASpineGenerator::GetMaximumChainage() const
     return static_cast<float>(BlocksEast) * BlockSize;
 }
 
+void ASpineGenerator::GetBaseSplineFrameAtChainage(
+    float Chainage,
+    FVector& OutLocation,
+    FVector& OutForward
+) const
+{
+    const float SplineLength = GuideSpline
+        ? GuideSpline->GetSplineLength()
+        : 0.0f;
+    if (!GuideSpline || SplineLength <= KINDA_SMALL_NUMBER)
+    {
+        OutLocation = GetActorLocation() + FVector(Chainage, 0.0f, 0.0f);
+        OutForward = GetActorForwardVector();
+        return;
+    }
+
+    const float RequestedDistance = StationZeroSplineDistance + Chainage;
+    const float SampleDistance = FMath::Clamp(
+        RequestedDistance,
+        0.0f,
+        SplineLength
+    );
+    OutLocation = GuideSpline->GetLocationAtDistanceAlongSpline(
+        SampleDistance,
+        ESplineCoordinateSpace::World
+    );
+    OutForward = GuideSpline->GetDirectionAtDistanceAlongSpline(
+        SampleDistance,
+        ESplineCoordinateSpace::World
+    ).GetSafeNormal();
+
+    // Continue along the end tangent instead of collapsing every out-of-range
+    // terrain row onto the first/last spline point.
+    if (RequestedDistance < 0.0f)
+    {
+        OutLocation += OutForward * RequestedDistance;
+    }
+    else if (RequestedDistance > SplineLength)
+    {
+        OutLocation += OutForward * (RequestedDistance - SplineLength);
+    }
+}
+
 FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
 {
     if (!GuideSpline || GuideSpline->GetSplineLength() <= KINDA_SMALL_NUMBER)
@@ -81,20 +124,9 @@ FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
         return GetActorTransform();
     }
 
-    const float SplineDistance = FMath::Clamp(
-        StationZeroSplineDistance + Chainage,
-        0.0f,
-        GuideSpline->GetSplineLength()
-    );
-
-    FVector Location = GuideSpline->GetLocationAtDistanceAlongSpline(
-        SplineDistance,
-        ESplineCoordinateSpace::World
-    );
-    FVector Forward = GuideSpline->GetDirectionAtDistanceAlongSpline(
-        SplineDistance,
-        ESplineCoordinateSpace::World
-    ).GetSafeNormal();
+    FVector Location;
+    FVector Forward;
+    GetBaseSplineFrameAtChainage(Chainage, Location, Forward);
 
     FVector Right = FVector::CrossProduct(FVector::UpVector, Forward)
         .GetSafeNormal();
@@ -141,20 +173,13 @@ FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
     const float AheadChainage = FMath::Min(Chainage + Probe, GetMaximumChainage());
     if (!FMath::IsNearlyEqual(AheadChainage, Chainage))
     {
-        const float AheadDistance = FMath::Clamp(
-            StationZeroSplineDistance + AheadChainage,
-            0.0f,
-            GuideSpline->GetSplineLength()
+        FVector Ahead;
+        FVector AheadBaseForward;
+        GetBaseSplineFrameAtChainage(
+            AheadChainage,
+            Ahead,
+            AheadBaseForward
         );
-        FVector Ahead = GuideSpline->GetLocationAtDistanceAlongSpline(
-            AheadDistance,
-            ESplineCoordinateSpace::World
-        );
-        const FVector AheadBaseForward =
-            GuideSpline->GetDirectionAtDistanceAlongSpline(
-                AheadDistance,
-                ESplineCoordinateSpace::World
-            ).GetSafeNormal();
         FVector AheadRight = FVector::CrossProduct(
             FVector::UpVector,
             AheadBaseForward
