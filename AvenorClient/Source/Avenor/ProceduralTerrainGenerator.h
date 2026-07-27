@@ -41,6 +41,26 @@ public:
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain")
     void ClearGeneratedTerrain();
 
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    float GetTerrainHeightAtSpineSpace(
+        float Chainage,
+        float Lateral
+    ) const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    bool GetWaterSurfaceAtSpineSpace(
+        float Chainage,
+        float Lateral,
+        float& OutSurfaceHeight
+    ) const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    bool IsUnderwaterAtSpineSpace(
+        float Chainage,
+        float Lateral,
+        float& OutDepth
+    ) const;
+
 protected:
     virtual void OnConstruction(const FTransform& Transform) override;
 
