@@ -13,7 +13,7 @@ public class Avenor : ModuleRules
 				"CoreUObject",
 				"Engine",
 				"InputCore",
-				"ProceduralMeshComponent"
+				"Landscape"
 			}
 		);
 
