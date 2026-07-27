@@ -69,6 +69,11 @@ protected:
 
 private:
     void RebuildStrip();
+    void GetBaseSplineFrameAtChainage(
+        float Chainage,
+        FVector& OutLocation,
+        FVector& OutForward
+    ) const;
 
     void AddBox(
         UInstancedStaticMeshComponent* Component,

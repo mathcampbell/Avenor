@@ -18,10 +18,16 @@ struct FGeneratedWatercourse
     TArray<FVector2D> SpineSpacePoints;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Water")
+    TArray<float> SurfaceHeights;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Water")
     FVector2D LakeCentre = FVector2D::ZeroVector;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Water")
     float LakeRadius = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Water")
+    float LakeSurfaceHeight = 0.0f;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Water")
     float Width = 0.0f;
@@ -96,7 +102,7 @@ private:
     // Dimensions in centimetres.
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "100000.0"))
-    float Length = 400000.0f;
+    float Length = 1200000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "100000.0"))
@@ -120,7 +126,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hills",
         meta = (ClampMin = "0.0"))
-    float HillRelief = 16000.0f;
+    float HillRelief = 9000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Mountains",
         meta = (ClampMin = "0"))
@@ -132,15 +138,15 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Mountains",
         meta = (ClampMin = "1000.0"))
-    float MountainRelief = 120000.0f;
+    float MountainRelief = 80000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Water",
         meta = (ClampMin = "0", ClampMax = "8"))
     int32 RiverCount = 2;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Water",
-        meta = (ClampMin = "4", ClampMax = "32"))
-    int32 RiverControlPointCount = 10;
+        meta = (ClampMin = "8", ClampMax = "128"))
+    int32 RiverControlPointCount = 48;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Water",
         meta = (ClampMin = "500.0"))

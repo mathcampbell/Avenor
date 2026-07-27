@@ -58,7 +58,7 @@ void AProceduralTerrainGenerator::Regenerate()
                 Random.FRandRange(0.0f, AvailableDistance)
             )
         ));
-        MountainRadii.Add(Random.FRandRange(180000.0f, 420000.0f));
+        MountainRadii.Add(Random.FRandRange(600000.0f, 1200000.0f));
         MountainHeights.Add(
             MountainRelief * Random.FRandRange(0.65f, 1.25f)
         );
@@ -114,15 +114,25 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
         const float NormalisedDistance = Delta.Size() / Radius;
         if (NormalisedDistance < 1.0f)
         {
-            const float Envelope = FMath::Square(
-                1.0f - FMath::Square(NormalisedDistance)
+            // Quintic-style smooth transition: zero slope both at the
+            // foothill boundary and around the broad summit.
+            const float Envelope = 1.0f - FMath::SmoothStep(
+                0.0f,
+                1.0f,
+                NormalisedDistance
             );
-            const float RidgeNoise = 0.68f + 0.32f * FMath::Abs(
+            const float RidgeNoise = 0.85f + 0.15f * FMath::Abs(
                 FMath::PerlinNoise2D(
-                    (P + SeedOffset * (Index + 3.0f)) / 90000.0f
+                    (P + SeedOffset * (Index + 3.0f)) / 250000.0f
                 )
             );
-            Height += MountainHeights[Index] * Envelope * RidgeNoise;
+            const float DistantMountainFactor = FMath::SmoothStep(
+                MountainMinimumDistance * 0.75f,
+                MountainMinimumDistance,
+                Distance
+            );
+            Height += MountainHeights[Index] * Envelope * RidgeNoise *
+                DistantMountainFactor;
         }
     }
     return Height;
@@ -223,10 +233,7 @@ bool AProceduralTerrainGenerator::GetWaterSurfaceAtSpineSpace(
         );
         if (LakeDistance <= Watercourse.LakeRadius)
         {
-            const float LakeSurface = EvaluateBaseHeight(
-                Watercourse.LakeCentre.X,
-                Watercourse.LakeCentre.Y
-            ) - RiverCarveDepth * 0.35f;
+            const float LakeSurface = Watercourse.LakeSurfaceHeight;
             HighestSurface = FMath::Max(HighestSurface, LakeSurface);
             bFoundWater = true;
         }
@@ -241,11 +248,15 @@ bool AProceduralTerrainGenerator::GetWaterSurfaceAtSpineSpace(
             const float Distance = DistanceToSegment(Point, A, B, Alpha);
             if (Distance <= Watercourse.Width * 0.5f)
             {
-                const FVector2D Closest = FMath::Lerp(A, B, Alpha);
-                const float RiverSurface = EvaluateBaseHeight(
-                    Closest.X,
-                    Closest.Y
-                ) - RiverCarveDepth * 0.35f;
+                const float RiverSurface =
+                    Watercourse.SurfaceHeights.IsValidIndex(Index + 1)
+                    ? FMath::Lerp(
+                        Watercourse.SurfaceHeights[Index],
+                        Watercourse.SurfaceHeights[Index + 1],
+                        Alpha
+                    )
+                    : EvaluateBaseHeight(Point.X, Point.Y) -
+                        RiverCarveDepth * 0.35f;
                 HighestSurface = FMath::Max(HighestSurface, RiverSurface);
                 bFoundWater = true;
             }
@@ -311,45 +322,185 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
             Random.FRandRange(0.75f, 1.55f);
 
         const float SourceSide = RiverIndex % 2 == 0 ? 1.0f : -1.0f;
-        const float CrossingChainage = Random.FRandRange(
-            -Length * 0.42f,
-            Length * 0.42f
-        );
+        FVector2D Current = FVector2D::ZeroVector;
+        float CurrentHeight = -TNumericLimits<float>::Max();
+
+        // Pick a genuinely high source in the outer hill country.
+        for (int32 CandidateIndex = 0; CandidateIndex < 64; ++CandidateIndex)
+        {
+            const FVector2D Candidate(
+                Random.FRandRange(-Length * 0.48f, Length * 0.48f),
+                SourceSide * Random.FRandRange(
+                    HalfWidth * 0.65f,
+                    HalfWidth * 0.95f
+                )
+            );
+            const float Height = EvaluateBaseHeight(
+                Candidate.X,
+                Candidate.Y
+            );
+            if (Height > CurrentHeight)
+            {
+                Current = Candidate;
+                CurrentHeight = Height;
+            }
+        }
+
+        const float Step = FMath::Max(CellSize * 2.0f, 20000.0f);
+        FVector2D PreviousDirection(0.0f, -SourceSide);
+        TSet<FIntPoint> Visited;
 
         for (int32 PointIndex = 0;
              PointIndex < RiverControlPointCount;
              ++PointIndex)
         {
-            const float Alpha = static_cast<float>(PointIndex) /
-                static_cast<float>(RiverControlPointCount - 1);
-            const float Lateral = FMath::Lerp(
-                SourceSide * HalfWidth,
-                -SourceSide * HalfWidth,
-                Alpha
+            const FIntPoint Cell(
+                FMath::RoundToInt(Current.X / Step),
+                FMath::RoundToInt(Current.Y / Step)
             );
-            const float MeanderStrength =
-                FMath::Sin(Alpha * PI) * Length * 0.16f;
-            const float Meander =
-                FMath::Sin(
-                    Alpha * PI * Random.FRandRange(2.0f, 4.5f) +
-                    Random.FRandRange(-PI, PI)
-                ) * MeanderStrength;
-            Watercourse.SpineSpacePoints.Add(FVector2D(
-                CrossingChainage + Meander,
-                Lateral
-            ));
+            if (Visited.Contains(Cell))
+            {
+                break;
+            }
+            Visited.Add(Cell);
+
+            Watercourse.SpineSpacePoints.Add(Current);
+            const float DesiredSurface =
+                EvaluateBaseHeight(Current.X, Current.Y) -
+                RiverCarveDepth * 0.35f;
+            const float Surface = Watercourse.SurfaceHeights.IsEmpty()
+                ? DesiredSurface
+                : FMath::Min(
+                    DesiredSurface,
+                    Watercourse.SurfaceHeights.Last() - 5.0f
+                );
+            Watercourse.SurfaceHeights.Add(Surface);
+
+            if (FMath::Abs(Current.X) >= Length * 0.49f ||
+                FMath::Abs(Current.Y) >= HalfWidth * 0.98f)
+            {
+                break;
+            }
+
+            FVector2D BestPoint = Current;
+            FVector2D BestDirection = PreviousDirection;
+            float BestHeight = TNumericLimits<float>::Max();
+            float BestScore = TNumericLimits<float>::Max();
+            constexpr int32 DirectionSamples = 24;
+            for (int32 DirectionIndex = 0;
+                 DirectionIndex < DirectionSamples;
+                 ++DirectionIndex)
+            {
+                const float Angle =
+                    2.0f * PI * DirectionIndex / DirectionSamples;
+                const FVector2D Direction(
+                    FMath::Cos(Angle),
+                    FMath::Sin(Angle)
+                );
+                const FVector2D Candidate = Current + Direction * Step;
+                if (FMath::Abs(Candidate.X) > Length * 0.5f ||
+                    FMath::Abs(Candidate.Y) > HalfWidth)
+                {
+                    continue;
+                }
+                const float Height = EvaluateBaseHeight(
+                    Candidate.X,
+                    Candidate.Y
+                );
+                const float TurnPenalty =
+                    (1.0f - FVector2D::DotProduct(
+                        PreviousDirection,
+                        Direction
+                    )) * 250.0f;
+                const float Score = Height + TurnPenalty;
+                if (Score < BestScore)
+                {
+                    BestScore = Score;
+                    BestHeight = Height;
+                    BestPoint = Candidate;
+                    BestDirection = Direction;
+                }
+            }
+
+            if (BestHeight < CurrentHeight - 10.0f)
+            {
+                Current = BestPoint;
+                CurrentHeight = BestHeight;
+                PreviousDirection = BestDirection;
+                continue;
+            }
+
+            // A local depression becomes a lake. Search expanding rings for
+            // its lowest spill route, then continue the river from there.
+            FVector2D SpillPoint = Current;
+            float SpillHeight = TNumericLimits<float>::Max();
+            float SpillRadius = 0.0f;
+            for (int32 Ring = 2; Ring <= 14; ++Ring)
+            {
+                const float Radius = Step * Ring;
+                FVector2D RingBest = Current;
+                float RingBestHeight = TNumericLimits<float>::Max();
+                for (int32 Sample = 0; Sample < 32; ++Sample)
+                {
+                    const float Angle = 2.0f * PI * Sample / 32.0f;
+                    const FVector2D Candidate = Current + FVector2D(
+                        FMath::Cos(Angle),
+                        FMath::Sin(Angle)
+                    ) * Radius;
+                    if (FMath::Abs(Candidate.X) > Length * 0.5f ||
+                        FMath::Abs(Candidate.Y) > HalfWidth)
+                    {
+                        continue;
+                    }
+                    const float Height = EvaluateBaseHeight(
+                        Candidate.X,
+                        Candidate.Y
+                    );
+                    if (Height < RingBestHeight)
+                    {
+                        RingBestHeight = Height;
+                        RingBest = Candidate;
+                    }
+                }
+                if (RingBestHeight < SpillHeight)
+                {
+                    SpillHeight = RingBestHeight;
+                    SpillPoint = RingBest;
+                    SpillRadius = Radius;
+                }
+                if (RingBestHeight < CurrentHeight)
+                {
+                    break;
+                }
+            }
+
+            if (Watercourse.LakeRadius <= 0.0f)
+            {
+                Watercourse.LakeCentre = Current;
+                Watercourse.LakeRadius = FMath::Clamp(
+                    SpillRadius * 0.55f,
+                    35000.0f,
+                    180000.0f
+                );
+                Watercourse.LakeSurfaceHeight = FMath::Max(
+                    CurrentHeight,
+                    SpillHeight
+                );
+            }
+
+            if (SpillPoint.Equals(Current, Step * 0.25f))
+            {
+                break;
+            }
+            PreviousDirection = (SpillPoint - Current).GetSafeNormal();
+            Current = SpillPoint;
+            CurrentHeight = SpillHeight;
         }
 
-        const int32 LakePoint = FMath::Clamp(
-            RiverControlPointCount / 3,
-            1,
-            RiverControlPointCount - 2
-        );
-        Watercourse.LakeCentre =
-            Watercourse.SpineSpacePoints[LakePoint];
-        Watercourse.LakeRadius =
-            Random.FRandRange(45000.0f, 120000.0f);
-        Watercourses.Add(MoveTemp(Watercourse));
+        if (Watercourse.SpineSpacePoints.Num() >= 2)
+        {
+            Watercourses.Add(MoveTemp(Watercourse));
+        }
     }
 }
 
@@ -437,7 +588,10 @@ void AProceduralTerrainGenerator::BuildWaterMesh()
                 : (Point - Watercourse.SpineSpacePoints[Index - 1]).GetSafeNormal();
             const FVector2D Across(-Direction.Y, Direction.X);
             const float Height =
-                EvaluateBaseHeight(Point.X, Point.Y) - RiverCarveDepth * 0.35f;
+                Watercourse.SurfaceHeights.IsValidIndex(Index)
+                ? Watercourse.SurfaceHeights[Index]
+                : EvaluateBaseHeight(Point.X, Point.Y) -
+                    RiverCarveDepth * 0.35f;
             for (const float Side : {-1.0f, 1.0f})
             {
                 const FVector2D Edge =
@@ -462,12 +616,14 @@ void AProceduralTerrainGenerator::BuildWaterMesh()
             Triangles.Append({A, A + 3, A + 2, A, A + 1, A + 3});
         }
 
+        if (Watercourse.LakeRadius <= 0.0f)
+        {
+            continue;
+        }
+
         const int32 LakeSegments = 32;
         const int32 CentreIndex = Vertices.Num();
-        const float LakeHeight = EvaluateBaseHeight(
-            Watercourse.LakeCentre.X,
-            Watercourse.LakeCentre.Y
-        ) - RiverCarveDepth * 0.35f;
+        const float LakeHeight = Watercourse.LakeSurfaceHeight;
         Vertices.Add(GetActorTransform().InverseTransformPosition(
             SpineSpaceToWorld(
                 Watercourse.LakeCentre.X,
