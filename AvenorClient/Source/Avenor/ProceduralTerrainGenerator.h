@@ -4,9 +4,9 @@
 #include "GameFramework/Actor.h"
 #include "ProceduralTerrainGenerator.generated.h"
 
+class ALandscape;
 class ASpineGenerator;
 class UMaterialInterface;
-class UProceduralMeshComponent;
 class USceneComponent;
 
 USTRUCT(BlueprintType)
@@ -33,6 +33,14 @@ struct FGeneratedWatercourse
     float Width = 0.0f;
 };
 
+/**
+ * Generates Avenor's authored world form as a native Unreal Landscape.
+ *
+ * The class name is retained so existing level references and parcel queries
+ * survive the migration from UProceduralMeshComponent. Regeneration is an
+ * editor operation; the resulting ALandscape is saved with the map and cooks
+ * like any manually-created Landscape.
+ */
 UCLASS()
 class AVENOR_API AProceduralTerrainGenerator : public AActor
 {
@@ -67,16 +75,30 @@ public:
         float& OutDepth
     ) const;
 
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    ALandscape* GetGeneratedLandscape() const
+    {
+        return GeneratedLandscape;
+    }
+
 protected:
     virtual void OnConstruction(const FTransform& Transform) override;
 
 private:
     float EvaluateBaseHeight(float Chainage, float Lateral) const;
     float EvaluateTerrainHeight(float Chainage, float Lateral) const;
-    FVector SpineSpaceToWorld(float Chainage, float Lateral, float Height) const;
+    FVector SpineSpaceToWorld(
+        float Chainage,
+        float Lateral,
+        float Height
+    ) const;
+    void WorldToSpineSpace(
+        const FVector& WorldLocation,
+        float& OutChainage,
+        float& OutLateral
+    ) const;
     void GenerateWatercourses();
-    void BuildTerrainMesh();
-    void BuildWaterMesh();
+    void BuildLandscape();
     float DistanceToSegment(
         const FVector2D& Point,
         const FVector2D& A,
@@ -87,8 +109,8 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
 
-    UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
-    TObjectPtr<UProceduralMeshComponent> GeneratedMesh;
+    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
+    TObjectPtr<ALandscape> GeneratedLandscape;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|Terrain")
     TObjectPtr<ASpineGenerator> Spine;
@@ -96,10 +118,12 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Generation")
     int32 WorldSeed = 1847;
 
+    // Large native Landscapes should be rebuilt explicitly with Regenerate.
     UPROPERTY(EditAnywhere, Category = "Avenor|Generation")
-    bool bRegenerateOnConstruction = true;
+    bool bRegenerateOnConstruction = false;
 
-    // Dimensions in centimetres.
+    // Requested dimensions in centimetres. Actual dimensions are rounded up
+    // to whole Landscape components.
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "100000.0"))
     float Length = 1200000.0f;
@@ -108,9 +132,21 @@ private:
         meta = (ClampMin = "100000.0"))
     float HalfWidth = 1500000.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
-        meta = (ClampMin = "1000.0"))
-    float CellSize = 10000.0f;
+    // Native Landscape vertex spacing. 2000 cm gives a useful 20 m world-form
+    // grid; roads, banks and plots can add local detail without a huge base.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
+        meta = (ClampMin = "100.0"))
+    float LandscapeVertexSpacing = 2000.0f;
+
+    // 63 quads is the standard one-section Landscape component size.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
+        meta = (ClampMin = "7", ClampMax = "255"))
+    int32 LandscapeQuadsPerSection = 63;
+
+    // 400 supports approximately +/- 1,024 metres of vertical relief.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
+        meta = (ClampMin = "25.0"))
+    float LandscapeZScale = 400.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
         meta = (ClampMin = "0.0"))
@@ -137,7 +173,7 @@ private:
     float MountainMinimumDistance = 1000000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Mountains",
-        meta = (ClampMin = "1000.0"))
+        meta = (ClampMin = "0.0"))
     float MountainRelief = 80000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Water",
@@ -158,9 +194,6 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
     TObjectPtr<UMaterialInterface> TerrainMaterial;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
-    TObjectPtr<UMaterialInterface> WaterMaterial;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TArray<FGeneratedWatercourse> Watercourses;
