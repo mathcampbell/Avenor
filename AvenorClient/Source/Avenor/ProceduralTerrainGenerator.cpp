@@ -315,7 +315,8 @@ void AProceduralTerrainGenerator::BuildTerrainMesh()
             const int32 B = (X + 1) * YCount + Y;
             const int32 C = (X + 1) * YCount + Y + 1;
             const int32 D = X * YCount + Y + 1;
-            Triangles.Append({A, B, C, A, C, D});
+            // Unreal uses clockwise front-face winding. Keep terrain normals up.
+            Triangles.Append({A, C, B, A, D, C});
         }
     }
 
@@ -375,7 +376,7 @@ void AProceduralTerrainGenerator::BuildWaterMesh()
              ++Index)
         {
             const int32 A = RiverStart + Index * 2;
-            Triangles.Append({A, A + 2, A + 3, A, A + 3, A + 1});
+            Triangles.Append({A, A + 3, A + 2, A, A + 1, A + 3});
         }
 
         const int32 LakeSegments = 32;
@@ -411,8 +412,8 @@ void AProceduralTerrainGenerator::BuildWaterMesh()
         {
             Triangles.Append({
                 CentreIndex,
-                CentreIndex + 1 + Segment,
-                CentreIndex + 1 + (Segment + 1) % LakeSegments
+                CentreIndex + 1 + (Segment + 1) % LakeSegments,
+                CentreIndex + 1 + Segment
             });
         }
     }
