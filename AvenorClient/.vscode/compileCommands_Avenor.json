@@ -1,0 +1,18 @@
+[
+	{
+		"file": "D:\\Github\\Avenor\\AvenorClient\\Source\\Avenor\\Avenor.cpp",
+		"arguments": [
+			"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+			"@D:\\Github\\Avenor\\AvenorClient\\.vscode\\compileCommands_Avenor\\Avenor.0.rsp"
+		],
+		"directory": "D:\\Epic Games\\UE_5.8\\Engine\\Source"
+	},
+	{
+		"file": "D:\\Github\\Avenor\\AvenorClient\\Source\\Avenor\\SpineGenerator.cpp",
+		"arguments": [
+			"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+			"@D:\\Github\\Avenor\\AvenorClient\\.vscode\\compileCommands_Avenor\\Avenor.0.rsp"
+		],
+		"directory": "D:\\Epic Games\\UE_5.8\\Engine\\Source"
+	}
+]

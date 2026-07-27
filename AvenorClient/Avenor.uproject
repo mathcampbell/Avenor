@@ -3,6 +3,16 @@
 	"EngineAssociation": "{FE6DFDF5-49C6-8531-3768-6C88E8220D1F}",
 	"Category": "",
 	"Description": "",
+	"Modules": [
+		{
+			"Name": "Avenor",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine"
+			]
+		}
+	],
 	"Plugins": [
 		{
 			"Name": "OpenXR",
