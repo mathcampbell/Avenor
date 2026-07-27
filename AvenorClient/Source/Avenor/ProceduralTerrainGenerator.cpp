@@ -1,9 +1,9 @@
 #include "ProceduralTerrainGenerator.h"
 
-#include "ProceduralMeshComponent.h"
 #include "SpineGenerator.h"
 #include "Components/SceneComponent.h"
-#include "KismetProceduralMeshLibrary.h"
+#include "Landscape.h"
+#include "LandscapeInfo.h"
 #include "Materials/MaterialInterface.h"
 
 AProceduralTerrainGenerator::AProceduralTerrainGenerator()
@@ -12,27 +12,30 @@ AProceduralTerrainGenerator::AProceduralTerrainGenerator()
 
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
-
-    GeneratedMesh = CreateDefaultSubobject<UProceduralMeshComponent>(
-        TEXT("GeneratedMesh")
-    );
-    GeneratedMesh->SetupAttachment(SceneRoot);
-    GeneratedMesh->bUseAsyncCooking = true;
-    GeneratedMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 }
 
 void AProceduralTerrainGenerator::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    if (bRegenerateOnConstruction)
+#if WITH_EDITOR
+    if (bRegenerateOnConstruction && !IsRunningGame())
     {
         Regenerate();
     }
+#endif
 }
 
 void AProceduralTerrainGenerator::ClearGeneratedTerrain()
 {
-    GeneratedMesh->ClearAllMeshSections();
+#if WITH_EDITOR
+    if (IsValid(GeneratedLandscape))
+    {
+        GeneratedLandscape->Modify();
+        GeneratedLandscape->Destroy();
+        GeneratedLandscape = nullptr;
+    }
+#endif
+
     Watercourses.Reset();
     MountainCentres.Reset();
     MountainRadii.Reset();
@@ -41,6 +44,18 @@ void AProceduralTerrainGenerator::ClearGeneratedTerrain()
 
 void AProceduralTerrainGenerator::Regenerate()
 {
+#if WITH_EDITOR
+    if (IsRunningGame())
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Avenor Landscape can only be regenerated in the editor.")
+        );
+        return;
+    }
+
+    Modify();
     ClearGeneratedTerrain();
 
     FRandomStream Random(WorldSeed);
@@ -65,8 +80,14 @@ void AProceduralTerrainGenerator::Regenerate()
     }
 
     GenerateWatercourses();
-    BuildTerrainMesh();
-    BuildWaterMesh();
+    BuildLandscape();
+#else
+    UE_LOG(
+        LogTemp,
+        Warning,
+        TEXT("Avenor Landscape generation is editor-only.")
+    );
+#endif
 }
 
 float AProceduralTerrainGenerator::EvaluateBaseHeight(
@@ -114,8 +135,6 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
         const float NormalisedDistance = Delta.Size() / Radius;
         if (NormalisedDistance < 1.0f)
         {
-            // Quintic-style smooth transition: zero slope both at the
-            // foothill boundary and around the broad summit.
             const float Envelope = 1.0f - FMath::SmoothStep(
                 0.0f,
                 1.0f,
@@ -181,7 +200,8 @@ float AProceduralTerrainGenerator::EvaluateTerrainHeight(
             const float ValleyWidth = Watercourse.Width * 5.0f;
             if (Distance < ValleyWidth)
             {
-                const float Weight = FMath::Square(1.0f - Distance / ValleyWidth);
+                const float Weight =
+                    FMath::Square(1.0f - Distance / ValleyWidth);
                 Height -= RiverCarveDepth * Weight;
             }
         }
@@ -233,8 +253,10 @@ bool AProceduralTerrainGenerator::GetWaterSurfaceAtSpineSpace(
         );
         if (LakeDistance <= Watercourse.LakeRadius)
         {
-            const float LakeSurface = Watercourse.LakeSurfaceHeight;
-            HighestSurface = FMath::Max(HighestSurface, LakeSurface);
+            HighestSurface = FMath::Max(
+                HighestSurface,
+                Watercourse.LakeSurfaceHeight
+            );
             bFoundWater = true;
         }
 
@@ -312,6 +334,31 @@ FVector AProceduralTerrainGenerator::SpineSpaceToWorld(
     );
 }
 
+void AProceduralTerrainGenerator::WorldToSpineSpace(
+    const FVector& WorldLocation,
+    float& OutChainage,
+    float& OutLateral
+) const
+{
+    if (Spine)
+    {
+        float Vertical = 0.0f;
+        Spine->GetSpineSpaceForWorldLocation(
+            WorldLocation,
+            OutChainage,
+            OutLateral,
+            Vertical
+        );
+        return;
+    }
+
+    const FVector Local = GetActorTransform().InverseTransformPosition(
+        WorldLocation
+    );
+    OutChainage = Local.X;
+    OutLateral = Local.Y;
+}
+
 void AProceduralTerrainGenerator::GenerateWatercourses()
 {
     FRandomStream Random(WorldSeed ^ 0x6A09E667);
@@ -325,7 +372,6 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
         FVector2D Current = FVector2D::ZeroVector;
         float CurrentHeight = -TNumericLimits<float>::Max();
 
-        // Pick a genuinely high source in the outer hill country.
         for (int32 CandidateIndex = 0; CandidateIndex < 64; ++CandidateIndex)
         {
             const FVector2D Candidate(
@@ -346,7 +392,10 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
             }
         }
 
-        const float Step = FMath::Max(CellSize * 2.0f, 20000.0f);
+        const float Step = FMath::Max(
+            LandscapeVertexSpacing * 2.0f,
+            20000.0f
+        );
         FVector2D PreviousDirection(0.0f, -SourceSide);
         TSet<FIntPoint> Visited;
 
@@ -430,8 +479,6 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
                 continue;
             }
 
-            // A local depression becomes a lake. Search expanding rings for
-            // its lowest spill route, then continue the river from there.
             FVector2D SpillPoint = Current;
             float SpillHeight = TNumericLimits<float>::Max();
             float SpillRadius = 0.0f;
@@ -504,167 +551,156 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
     }
 }
 
-void AProceduralTerrainGenerator::BuildTerrainMesh()
+void AProceduralTerrainGenerator::BuildLandscape()
 {
-    const int32 XCount = FMath::Max(2, FMath::FloorToInt(Length / CellSize) + 1);
-    const int32 YCount = FMath::Max(
-        2,
-        FMath::FloorToInt((HalfWidth * 2.0f) / CellSize) + 1
+#if WITH_EDITOR
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    const int32 QuadsPerSection = FMath::Clamp(
+        LandscapeQuadsPerSection,
+        7,
+        255
+    );
+    constexpr int32 SectionsPerComponent = 1;
+    const int32 XComponents = FMath::Max(
+        1,
+        FMath::CeilToInt(
+            Length / (LandscapeVertexSpacing * QuadsPerSection)
+        )
+    );
+    const int32 YComponents = FMath::Max(
+        1,
+        FMath::CeilToInt(
+            (HalfWidth * 2.0f) /
+            (LandscapeVertexSpacing * QuadsPerSection)
+        )
+    );
+    const int32 XQuads = XComponents * QuadsPerSection;
+    const int32 YQuads = YComponents * QuadsPerSection;
+    const int32 XSize = XQuads + 1;
+    const int32 YSize = YQuads + 1;
+    const float ActualLength = XQuads * LandscapeVertexSpacing;
+    const float ActualWidth = YQuads * LandscapeVertexSpacing;
+
+    TArray<uint16> HeightData;
+    HeightData.SetNumUninitialized(XSize * YSize);
+
+    const FVector Centre = GetActorLocation();
+    const FVector LandscapeOrigin(
+        Centre.X - ActualLength * 0.5f,
+        Centre.Y - ActualWidth * 0.5f,
+        Centre.Z
     );
 
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UVs;
-    TArray<FColor> Colours;
-    TArray<FProcMeshTangent> Tangents;
-    Vertices.Reserve(XCount * YCount);
-    UVs.Reserve(XCount * YCount);
-
-    for (int32 X = 0; X < XCount; ++X)
+    for (int32 Y = 0; Y < YSize; ++Y)
     {
-        const float Chainage = -Length * 0.5f + X * CellSize;
-        for (int32 Y = 0; Y < YCount; ++Y)
+        for (int32 X = 0; X < XSize; ++X)
         {
-            const float Lateral = -HalfWidth + Y * CellSize;
-            const float Height = EvaluateTerrainHeight(Chainage, Lateral);
-            const FVector World = SpineSpaceToWorld(
-                Chainage,
-                Lateral,
-                Height
+            const FVector WorldPoint(
+                LandscapeOrigin.X + X * LandscapeVertexSpacing,
+                LandscapeOrigin.Y + Y * LandscapeVertexSpacing,
+                Centre.Z
             );
-            Vertices.Add(GetActorTransform().InverseTransformPosition(World));
-            UVs.Add(FVector2D(
-                static_cast<float>(X) / (XCount - 1),
-                static_cast<float>(Y) / (YCount - 1)
-            ));
+            float Chainage = 0.0f;
+            float Lateral = 0.0f;
+            WorldToSpineSpace(WorldPoint, Chainage, Lateral);
+            const float Height = EvaluateTerrainHeight(
+                Chainage,
+                Lateral
+            );
+            const int32 EncodedHeight = FMath::RoundToInt(
+                32768.0f + Height * 128.0f / LandscapeZScale
+            );
+            HeightData[Y * XSize + X] = static_cast<uint16>(
+                FMath::Clamp(EncodedHeight, 0, 65535)
+            );
         }
     }
 
-    for (int32 X = 0; X + 1 < XCount; ++X)
-    {
-        for (int32 Y = 0; Y + 1 < YCount; ++Y)
-        {
-            const int32 A = X * YCount + Y;
-            const int32 B = (X + 1) * YCount + Y;
-            const int32 C = (X + 1) * YCount + Y + 1;
-            const int32 D = X * YCount + Y + 1;
-            // Unreal uses clockwise front-face winding. Keep terrain normals up.
-            Triangles.Append({A, C, B, A, D, C});
-        }
-    }
-
-    UKismetProceduralMeshLibrary::CalculateTangentsForMesh(
-        Vertices, Triangles, UVs, Normals, Tangents
+    FActorSpawnParameters SpawnParameters;
+    SpawnParameters.Name = MakeUniqueObjectName(
+        World->PersistentLevel,
+        ALandscape::StaticClass(),
+        TEXT("AvenorLandscape")
     );
-    GeneratedMesh->CreateMeshSection(
-        0, Vertices, Triangles, Normals, UVs, Colours, Tangents, true
+    SpawnParameters.SpawnCollisionHandlingOverride =
+        ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    ALandscape* Landscape = World->SpawnActor<ALandscape>(
+        ALandscape::StaticClass(),
+        LandscapeOrigin,
+        FRotator::ZeroRotator,
+        SpawnParameters
     );
-    if (TerrainMaterial)
+    if (!Landscape)
     {
-        GeneratedMesh->SetMaterial(0, TerrainMaterial);
-    }
-}
-
-void AProceduralTerrainGenerator::BuildWaterMesh()
-{
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UVs;
-    TArray<FColor> Colours;
-    TArray<FProcMeshTangent> Tangents;
-
-    for (const FGeneratedWatercourse& Watercourse : Watercourses)
-    {
-        for (int32 Index = 0;
-             Index < Watercourse.SpineSpacePoints.Num();
-             ++Index)
-        {
-            const FVector2D Point = Watercourse.SpineSpacePoints[Index];
-            const FVector2D Direction =
-                Index + 1 < Watercourse.SpineSpacePoints.Num()
-                ? (Watercourse.SpineSpacePoints[Index + 1] - Point).GetSafeNormal()
-                : (Point - Watercourse.SpineSpacePoints[Index - 1]).GetSafeNormal();
-            const FVector2D Across(-Direction.Y, Direction.X);
-            const float Height =
-                Watercourse.SurfaceHeights.IsValidIndex(Index)
-                ? Watercourse.SurfaceHeights[Index]
-                : EvaluateBaseHeight(Point.X, Point.Y) -
-                    RiverCarveDepth * 0.35f;
-            for (const float Side : {-1.0f, 1.0f})
-            {
-                const FVector2D Edge =
-                    Point + Across * Watercourse.Width * 0.5f * Side;
-                Vertices.Add(GetActorTransform().InverseTransformPosition(
-                    SpineSpaceToWorld(Edge.X, Edge.Y, Height)
-                ));
-                UVs.Add(FVector2D(
-                    static_cast<float>(Index),
-                    Side > 0.0f ? 1.0f : 0.0f
-                ));
-            }
-        }
-
-        const int32 RiverStart = Vertices.Num() -
-            Watercourse.SpineSpacePoints.Num() * 2;
-        for (int32 Index = 0;
-             Index + 1 < Watercourse.SpineSpacePoints.Num();
-             ++Index)
-        {
-            const int32 A = RiverStart + Index * 2;
-            Triangles.Append({A, A + 3, A + 2, A, A + 1, A + 3});
-        }
-
-        if (Watercourse.LakeRadius <= 0.0f)
-        {
-            continue;
-        }
-
-        const int32 LakeSegments = 32;
-        const int32 CentreIndex = Vertices.Num();
-        const float LakeHeight = Watercourse.LakeSurfaceHeight;
-        Vertices.Add(GetActorTransform().InverseTransformPosition(
-            SpineSpaceToWorld(
-                Watercourse.LakeCentre.X,
-                Watercourse.LakeCentre.Y,
-                LakeHeight
-            )
-        ));
-        UVs.Add(FVector2D(0.5f, 0.5f));
-        for (int32 Segment = 0; Segment < LakeSegments; ++Segment)
-        {
-            const float Angle = 2.0f * PI * Segment / LakeSegments;
-            const FVector2D Edge =
-                Watercourse.LakeCentre +
-                FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) *
-                Watercourse.LakeRadius;
-            Vertices.Add(GetActorTransform().InverseTransformPosition(
-                SpineSpaceToWorld(Edge.X, Edge.Y, LakeHeight)
-            ));
-            UVs.Add(FVector2D(
-                0.5f + FMath::Cos(Angle) * 0.5f,
-                0.5f + FMath::Sin(Angle) * 0.5f
-            ));
-        }
-        for (int32 Segment = 0; Segment < LakeSegments; ++Segment)
-        {
-            Triangles.Append({
-                CentreIndex,
-                CentreIndex + 1 + (Segment + 1) % LakeSegments,
-                CentreIndex + 1 + Segment
-            });
-        }
+        UE_LOG(LogTemp, Error, TEXT("Failed to create Avenor Landscape."));
+        return;
     }
 
-    UKismetProceduralMeshLibrary::CalculateTangentsForMesh(
-        Vertices, Triangles, UVs, Normals, Tangents
+    Landscape->Modify();
+    Landscape->SetActorScale3D(FVector(
+        LandscapeVertexSpacing,
+        LandscapeVertexSpacing,
+        LandscapeZScale
+    ));
+    Landscape->bCanHaveLayersContent = false;
+    Landscape->LandscapeMaterial = TerrainMaterial;
+
+    TMap<FGuid, TArray<uint16>> HeightDataPerLayers;
+    HeightDataPerLayers.Add(FGuid(), MoveTemp(HeightData));
+    TArray<FLandscapeImportLayerInfo> MaterialImportLayers;
+    TMap<FGuid, TArray<FLandscapeImportLayerInfo>>
+        MaterialLayerDataPerLayers;
+    MaterialLayerDataPerLayers.Add(
+        FGuid(),
+        MoveTemp(MaterialImportLayers)
     );
-    GeneratedMesh->CreateMeshSection(
-        1, Vertices, Triangles, Normals, UVs, Colours, Tangents, false
+
+    Landscape->Import(
+        FGuid::NewGuid(),
+        0,
+        0,
+        XQuads,
+        YQuads,
+        SectionsPerComponent,
+        QuadsPerSection,
+        HeightDataPerLayers,
+        nullptr,
+        MaterialLayerDataPerLayers,
+        ELandscapeImportAlphamapType::Additive
     );
-    if (WaterMaterial)
+
+    Landscape->StaticLightingLOD = FMath::DivideAndRoundUp(
+        FMath::CeilLogTwo(
+            (XSize * YSize) / (2048 * 2048) + 1
+        ),
+        static_cast<uint32>(2)
+    );
+    Landscape->RegisterAllComponents();
+    if (ULandscapeInfo* LandscapeInfo = Landscape->GetLandscapeInfo())
     {
-        GeneratedMesh->SetMaterial(1, WaterMaterial);
+        LandscapeInfo->UpdateLayerInfoMap(Landscape);
     }
+    Landscape->PostEditChange();
+    Landscape->SetActorLabel(TEXT("Avenor Generated Landscape"));
+    GeneratedLandscape = Landscape;
+
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT(
+            "Created native Avenor Landscape: %d x %d vertices, "
+            "%d x %d components."
+        ),
+        XSize,
+        YSize,
+        XComponents,
+        YComponents
+    );
+#endif
 }
