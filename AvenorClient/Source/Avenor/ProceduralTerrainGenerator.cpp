@@ -197,6 +197,89 @@ float AProceduralTerrainGenerator::EvaluateTerrainHeight(
     return Height;
 }
 
+float AProceduralTerrainGenerator::GetTerrainHeightAtSpineSpace(
+    float Chainage,
+    float Lateral
+) const
+{
+    return EvaluateTerrainHeight(Chainage, Lateral);
+}
+
+bool AProceduralTerrainGenerator::GetWaterSurfaceAtSpineSpace(
+    float Chainage,
+    float Lateral,
+    float& OutSurfaceHeight
+) const
+{
+    const FVector2D Point(Chainage, Lateral);
+    bool bFoundWater = false;
+    float HighestSurface = -TNumericLimits<float>::Max();
+
+    for (const FGeneratedWatercourse& Watercourse : Watercourses)
+    {
+        const float LakeDistance = FVector2D::Distance(
+            Point,
+            Watercourse.LakeCentre
+        );
+        if (LakeDistance <= Watercourse.LakeRadius)
+        {
+            const float LakeSurface = EvaluateBaseHeight(
+                Watercourse.LakeCentre.X,
+                Watercourse.LakeCentre.Y
+            ) - RiverCarveDepth * 0.35f;
+            HighestSurface = FMath::Max(HighestSurface, LakeSurface);
+            bFoundWater = true;
+        }
+
+        for (int32 Index = 0;
+             Index + 1 < Watercourse.SpineSpacePoints.Num();
+             ++Index)
+        {
+            float Alpha = 0.0f;
+            const FVector2D& A = Watercourse.SpineSpacePoints[Index];
+            const FVector2D& B = Watercourse.SpineSpacePoints[Index + 1];
+            const float Distance = DistanceToSegment(Point, A, B, Alpha);
+            if (Distance <= Watercourse.Width * 0.5f)
+            {
+                const FVector2D Closest = FMath::Lerp(A, B, Alpha);
+                const float RiverSurface = EvaluateBaseHeight(
+                    Closest.X,
+                    Closest.Y
+                ) - RiverCarveDepth * 0.35f;
+                HighestSurface = FMath::Max(HighestSurface, RiverSurface);
+                bFoundWater = true;
+            }
+        }
+    }
+
+    OutSurfaceHeight = bFoundWater ? HighestSurface : 0.0f;
+    return bFoundWater;
+}
+
+bool AProceduralTerrainGenerator::IsUnderwaterAtSpineSpace(
+    float Chainage,
+    float Lateral,
+    float& OutDepth
+) const
+{
+    float SurfaceHeight = 0.0f;
+    if (!GetWaterSurfaceAtSpineSpace(
+        Chainage,
+        Lateral,
+        SurfaceHeight
+    ))
+    {
+        OutDepth = 0.0f;
+        return false;
+    }
+
+    OutDepth = FMath::Max(
+        0.0f,
+        SurfaceHeight - EvaluateTerrainHeight(Chainage, Lateral)
+    );
+    return OutDepth > 1.0f;
+}
+
 FVector AProceduralTerrainGenerator::SpineSpaceToWorld(
     float Chainage,
     float Lateral,
