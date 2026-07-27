@@ -5,8 +5,37 @@
 #include "SpineGenerator.generated.h"
 
 class USceneComponent;
+class USplineComponent;
 class UStaticMesh;
 class UInstancedStaticMeshComponent;
+
+USTRUCT(BlueprintType)
+struct FSpineEffector
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
+    bool bEnabled = true;
+
+    // Signed centimetres from Station 0.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
+    float Chainage = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine",
+        meta = (ClampMin = "100.0"))
+    float InfluenceRadius = 50000.0f;
+
+    // Positive values move the spine towards local north/right.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
+    float LateralOffset = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
+    float VerticalOffset = 0.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine",
+        meta = (ClampMin = "0.1"))
+    float FalloffExponent = 2.0f;
+};
 
 UCLASS()
 class AVENOR_API ASpineGenerator : public AActor
@@ -15,6 +44,25 @@ class AVENOR_API ASpineGenerator : public AActor
 
 public:
     ASpineGenerator();
+
+    UFUNCTION(BlueprintCallable, Category = "Avenor|Spine")
+    FTransform GetSpineTransformAtChainage(float Chainage) const;
+
+    UFUNCTION(BlueprintCallable, Category = "Avenor|Spine")
+    FVector GetSpineLocationAtChainage(
+        float Chainage,
+        float LateralOffset = 0.0f,
+        float VerticalOffset = 0.0f
+    ) const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    float GetMinimumChainage() const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    float GetMaximumChainage() const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    USplineComponent* GetGuideSpline() const { return GuideSpline; }
 
 protected:
     virtual void OnConstruction(const FTransform& Transform) override;
@@ -25,11 +73,27 @@ private:
     void AddBox(
         UInstancedStaticMeshComponent* Component,
         const FVector& Location,
-        const FVector& Size
+        const FVector& Size,
+        const FQuat& Rotation = FQuat::Identity
+    );
+
+    void AddStripSegment(
+        UInstancedStaticMeshComponent* Component,
+        float StartChainage,
+        float EndChainage,
+        float LateralOffset,
+        float CentreHeight,
+        float Width,
+        float Thickness
     );
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
+
+    // Edit this spline directly for large-scale authored changes.
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Spine",
+        meta = (AllowPrivateAccess = "true"))
+    TObjectPtr<USplineComponent> GuideSpline;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TObjectPtr<UInstancedStaticMeshComponent> RoadInstances;
@@ -46,12 +110,18 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TObjectPtr<UInstancedStaticMeshComponent> MonorailInstances;
 
-    /*
-     * Generated extent.
-     *
-     * Block zero begins at Station 0 and extends east.
-     * Block minus one extends from 100 m west to Station 0.
-     */
+    // Distance along GuideSpline that represents Station 0.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Spine",
+        meta = (ClampMin = "0.0"))
+    float StationZeroSplineDistance = 50000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Spine",
+        meta = (ClampMin = "100.0"))
+    float GenerationSegmentLength = 1000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Spine")
+    TArray<FSpineEffector> Effectors;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "0"))
     int32 BlocksEast = 5;
@@ -64,30 +134,14 @@ private:
         meta = (ClampMin = "1"))
     int32 ParcelRowsPerSide = 3;
 
-    /*
-     * One base registry block: 100 metres.
-     */
     UPROPERTY(EditAnywhere, Category = "Avenor|Grid",
         meta = (ClampMin = "1000.0"))
     float BlockSize = 10000.0f;
 
-    /*
-     * A small visual separation between parcel pads.
-     * This is not yet a road or an ownership gap.
-     */
     UPROPERTY(EditAnywhere, Category = "Avenor|Grid",
         meta = (ClampMin = "0.0"))
     float ParcelGridGap = 100.0f;
 
-    /*
-     * Main cross-section:
-     *
-     * 5 m pavement
-     * 20 m carriageway
-     * 10 m median
-     * 20 m carriageway
-     * 5 m pavement
-     */
     UPROPERTY(EditAnywhere, Category = "Avenor|Main",
         meta = (ClampMin = "100.0"))
     float PavementWidth = 500.0f;
@@ -112,11 +166,6 @@ private:
         meta = (ClampMin = "1.0"))
     float ParcelPadThickness = 10.0f;
 
-    /*
-     * Temporary elevated monorail geometry.
-     *
-     * This is a placeholder guideway, not the finished train system.
-     */
     UPROPERTY(EditAnywhere, Category = "Avenor|Monorail",
         meta = (ClampMin = "300.0"))
     float MonorailBeamCentreHeight = 900.0f;
