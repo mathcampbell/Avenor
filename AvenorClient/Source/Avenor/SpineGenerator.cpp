@@ -309,28 +309,40 @@ void ASpineGenerator::RebuildStrip()
         );
     }
 
-    const float ParcelSize = FMath::Max(100.0f, BlockSize - ParcelGridGap);
-    for (int32 Along = -BlocksWest; Along < BlocksEast; ++Along)
+    if (bShowLegacyParcelPads)
     {
-        const float Chainage = (static_cast<float>(Along) + 0.5f) * BlockSize;
-        const FTransform Spine = GetSpineTransformAtChainage(Chainage);
-        for (int32 Depth = 0; Depth < ParcelRowsPerSide; ++Depth)
+        const float ParcelSize = FMath::Max(
+            100.0f,
+            BlockSize - ParcelGridGap
+        );
+        for (int32 Along = -BlocksWest; Along < BlocksEast; ++Along)
         {
-            const float Offset =
-                HalfCorridor + (static_cast<float>(Depth) + 0.5f) * BlockSize;
-            for (const float Side : {-1.0f, 1.0f})
+            const float Chainage =
+                (static_cast<float>(Along) + 0.5f) * BlockSize;
+            const FTransform Spine = GetSpineTransformAtChainage(Chainage);
+            for (int32 Depth = 0; Depth < ParcelRowsPerSide; ++Depth)
             {
-                FVector Location = GetSpineLocationAtChainage(
-                    Chainage,
-                    Side * Offset,
-                    ParcelPadThickness * 0.5f
-                );
-                AddBox(
-                    ParcelInstances,
-                    Location,
-                    FVector(ParcelSize, ParcelSize, ParcelPadThickness),
-                    Spine.GetRotation()
-                );
+                const float Offset =
+                    HalfCorridor +
+                    (static_cast<float>(Depth) + 0.5f) * BlockSize;
+                for (const float Side : {-1.0f, 1.0f})
+                {
+                    FVector Location = GetSpineLocationAtChainage(
+                        Chainage,
+                        Side * Offset,
+                        ParcelPadThickness * 0.5f
+                    );
+                    AddBox(
+                        ParcelInstances,
+                        Location,
+                        FVector(
+                            ParcelSize,
+                            ParcelSize,
+                            ParcelPadThickness
+                        ),
+                        Spine.GetRotation()
+                    );
+                }
             }
         }
     }
