@@ -13,7 +13,6 @@ public class Avenor : ModuleRules
 				"CoreUObject",
 				"Engine",
 				"InputCore",
-				"Landscape",
 				"PCG",
 				"Water"
 			}
