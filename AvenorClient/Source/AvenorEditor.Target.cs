@@ -10,6 +10,8 @@ public class AvenorEditorTarget : TargetRules
 		Type = TargetType.Editor;
 		DefaultBuildSettings = BuildSettingsVersion.V7;
 
-		ExtraModuleNames.AddRange( new string[] { "Avenor" } );
+		ExtraModuleNames.AddRange(
+			new string[] { "Avenor", "AvenorEditor" }
+		);
 	}
 }
