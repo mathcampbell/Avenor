@@ -62,6 +62,10 @@
 		{
 			"Name": "MeshTerrainMode",
 			"Enabled": true
+		},
+		{
+			"Name": "PCGToolset",
+			"Enabled": true
 		}
 	],
 	"TargetPlatforms": [
