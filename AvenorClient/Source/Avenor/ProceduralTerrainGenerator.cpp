@@ -241,6 +241,18 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
                 DistantMountainFactor;
         }
     }
+
+    // The Spine is the world datum. This puts roads/monorail at the expected
+    // authored elevation while retaining a broad, gentle development belt.
+    const float SpineReliefWeight = FMath::SmoothStep(
+        SpineLevelHalfWidth,
+        FMath::Max(
+            SpineLevelHalfWidth + 1.0f,
+            SpineLevelTransitionEnd
+        ),
+        Distance
+    );
+    Height *= SpineReliefWeight;
     return Height;
 }
 
@@ -479,12 +491,29 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
             }
         }
 
-        const float Step = FMath::Max(
+        // Guarantee a source lake feeding each generated river. Its outlet is
+        // the first river control point, so every lake has flowing drainage.
+        Watercourse.LakeCentre = Current;
+        Watercourse.LakeRadius = Random.FRandRange(50000.0f, 120000.0f);
+        Watercourse.LakeSurfaceHeight =
+            CurrentHeight - RiverCarveDepth * 0.25f;
+
+        // Scale the routing step to the world so the configured point count
+        // is sufficient to cross from the distant hills through the Spine.
+        const float MinimumCrossingStep =
+            HalfWidth /
+            FMath::Max(8.0f, RiverControlPointCount * 0.72f);
+        const float Step = FMath::Max3(
             LandscapeVertexSpacing * 2.0f,
-            20000.0f
+            20000.0f,
+            MinimumCrossingStep
         );
         FVector2D PreviousDirection(0.0f, -SourceSide);
         TSet<FIntPoint> Visited;
+        const FVector2D DrainageTarget(
+            Random.FRandRange(-Length * 0.4f, Length * 0.4f),
+            -SourceSide * HalfWidth * 0.75f
+        );
 
         for (int32 PointIndex = 0;
              PointIndex < RiverControlPointCount;
@@ -548,7 +577,13 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
                         PreviousDirection,
                         Direction
                     )) * 250.0f;
-                const float Score = Height + TurnPenalty;
+                // Terrain height remains dominant, but a broad drainage bias
+                // prevents rivers wandering forever on their source side.
+                const float DrainageBias = FVector2D::Distance(
+                    Candidate,
+                    DrainageTarget
+                ) * 0.0025f;
+                const float Score = Height + TurnPenalty + DrainageBias;
                 if (Score < BestScore)
                 {
                     BestScore = Score;
@@ -568,7 +603,6 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
 
             FVector2D SpillPoint = Current;
             float SpillHeight = TNumericLimits<float>::Max();
-            float SpillRadius = 0.0f;
             for (int32 Ring = 2; Ring <= 14; ++Ring)
             {
                 const float Radius = Step * Ring;
@@ -600,26 +634,11 @@ void AProceduralTerrainGenerator::GenerateWatercourses()
                 {
                     SpillHeight = RingBestHeight;
                     SpillPoint = RingBest;
-                    SpillRadius = Radius;
                 }
                 if (RingBestHeight < CurrentHeight)
                 {
                     break;
                 }
-            }
-
-            if (Watercourse.LakeRadius <= 0.0f)
-            {
-                Watercourse.LakeCentre = Current;
-                Watercourse.LakeRadius = FMath::Clamp(
-                    SpillRadius * 0.55f,
-                    35000.0f,
-                    180000.0f
-                );
-                Watercourse.LakeSurfaceHeight = FMath::Max(
-                    CurrentHeight,
-                    SpillHeight
-                );
             }
 
             if (SpillPoint.Equals(Current, Step * 0.25f))
