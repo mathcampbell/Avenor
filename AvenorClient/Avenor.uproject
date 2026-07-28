@@ -9,8 +9,7 @@
 			"Type": "Runtime",
 			"LoadingPhase": "Default",
 			"AdditionalDependencies": [
-				"Engine",
-				"Landscape"
+				"Engine"
 			]
 		}
 	],
@@ -45,7 +44,23 @@
 			"Enabled": true
 		},
 		{
-			"Name": "Landmass",
+			"Name": "MeshPartition",
+			"Enabled": true
+		},
+		{
+			"Name": "MeshPartitionWater",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGGeometryScriptInterop",
+			"Enabled": true
+		},
+		{
+			"Name": "PCGMeshPartitionInterop",
+			"Enabled": true
+		},
+		{
+			"Name": "MeshTerrainMode",
 			"Enabled": true
 		}
 	],

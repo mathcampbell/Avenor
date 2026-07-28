@@ -4,7 +4,6 @@
 #include "GameFramework/Actor.h"
 #include "ProceduralTerrainGenerator.generated.h"
 
-class ALandscape;
 class ASpineGenerator;
 class AWaterBody;
 class UPCGComponent;
@@ -40,9 +39,8 @@ struct FGeneratedWatercourse
  * Authoritative, deterministic world definition for Avenor.
  *
  * The legacy class name is retained so existing maps and ParcelGenerator
- * references keep loading. This actor no longer creates, imports or deletes an
- * ALandscape, Water Zone or Water Body. It owns rules and PCG entry points;
- * Unreal's native Landscape and Water systems own the actual world actors.
+ * references keep loading. This actor owns rules and PCG entry points while
+ * Mesh Partition owns the terrain geometry and compiled runtime sections.
  */
 UCLASS()
 class AVENOR_API AProceduralTerrainGenerator : public AActor
@@ -58,7 +56,7 @@ public:
 
     /**
      * Compatibility button. It cleans this actor's PCG output only; it never
-     * destroys the referenced Landscape or authored Water Bodies.
+     * destroys the referenced Mesh Terrain or authored Water Bodies.
      */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|World")
     void ClearGeneratedTerrain();
@@ -99,7 +97,7 @@ public:
     ) const;
 
     UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
-    ALandscape* GetGeneratedLandscape() const { return NativeLandscape; }
+    AActor* GetMeshTerrainActor() const { return MeshTerrainActor; }
 
     UFUNCTION(BlueprintPure, Category = "Avenor|World")
     int32 GetWorldSeed() const { return WorldSeed; }
@@ -149,16 +147,17 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
     TObjectPtr<UPCGComponent> InfrastructurePCG;
 
-    // Create one native Landscape in the editor and assign it here. It is
-    // never spawned, moved or destroyed by this actor.
+    // Create one Mesh Partition actor in Mesh Terrain Mode and assign it here.
+    // AActor intentionally avoids binding game code to the experimental
+    // plugin's rapidly changing C++ class names.
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
-    TObjectPtr<ALandscape> NativeLandscape;
+    TObjectPtr<AActor> MeshTerrainActor;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<ASpineGenerator> Spine;
 
     // Optional references to native Water Bodies produced/authored for this
-    // definition. They remain owned by the level and Water system.
+    // definition. MeshPartitionWater connects them to terrain modifiers.
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TArray<TObjectPtr<AWaterBody>> NativeWaterBodies;
 
