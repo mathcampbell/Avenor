@@ -1,10 +1,19 @@
 #include "ProceduralTerrainGenerator.h"
 
 #include "SpineGenerator.h"
+#include "Components/BoxComponent.h"
 #include "Components/SceneComponent.h"
 #include "Landscape.h"
 #include "LandscapeInfo.h"
 #include "Materials/MaterialInterface.h"
+#include "PCGComponent.h"
+#include "PCGGraph.h"
+#include "WaterBodyActor.h"
+#include "WaterBodyComponent.h"
+#include "WaterBodyLakeActor.h"
+#include "WaterBodyRiverActor.h"
+#include "WaterSplineComponent.h"
+#include "WaterZoneActor.h"
 
 AProceduralTerrainGenerator::AProceduralTerrainGenerator()
 {
@@ -12,6 +21,17 @@ AProceduralTerrainGenerator::AProceduralTerrainGenerator()
 
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
+
+    PCGBounds = CreateDefaultSubobject<UBoxComponent>(TEXT("PCGBounds"));
+    PCGBounds->SetupAttachment(SceneRoot);
+    PCGBounds->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    PCGBounds->SetHiddenInGame(true);
+
+    VegetationPCG = CreateDefaultSubobject<UPCGComponent>(
+        TEXT("VegetationPCG")
+    );
+    VegetationPCG->bIsComponentPartitioned = true;
+    VegetationPCG->bRegenerateInEditor = true;
 }
 
 void AProceduralTerrainGenerator::OnConstruction(const FTransform& Transform)
@@ -33,6 +53,21 @@ void AProceduralTerrainGenerator::ClearGeneratedTerrain()
         GeneratedLandscape->Modify();
         GeneratedLandscape->Destroy();
         GeneratedLandscape = nullptr;
+    }
+    for (AWaterBody* WaterBody : GeneratedWaterBodies)
+    {
+        if (IsValid(WaterBody))
+        {
+            WaterBody->Modify();
+            WaterBody->Destroy();
+        }
+    }
+    GeneratedWaterBodies.Reset();
+    if (IsValid(GeneratedWaterZone))
+    {
+        GeneratedWaterZone->Modify();
+        GeneratedWaterZone->Destroy();
+        GeneratedWaterZone = nullptr;
     }
 #endif
 
@@ -81,12 +116,53 @@ void AProceduralTerrainGenerator::Regenerate()
 
     GenerateWatercourses();
     BuildLandscape();
+    if (bGenerateNativeWater)
+    {
+        BuildNativeWater();
+    }
+    if (bRegenerateVegetationWithLandscape && VegetationGraph)
+    {
+        RegenerateVegetation();
+    }
 #else
     UE_LOG(
         LogTemp,
         Warning,
         TEXT("Avenor Landscape generation is editor-only.")
     );
+#endif
+}
+
+void AProceduralTerrainGenerator::RegenerateVegetation()
+{
+#if WITH_EDITOR
+    if (!VegetationPCG || !VegetationGraph)
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT(
+                "Assign a PCG Graph to Vegetation Graph before generating "
+                "Avenor vegetation."
+            )
+        );
+        return;
+    }
+
+    VegetationPCG->Seed = WorldSeed;
+    VegetationPCG->SetGraphLocal(VegetationGraph);
+    VegetationPCG->CleanupLocal(true);
+    VegetationPCG->GenerateLocal(true);
+#endif
+}
+
+void AProceduralTerrainGenerator::ClearVegetation()
+{
+#if WITH_EDITOR
+    if (VegetationPCG)
+    {
+        VegetationPCG->CleanupLocal(true);
+    }
 #endif
 }
 
@@ -597,8 +673,9 @@ void AProceduralTerrainGenerator::BuildLandscape()
     const float ActualLength = XQuads * LandscapeVertexSpacing;
     const float ActualWidth = YQuads * LandscapeVertexSpacing;
 
-    TArray<uint16> HeightData;
-    HeightData.SetNumUninitialized(XSize * YSize);
+    TArray<float> SampledHeights;
+    SampledHeights.SetNumUninitialized(XSize * YSize);
+    float MaximumAbsoluteHeight = 0.0f;
 
     const FVector Centre = GetActorLocation();
     const FVector LandscapeOrigin(
@@ -623,13 +700,32 @@ void AProceduralTerrainGenerator::BuildLandscape()
                 Chainage,
                 Lateral
             );
-            const int32 EncodedHeight = FMath::RoundToInt(
-                32768.0f + Height * 128.0f / LandscapeZScale
-            );
-            HeightData[Y * XSize + X] = static_cast<uint16>(
-                FMath::Clamp(EncodedHeight, 0, 65535)
+            SampledHeights[Y * XSize + X] = Height;
+            MaximumAbsoluteHeight = FMath::Max(
+                MaximumAbsoluteHeight,
+                FMath::Abs(Height)
             );
         }
+    }
+
+    // Choose enough vertical range for the actual generated terrain. This
+    // prevents the 16-bit height data saturating into perfectly flat summits.
+    const float RequiredZScale =
+        MaximumAbsoluteHeight * 128.0f / 32760.0f * 1.02f;
+    const float EffectiveZScale = FMath::Max(
+        LandscapeZScale,
+        RequiredZScale
+    );
+    TArray<uint16> HeightData;
+    HeightData.SetNumUninitialized(SampledHeights.Num());
+    for (int32 Index = 0; Index < SampledHeights.Num(); ++Index)
+    {
+        const int32 EncodedHeight = FMath::RoundToInt(
+            32768.0f + SampledHeights[Index] * 128.0f / EffectiveZScale
+        );
+        HeightData[Index] = static_cast<uint16>(
+                FMath::Clamp(EncodedHeight, 0, 65535)
+        );
     }
 
     FActorSpawnParameters SpawnParameters;
@@ -657,7 +753,7 @@ void AProceduralTerrainGenerator::BuildLandscape()
     Landscape->SetActorScale3D(FVector(
         LandscapeVertexSpacing,
         LandscapeVertexSpacing,
-        LandscapeZScale
+        EffectiveZScale
     ));
     Landscape->LandscapeMaterial = TerrainMaterial;
 
@@ -701,6 +797,11 @@ void AProceduralTerrainGenerator::BuildLandscape()
     Landscape->PostEditChange();
     Landscape->SetActorLabel(TEXT("Avenor Generated Landscape"));
     GeneratedLandscape = Landscape;
+    PCGBounds->SetBoxExtent(FVector(
+        ActualLength * 0.5f,
+        ActualWidth * 0.5f,
+        MaximumAbsoluteHeight + 100000.0f
+    ));
 
     UE_LOG(
         LogTemp,
@@ -714,5 +815,179 @@ void AProceduralTerrainGenerator::BuildLandscape()
         XComponents,
         YComponents
     );
+#endif
+}
+
+void AProceduralTerrainGenerator::BuildNativeWater()
+{
+#if WITH_EDITOR
+    UWorld* World = GetWorld();
+    if (!World || Watercourses.IsEmpty())
+    {
+        return;
+    }
+
+    const FVector Centre = GetActorLocation();
+    FActorSpawnParameters SpawnParameters;
+    SpawnParameters.SpawnCollisionHandlingOverride =
+        ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    GeneratedWaterZone = World->SpawnActor<AWaterZone>(
+        AWaterZone::StaticClass(),
+        Centre,
+        FRotator::ZeroRotator,
+        SpawnParameters
+    );
+    if (GeneratedWaterZone)
+    {
+        GeneratedWaterZone->SetActorLabel(
+            TEXT("Avenor Generated Water Zone")
+        );
+        if (UBoxComponent* Bounds =
+            GeneratedWaterZone->FindComponentByClass<UBoxComponent>())
+        {
+            Bounds->SetBoxExtent(FVector(
+                Length * 0.55f,
+                HalfWidth * 1.1f,
+                200000.0f
+            ));
+        }
+    }
+
+    for (int32 WaterIndex = 0;
+         WaterIndex < Watercourses.Num();
+         ++WaterIndex)
+    {
+        const FGeneratedWatercourse& Watercourse =
+            Watercourses[WaterIndex];
+
+        AWaterBodyRiver* River = World->SpawnActor<AWaterBodyRiver>(
+            AWaterBodyRiver::StaticClass(),
+            FVector::ZeroVector,
+            FRotator::ZeroRotator,
+            SpawnParameters
+        );
+        if (River)
+        {
+            River->SetActorLabel(FString::Printf(
+                TEXT("Avenor River %d"),
+                WaterIndex + 1
+            ));
+            UWaterSplineComponent* Spline = River->GetWaterSpline();
+            Spline->ClearSplinePoints(false);
+            for (int32 PointIndex = 0;
+                 PointIndex < Watercourse.SpineSpacePoints.Num();
+                 ++PointIndex)
+            {
+                const FVector2D Point =
+                    Watercourse.SpineSpacePoints[PointIndex];
+                const float Height =
+                    Watercourse.SurfaceHeights.IsValidIndex(PointIndex)
+                    ? Watercourse.SurfaceHeights[PointIndex]
+                    : EvaluateBaseHeight(Point.X, Point.Y);
+                Spline->AddSplinePoint(
+                    SpineSpaceToWorld(Point.X, Point.Y, Height),
+                    ESplineCoordinateSpace::World,
+                    false
+                );
+                Spline->SetScaleAtSplinePoint(
+                    PointIndex,
+                    FVector(
+                        1.0f,
+                        FMath::Max(1.0f, Watercourse.Width / 1000.0f),
+                        1.0f
+                    ),
+                    false
+                );
+                Spline->SetSplinePointType(
+                    PointIndex,
+                    ESplinePointType::Curve,
+                    false
+                );
+            }
+            Spline->SetClosedLoop(false, true);
+            if (UWaterBodyComponent* Component =
+                River->GetWaterBodyComponent())
+            {
+                Component->bAffectsLandscape = false;
+                if (WaterMaterial)
+                {
+                    Component->SetWaterMaterial(WaterMaterial);
+                }
+                if (GeneratedWaterZone)
+                {
+                    Component->SetWaterZoneOverride(
+                        TSoftObjectPtr<AWaterZone>(GeneratedWaterZone)
+                    );
+                }
+                Component->OnWaterBodyChanged(true, false, true);
+            }
+            GeneratedWaterBodies.Add(River);
+        }
+
+        if (Watercourse.LakeRadius <= 0.0f)
+        {
+            continue;
+        }
+
+        AWaterBodyLake* Lake = World->SpawnActor<AWaterBodyLake>(
+            AWaterBodyLake::StaticClass(),
+            FVector::ZeroVector,
+            FRotator::ZeroRotator,
+            SpawnParameters
+        );
+        if (!Lake)
+        {
+            continue;
+        }
+        Lake->SetActorLabel(FString::Printf(
+            TEXT("Avenor Lake %d"),
+            WaterIndex + 1
+        ));
+        UWaterSplineComponent* LakeSpline = Lake->GetWaterSpline();
+        LakeSpline->ClearSplinePoints(false);
+        constexpr int32 LakeSegments = 24;
+        for (int32 Segment = 0; Segment < LakeSegments; ++Segment)
+        {
+            const float Angle =
+                2.0f * PI * static_cast<float>(Segment) / LakeSegments;
+            const FVector2D Point =
+                Watercourse.LakeCentre +
+                FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) *
+                Watercourse.LakeRadius;
+            LakeSpline->AddSplinePoint(
+                SpineSpaceToWorld(
+                    Point.X,
+                    Point.Y,
+                    Watercourse.LakeSurfaceHeight
+                ),
+                ESplineCoordinateSpace::World,
+                false
+            );
+            LakeSpline->SetSplinePointType(
+                Segment,
+                ESplinePointType::Curve,
+                false
+            );
+        }
+        LakeSpline->SetClosedLoop(true, true);
+        if (UWaterBodyComponent* Component =
+            Lake->GetWaterBodyComponent())
+        {
+            Component->bAffectsLandscape = false;
+            if (WaterMaterial)
+            {
+                Component->SetWaterMaterial(WaterMaterial);
+            }
+            if (GeneratedWaterZone)
+            {
+                Component->SetWaterZoneOverride(
+                    TSoftObjectPtr<AWaterZone>(GeneratedWaterZone)
+                );
+            }
+            Component->OnWaterBodyChanged(true, false, true);
+        }
+        GeneratedWaterBodies.Add(Lake);
+    }
 #endif
 }
