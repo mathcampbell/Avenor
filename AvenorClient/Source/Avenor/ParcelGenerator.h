@@ -112,6 +112,8 @@ private:
         const FVector2D& A,
         const FVector2D& B
     );
+    void RegenerateNearSpineRoads();
+    void AddRoadEdge(const FVector2D& A, const FVector2D& B);
     FVector ToWorld(float Chainage, float Lateral, float Height) const;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
@@ -125,6 +127,9 @@ private:
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TObjectPtr<UInstancedStaticMeshComponent> UnavailableBoundaries;
+
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
+    TObjectPtr<UInstancedStaticMeshComponent> AccessRoadInstances;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<ASpineGenerator> Spine;
@@ -170,6 +175,30 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Grid",
         meta = (ClampMin = "0.0"))
     float CorridorHalfWidth = 3000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads")
+    bool bGenerateNearSpineRoads = true;
+
+    // Only road-grid the parcel rows nearest the Spine. More distant roads
+    // should be generated when development actually reaches them.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads",
+        meta = (ClampMin = "0"))
+    int32 AccessRoadRows = 1;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads",
+        meta = (ClampMin = "100.0"))
+    float AccessRoadWidth = 700.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads",
+        meta = (ClampMin = "1.0"))
+    float AccessRoadThickness = 20.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads",
+        meta = (ClampMin = "100.0"))
+    float AccessRoadSegmentLength = 1000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Roads")
+    TObjectPtr<UMaterialInterface> AccessRoadMaterial;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Analysis",
         meta = (ClampMin = "3", ClampMax = "17"))

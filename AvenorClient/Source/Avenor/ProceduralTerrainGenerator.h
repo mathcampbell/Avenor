@@ -6,7 +6,12 @@
 
 class ALandscape;
 class ASpineGenerator;
+class AWaterBody;
+class AWaterZone;
+class UBoxComponent;
 class UMaterialInterface;
+class UPCGComponent;
+class UPCGGraphInterface;
 class USceneComponent;
 
 USTRUCT(BlueprintType)
@@ -81,6 +86,12 @@ public:
         return GeneratedLandscape;
     }
 
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateVegetation();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void ClearVegetation();
+
 protected:
     virtual void OnConstruction(const FTransform& Transform) override;
 
@@ -99,6 +110,7 @@ private:
     ) const;
     void GenerateWatercourses();
     void BuildLandscape();
+    void BuildNativeWater();
     float DistanceToSegment(
         const FVector2D& Point,
         const FVector2D& A,
@@ -109,8 +121,20 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
 
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UBoxComponent> PCGBounds;
+
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGComponent> VegetationPCG;
+
     UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
     TObjectPtr<ALandscape> GeneratedLandscape;
+
+    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
+    TObjectPtr<AWaterZone> GeneratedWaterZone;
+
+    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
+    TArray<TObjectPtr<AWaterBody>> GeneratedWaterBodies;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|Terrain")
     TObjectPtr<ASpineGenerator> Spine;
@@ -121,6 +145,12 @@ private:
     // Large native Landscapes should be rebuilt explicitly with Regenerate.
     UPROPERTY(EditAnywhere, Category = "Avenor|Generation")
     bool bRegenerateOnConstruction = false;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGGraphInterface> VegetationGraph;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
+    bool bRegenerateVegetationWithLandscape = true;
 
     // Requested dimensions in centimetres. Actual dimensions are rounded up
     // to whole Landscape components.
@@ -192,8 +222,14 @@ private:
         meta = (ClampMin = "100.0"))
     float RiverCarveDepth = 1200.0f;
 
+    UPROPERTY(EditAnywhere, Category = "Avenor|Water")
+    bool bGenerateNativeWater = true;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
     TObjectPtr<UMaterialInterface> TerrainMaterial;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
+    TObjectPtr<UMaterialInterface> WaterMaterial;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TArray<FGeneratedWatercourse> Watercourses;
