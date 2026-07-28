@@ -880,14 +880,24 @@ void AProceduralTerrainGenerator::BuildNativeWater()
         const FGeneratedWatercourse& Watercourse =
             Watercourses[WaterIndex];
 
-        AWaterBodyRiver* River = World->SpawnActor<AWaterBodyRiver>(
+        AWaterBodyRiver* River = World->SpawnActorDeferred<AWaterBodyRiver>(
             AWaterBodyRiver::StaticClass(),
-            FVector::ZeroVector,
-            FRotator::ZeroRotator,
-            SpawnParameters
+            FTransform::Identity,
+            nullptr,
+            nullptr,
+            ESpawnActorCollisionHandlingMethod::AlwaysSpawn
         );
         if (River)
         {
+            // Water bodies default to landscape deformation. Disable it before
+            // FinishSpawning so they never register a Water edit-layer brush;
+            // Avenor's height generator has already carved these channels.
+            UWaterBodyComponent* Component =
+                River->GetWaterBodyComponent();
+            if (Component)
+            {
+                Component->bAffectsLandscape = false;
+            }
             River->SetActorLabel(FString::Printf(
                 TEXT("Avenor River %d"),
                 WaterIndex + 1
@@ -925,10 +935,9 @@ void AProceduralTerrainGenerator::BuildNativeWater()
                 );
             }
             Spline->SetClosedLoop(false, true);
-            if (UWaterBodyComponent* Component =
-                River->GetWaterBodyComponent())
+            River->FinishSpawning(FTransform::Identity);
+            if (Component)
             {
-                Component->bAffectsLandscape = false;
                 if (WaterMaterial)
                 {
                     Component->SetWaterMaterial(WaterMaterial);
@@ -949,15 +958,22 @@ void AProceduralTerrainGenerator::BuildNativeWater()
             continue;
         }
 
-        AWaterBodyLake* Lake = World->SpawnActor<AWaterBodyLake>(
+        AWaterBodyLake* Lake = World->SpawnActorDeferred<AWaterBodyLake>(
             AWaterBodyLake::StaticClass(),
-            FVector::ZeroVector,
-            FRotator::ZeroRotator,
-            SpawnParameters
+            FTransform::Identity,
+            nullptr,
+            nullptr,
+            ESpawnActorCollisionHandlingMethod::AlwaysSpawn
         );
         if (!Lake)
         {
             continue;
+        }
+        UWaterBodyComponent* LakeComponent =
+            Lake->GetWaterBodyComponent();
+        if (LakeComponent)
+        {
+            LakeComponent->bAffectsLandscape = false;
         }
         Lake->SetActorLabel(FString::Printf(
             TEXT("Avenor Lake %d"),
@@ -990,21 +1006,20 @@ void AProceduralTerrainGenerator::BuildNativeWater()
             );
         }
         LakeSpline->SetClosedLoop(true, true);
-        if (UWaterBodyComponent* Component =
-            Lake->GetWaterBodyComponent())
+        Lake->FinishSpawning(FTransform::Identity);
+        if (LakeComponent)
         {
-            Component->bAffectsLandscape = false;
             if (WaterMaterial)
             {
-                Component->SetWaterMaterial(WaterMaterial);
+                LakeComponent->SetWaterMaterial(WaterMaterial);
             }
             if (GeneratedWaterZone)
             {
-                Component->SetWaterZoneOverride(
+                LakeComponent->SetWaterZoneOverride(
                     TSoftObjectPtr<AWaterZone>(GeneratedWaterZone)
                 );
             }
-            Component->OnWaterBodyChanged(true, false, true);
+            LakeComponent->OnWaterBodyChanged(true, false, true);
         }
         GeneratedWaterBodies.Add(Lake);
     }
