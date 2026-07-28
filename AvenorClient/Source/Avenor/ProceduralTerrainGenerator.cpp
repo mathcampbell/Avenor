@@ -115,11 +115,11 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
     const float Detail = FMath::PerlinNoise2D(
         (WarpedP + SeedOffset * 2.41f) / 65000.0f
     );
-    const float RidgeNoise = FMath::PerlinNoise2D(
+    const float RollingRidgeNoise = FMath::PerlinNoise2D(
         (WarpedP + SeedOffset * 3.19f) / 280000.0f
     );
     const float Ridges =
-        (1.0f - FMath::Abs(RidgeNoise)) * 2.0f - 1.0f;
+        (1.0f - FMath::Abs(RollingRidgeNoise)) * 2.0f - 1.0f;
 
     const float Distance = FMath::Abs(Lateral);
     const float HillFactor = FMath::SmoothStep(
