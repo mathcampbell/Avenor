@@ -100,16 +100,26 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
         static_cast<float>(WorldSeed) * -7.91f
     );
     const FVector2D P(Chainage, Lateral);
+    const FVector2D Warp(
+        FMath::PerlinNoise2D((P + SeedOffset * 0.37f) / 850000.0f),
+        FMath::PerlinNoise2D((P + SeedOffset * 0.61f) / 850000.0f)
+    );
+    const FVector2D WarpedP = P + Warp * 140000.0f;
 
     const float Broad = FMath::PerlinNoise2D(
-        (P + SeedOffset) / 600000.0f
+        (WarpedP + SeedOffset) / 600000.0f
     );
     const float Medium = FMath::PerlinNoise2D(
-        (P + SeedOffset * 1.73f) / 180000.0f
+        (WarpedP + SeedOffset * 1.73f) / 180000.0f
     );
     const float Detail = FMath::PerlinNoise2D(
-        (P + SeedOffset * 2.41f) / 65000.0f
+        (WarpedP + SeedOffset * 2.41f) / 65000.0f
     );
+    const float RidgeNoise = FMath::PerlinNoise2D(
+        (WarpedP + SeedOffset * 3.19f) / 280000.0f
+    );
+    const float Ridges =
+        (1.0f - FMath::Abs(RidgeNoise)) * 2.0f - 1.0f;
 
     const float Distance = FMath::Abs(Lateral);
     const float HillFactor = FMath::SmoothStep(
@@ -124,9 +134,10 @@ float AProceduralTerrainGenerator::EvaluateBaseHeight(
     );
 
     float Height =
-        Broad * Relief * 0.62f +
+        Broad * Relief * 0.52f +
         Medium * Relief * 0.28f +
-        Detail * Relief * 0.10f;
+        Detail * Relief * 0.10f +
+        Ridges * Relief * 0.10f;
 
     for (int32 Index = 0; Index < MountainCentres.Num(); ++Index)
     {

@@ -246,10 +246,55 @@ void ASpineGenerator::GetSpineSpaceForWorldLocation(
         return;
     }
 
+    const float SplineLength = GuideSpline->GetSplineLength();
     const float InputKey =
         GuideSpline->FindInputKeyClosestToWorldLocation(WorldLocation);
-    const float Distance =
+    float Distance =
         GuideSpline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
+
+    // The authored guide spline can be much shorter than the generated world.
+    // Extend its end tangents for reverse lookups just as
+    // GetBaseSplineFrameAtChainage does for forward lookups. Without this,
+    // every Landscape vertex beyond an endpoint receives the same chainage,
+    // collapsing one axis of terrain noise into long flat plateaux.
+    const FVector StartLocation =
+        GuideSpline->GetLocationAtDistanceAlongSpline(
+            0.0f,
+            ESplineCoordinateSpace::World
+        );
+    const FVector StartDirection =
+        GuideSpline->GetDirectionAtDistanceAlongSpline(
+            0.0f,
+            ESplineCoordinateSpace::World
+        ).GetSafeNormal();
+    const FVector EndLocation =
+        GuideSpline->GetLocationAtDistanceAlongSpline(
+            SplineLength,
+            ESplineCoordinateSpace::World
+        );
+    const FVector EndDirection =
+        GuideSpline->GetDirectionAtDistanceAlongSpline(
+            SplineLength,
+            ESplineCoordinateSpace::World
+        ).GetSafeNormal();
+    const float BeforeStart = FVector::DotProduct(
+        WorldLocation - StartLocation,
+        StartDirection
+    );
+    const float BeyondEnd = FVector::DotProduct(
+        WorldLocation - EndLocation,
+        EndDirection
+    );
+    if (Distance <= KINDA_SMALL_NUMBER && BeforeStart < 0.0f)
+    {
+        Distance = BeforeStart;
+    }
+    else if (Distance >= SplineLength - KINDA_SMALL_NUMBER &&
+             BeyondEnd > 0.0f)
+    {
+        Distance = SplineLength + BeyondEnd;
+    }
+
     OutChainage = Distance - StationZeroSplineDistance;
 
     const FTransform Frame = GetSpineTransformAtChainage(OutChainage);
