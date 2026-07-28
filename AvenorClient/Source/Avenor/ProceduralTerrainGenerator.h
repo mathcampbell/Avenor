@@ -182,6 +182,16 @@ private:
         meta = (ClampMin = "0.0"))
     float LowlandCoreDistance = 100000.0f;
 
+    // Keep the infrastructure itself exactly on the Spine datum, then blend
+    // gradually into the natural lowland relief.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
+        meta = (ClampMin = "0.0"))
+    float SpineLevelHalfWidth = 3000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
+        meta = (ClampMin = "1.0"))
+    float SpineLevelTransitionEnd = 100000.0f;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
         meta = (ClampMin = "1000.0"))
     float LowlandTransitionEnd = 500000.0f;
