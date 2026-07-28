@@ -648,7 +648,6 @@ void AProceduralTerrainGenerator::BuildLandscape()
         LandscapeVertexSpacing,
         LandscapeZScale
     ));
-    Landscape->bCanHaveLayersContent = false;
     Landscape->LandscapeMaterial = TerrainMaterial;
 
     TMap<FGuid, TArray<uint16>> HeightDataPerLayers;
@@ -660,6 +659,7 @@ void AProceduralTerrainGenerator::BuildLandscape()
         FGuid(),
         MoveTemp(MaterialImportLayers)
     );
+    const TArray<FLandscapeLayer> ImportLayers;
 
     Landscape->Import(
         FGuid::NewGuid(),
@@ -672,7 +672,8 @@ void AProceduralTerrainGenerator::BuildLandscape()
         HeightDataPerLayers,
         nullptr,
         MaterialLayerDataPerLayers,
-        ELandscapeImportAlphamapType::Additive
+        ELandscapeImportAlphamapType::Additive,
+        TArrayView<const FLandscapeLayer>(ImportLayers)
     );
 
     Landscape->StaticLightingLOD = FMath::DivideAndRoundUp(
