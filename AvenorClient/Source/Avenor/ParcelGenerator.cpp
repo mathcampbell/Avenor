@@ -27,6 +27,10 @@ AParcelGenerator::AParcelGenerator()
     SellableBoundaries = CreateBoundaries(TEXT("SellableBoundaries"));
     ReviewBoundaries = CreateBoundaries(TEXT("ReviewBoundaries"));
     UnavailableBoundaries = CreateBoundaries(TEXT("UnavailableBoundaries"));
+    AccessRoadInstances = CreateBoundaries(TEXT("AccessRoadInstances"));
+    AccessRoadInstances->SetCollisionEnabled(
+        ECollisionEnabled::QueryAndPhysics
+    );
 
     static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(
         TEXT("/Engine/BasicShapes/Cube.Cube")
@@ -37,6 +41,141 @@ AParcelGenerator::AParcelGenerator()
         SellableBoundaries->SetStaticMesh(CubeMesh);
         ReviewBoundaries->SetStaticMesh(CubeMesh);
         UnavailableBoundaries->SetStaticMesh(CubeMesh);
+        AccessRoadInstances->SetStaticMesh(CubeMesh);
+    }
+}
+
+void AParcelGenerator::AddRoadEdge(
+    const FVector2D& A,
+    const FVector2D& B
+)
+{
+    if (!AccessRoadInstances || !Terrain)
+    {
+        return;
+    }
+
+    const float EdgeLength = FVector2D::Distance(A, B);
+    const int32 Segments = FMath::Max(
+        1,
+        FMath::CeilToInt(EdgeLength / AccessRoadSegmentLength)
+    );
+    for (int32 Index = 0; Index < Segments; ++Index)
+    {
+        const FVector2D SampleA = FMath::Lerp(
+            A,
+            B,
+            static_cast<float>(Index) / Segments
+        );
+        const FVector2D SampleB = FMath::Lerp(
+            A,
+            B,
+            static_cast<float>(Index + 1) / Segments
+        );
+        const FVector2D Midpoint = (SampleA + SampleB) * 0.5f;
+        float WaterDepth = 0.0f;
+        if (Terrain->IsUnderwaterAtSpineSpace(
+            Midpoint.X,
+            Midpoint.Y,
+            WaterDepth
+        ))
+        {
+            continue;
+        }
+
+        FVector WorldA = ToWorld(
+            SampleA.X,
+            SampleA.Y,
+            Terrain->GetTerrainHeightAtSpineSpace(SampleA.X, SampleA.Y)
+                + AccessRoadThickness * 0.5f
+        );
+        FVector WorldB = ToWorld(
+            SampleB.X,
+            SampleB.Y,
+            Terrain->GetTerrainHeightAtSpineSpace(SampleB.X, SampleB.Y)
+                + AccessRoadThickness * 0.5f
+        );
+        const FVector Delta = WorldB - WorldA;
+        if (Delta.IsNearlyZero())
+        {
+            continue;
+        }
+        AccessRoadInstances->AddInstance(
+            FTransform(
+                Delta.Rotation(),
+                (WorldA + WorldB) * 0.5f,
+                FVector(
+                    Delta.Size() / 100.0f,
+                    AccessRoadWidth / 100.0f,
+                    AccessRoadThickness / 100.0f
+                )
+            ),
+            true
+        );
+    }
+}
+
+void AParcelGenerator::RegenerateNearSpineRoads()
+{
+    AccessRoadInstances->ClearInstances();
+    if (!bGenerateNearSpineRoads || AccessRoadRows <= 0 ||
+        !Spine || !Terrain)
+    {
+        return;
+    }
+
+    if (AccessRoadMaterial)
+    {
+        AccessRoadInstances->SetMaterial(0, AccessRoadMaterial);
+    }
+    AccessRoadInstances->SetHiddenInGame(false);
+
+    const int32 Rows = FMath::Min(
+        AccessRoadRows,
+        ParcelRowsPerSide
+    );
+    const float StartChainage =
+        -static_cast<float>(BlocksWest) * BlockSize;
+    const float EndChainage =
+        static_cast<float>(BlocksEast) * BlockSize;
+
+    // Longitudinal roads follow the inner and outer boundaries of each
+    // developed parcel row.
+    for (const int32 Side : {-1, 1})
+    {
+        for (int32 Boundary = 0; Boundary <= Rows; ++Boundary)
+        {
+            const float Lateral = static_cast<float>(Side) * (
+                CorridorHalfWidth +
+                static_cast<float>(Boundary) * BlockSize
+            );
+            AddRoadEdge(
+                FVector2D(StartChainage, Lateral),
+                FVector2D(EndChainage, Lateral)
+            );
+        }
+    }
+
+    // Cross streets stop at the main Spine corridor. Missing underwater
+    // segments deliberately reserve obvious locations for authored bridges.
+    for (int32 Along = -BlocksWest; Along <= BlocksEast; ++Along)
+    {
+        const float Chainage = static_cast<float>(Along) * BlockSize;
+        for (const int32 Side : {-1, 1})
+        {
+            AddRoadEdge(
+                FVector2D(
+                    Chainage,
+                    static_cast<float>(Side) * CorridorHalfWidth
+                ),
+                FVector2D(
+                    Chainage,
+                    static_cast<float>(Side) * (
+                        CorridorHalfWidth + Rows * BlockSize
+                    )
+                )
+            );
+        }
     }
 }
 
@@ -331,6 +470,7 @@ void AParcelGenerator::RegenerateParcels()
     SellableBoundaries->ClearInstances();
     ReviewBoundaries->ClearInstances();
     UnavailableBoundaries->ClearInstances();
+    AccessRoadInstances->ClearInstances();
     Parcels.Reset();
 
     SellableBoundaries->SetHiddenInGame(!bVisibleInGame);
@@ -354,6 +494,8 @@ void AParcelGenerator::RegenerateParcels()
     {
         return;
     }
+
+    RegenerateNearSpineRoads();
 
     for (int32 Along = -BlocksWest; Along < BlocksEast; ++Along)
     {
