@@ -1,85 +1,130 @@
-# Avenor PCG World Pipeline
+# Avenor Mesh Terrain + PCG World Pipeline
 
 ## Ownership
 
-- `AProceduralTerrainGenerator` is the deterministic world definition. The
+- `AProceduralTerrainGenerator` is the deterministic world definition. Its
   legacy class name remains so existing level references continue to load.
-- One native `ALandscape`, created and saved in the level, owns ground,
-  collision, Landscape materials, LOD and navigation.
-- Native Water Body actors own visible rivers and lakes. They use the
-  Landscape `Water` edit layer.
-- PCG graphs read the world definition and create/bake terrain patches, water
-  actors, vegetation and infrastructure.
+- One Mesh Partition actor owns terrain geometry, spatial sections, modifier
+  layers, weight channels and compiled platform representations.
+- PCG reads and writes the Mesh Partition through
+  `PCGMeshPartitionInterop`.
+- Native Water Body actors own visible rivers and lakes.
+  `MeshPartitionWater` connects them to River and Lake terrain modifiers.
 - `ASpineGenerator::GuideSpline` is the authoritative Spine route.
-- `AParcelGenerator` owns parcel policy/availability data.
+- `AParcelGenerator` owns parcel policy and availability data.
 
-Regeneration must never create a second Landscape.
+The game module deliberately stores the experimental Mesh Partition actor as
+an `AActor` reference. Mesh Terrain work happens through assets, modifiers and
+PCG graphs, avoiding unnecessary dependency on experimental C++ class names
+that may change in the next engine release.
+
+## Required plugins
+
+- `MeshPartition`
+- `MeshPartitionWater`
+- `PCG`
+- `PCGGeometryScriptInterop`
+- `PCGMeshPartitionInterop`
+- `MeshTerrainMode`
+- `Water`
+
+These are enabled by `Avenor.uproject`.
 
 ## One-time level migration
 
-1. Delete every actor labelled `Avenor Generated Landscape`,
-   `Avenor Generated Water Zone`, `Avenor River ...` or `Avenor Lake ...`
-   left by the legacy generator.
-2. Keep one `ProceduralTerrainGenerator` and one `SpineGenerator`.
-3. Create one native Landscape in Landscape mode, centred on the level datum.
-   Enable Edit Layers and name the base layer `Terrain`.
-4. Add a layer named `Water` above `Terrain`.
-5. Assign that Landscape to `Native Landscape` on the world definition.
-6. Add one Water Zone. Water Bodies may be authored manually initially or
-   emitted by the assigned Water PCG graph.
-7. Assign PCG graphs to the world definition:
-   - `Terrain Graph`: landscape patch/stamp orchestration.
-   - `Water Graph`: rivers/lakes derived from `Watercourses`.
-   - `Vegetation Graph`: biome and exclusion-rule scattering.
-   - `Infrastructure Graph`: world-level roads and development.
-8. Assign the Spine-specific graph to
-   `SpineGenerator.Infrastructure Graph`.
+1. Open or create an **Open World** level with World Partition enabled.
+2. Delete all old Landscape actors and every obsolete actor labelled
+   `Avenor Generated Landscape`, `Avenor Generated Water Zone`,
+   `Avenor River ...` or `Avenor Lake ...`.
+3. Keep one `ProceduralTerrainGenerator` and one `SpineGenerator`.
+4. Enter Mesh Terrain Mode and create a rectangular Mesh Partition actor.
+5. Create and assign `MPD_AvenorWorld`, the Mesh Partition Definition.
+6. Assign the Mesh Partition actor to `Mesh Terrain Actor` on the world
+   definition.
+7. Define these modifier priority layers in `MPD_AvenorWorld`, in order:
+   - `BaseForm`
+   - `SpineCorridor`
+   - `RegionalRelief`
+   - `Hydrology`
+   - `Development`
+   - `LocalDetail`
+   - `ManualOverride`
+8. Define these weight channels:
+   - `Grass`
+   - `Forest`
+   - `Rock`
+   - `Wetland`
+   - `RiverBank`
+   - `Sand`
+   - `Developable`
+   - `Road`
+   - `SpineExclusion`
+   - `Water`
+9. Add one Water Zone. Add the Mesh Partition integration component required
+   by Mesh Terrain to each Water Body used by the Water graph.
+10. Assign the four PCG graphs on the world definition and the
+    Spine-specific infrastructure graph on `SpineGenerator`.
 
 ## Graph contract
 
-All graphs use the same fixed `WorldSeed`. Generation is an editor/build step,
-not per-player runtime randomness.
+All graphs use the fixed `WorldSeed`. Generation is an editor/build operation,
+then Mesh Partition compiles spatial runtime sections. Clients never generate
+independent random terrain.
 
-### Terrain
+### Terrain graph
 
-- Read the Spine spline and distance from it.
-- Keep the nearest roughly 1 km on either side broadly rolling and suitable
-  for development, not mathematically flat.
-- Blend progressively into hills.
-- Allow rare mountain masks only at distant ranges.
-- Write non-destructively through Landscape patches/stamps to the `Terrain`
-  layer.
+1. Query the Mesh Partition up to the appropriate input priority layer.
+2. Generate or transform Dynamic Mesh geometry inside the PCG volume.
+3. Write back to the matching priority/sub-priority. Do not use an inclusive
+   query that reads the graph's own output, because that creates a feedback
+   loop.
+4. Use the Spine spline and distance field to keep roughly 1 km on either side
+   broadly rolling and developable.
+5. Blend progressively into regional hills.
+6. Add rare mountain regions only at large Spine distances.
+7. Use spline remesh/tessellation around rivers, roads and developed parcels;
+   keep distant empty regions coarse.
 
-### Water
+### Water graph
 
-- Read `Watercourses` from the world-definition actor.
-- Each entry contains a source lake, connected river points, surface heights
-  and width.
-- Create or update native Water Body Lake/River actors.
-- Let Water own channel deformation on the `Water` edit layer.
-- Do not pre-carve the same channel into the base Terrain layer.
+- Read deterministic `Watercourses` from the world-definition actor.
+- Each entry contains a source lake, connected downhill river points, surface
+  heights and width.
+- Create/update Water Body Lake and Water Body River actors.
+- Pair them with Lake and River Mesh Terrain modifiers on the `Hydrology`
+  priority layer.
+- Write `Water`, `Wetland`, `RiverBank` and `Sand` channels from the same
+  geometry used to shape the banks.
 
-### Vegetation
+### Vegetation graph
 
-- Sample the native Landscape.
-- Exclude the Spine development corridor, roads, parcel development masks and
-  water surfaces.
-- Select biome by slope, height, moisture/distance-to-water and deterministic
-  regional masks.
-- Use partitioned PCG and hierarchical instancing.
+- Query the compiled terrain surface and weight channels.
+- Exclude `SpineExclusion`, `Road`, `Water` and developed parcel masks.
+- Select biomes using height, slope, moisture and the terrain channels.
+- Use partitioned PCG, hierarchical instancing and aggressive VR culling.
 
-### Spine infrastructure
+### Spine infrastructure graph
 
 - Sample `GuideSpline`.
-- Generate guideway meshes along the spline.
-- Place supports by distance with exclusions for rivers, roads and stations.
-- Place stations at the configured station interval.
-- Emit signs, lighting and street furniture as separate density/LOD groups.
+- Write the development-corridor modifier and `SpineExclusion` channel.
+- Generate guideway meshes and supports along the spline.
+- Exclude supports from water, roads and station footprints.
+- Place stations, signage, lighting and street furniture in separately
+  controllable density/LOD groups.
+
+### Parcels and roads
+
+- Analyse the final Mesh Partition surface, not an independent heightmap.
+- Classify submerged and mixed-water parcels from the `Water` channel and
+  Water Body geometry.
+- Generate access roads only for near-Spine/developed rows.
+- Grade roads through the `Development` modifier layer and remesh locally.
 
 ## Editor buttons
 
-- `Regenerate` rebuilds deterministic rule data and runs every assigned graph.
-- Individual PCG categories can be regenerated independently.
-- `Clear Generated Terrain` is retained for old level instances, but now only
-  clears PCG output and cached rules. It cannot delete the Landscape or Water
-  actors.
+- `Regenerate` rebuilds deterministic world-rule data and runs every assigned
+  PCG graph.
+- Individual terrain, water, vegetation and infrastructure graphs can be
+  regenerated independently.
+- `Clear Generated Terrain` only clears PCG output and cached rules. It cannot
+  delete the Mesh Partition actor or Water actors.
