@@ -112,7 +112,7 @@ void AProceduralTerrainGenerator::Regenerate()
         LogTemp,
         Display,
         TEXT(
-            "Avenor world definition regenerated. Native Landscape and Water "
+            "Avenor world definition regenerated. Mesh Terrain and Water "
             "actors were left intact."
         )
     );
@@ -202,8 +202,8 @@ void AProceduralTerrainGenerator::ClearGeneratedTerrain()
         LogTemp,
         Display,
         TEXT(
-            "Cleared Avenor PCG output and rule data. The native Landscape "
-            "and Water actors were not deleted."
+            "Cleared Avenor PCG output and rule data. Mesh Terrain and Water "
+            "actors were not deleted."
         )
     );
 }
