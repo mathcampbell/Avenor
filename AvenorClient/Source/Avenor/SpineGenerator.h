@@ -8,6 +8,8 @@ class USceneComponent;
 class USplineComponent;
 class UStaticMesh;
 class UInstancedStaticMeshComponent;
+class UPCGComponent;
+class UPCGGraphInterface;
 
 USTRUCT(BlueprintType)
 struct FSpineEffector
@@ -64,6 +66,12 @@ public:
     UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
     USplineComponent* GetGuideSpline() const { return GuideSpline; }
 
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateInfrastructure();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void ClearInfrastructure();
+
     UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
     void GetSpineSpaceForWorldLocation(
         const FVector& WorldLocation,
@@ -107,6 +115,18 @@ private:
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Spine",
         meta = (AllowPrivateAccess = "true"))
     TObjectPtr<USplineComponent> GuideSpline;
+
+    // The Spine spline is authoritative data. The assigned PCG graph should
+    // create guideway, supports, stations, signs and street furniture from it.
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGComponent> InfrastructurePCG;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGGraphInterface> InfrastructureGraph;
+
+    // Temporary cube blockout retained for comparison/migration only.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Legacy")
+    bool bUseLegacyBlockout = false;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
     TObjectPtr<UInstancedStaticMeshComponent> RoadInstances;
