@@ -7,11 +7,9 @@
 class ALandscape;
 class ASpineGenerator;
 class AWaterBody;
-class AWaterZone;
-class UBoxComponent;
-class UMaterialInterface;
 class UPCGComponent;
 class UPCGGraphInterface;
+class UBoxComponent;
 class USceneComponent;
 
 USTRUCT(BlueprintType)
@@ -39,12 +37,12 @@ struct FGeneratedWatercourse
 };
 
 /**
- * Generates Avenor's authored world form as a native Unreal Landscape.
+ * Authoritative, deterministic world definition for Avenor.
  *
- * The class name is retained so existing level references and parcel queries
- * survive the migration from UProceduralMeshComponent. Regeneration is an
- * editor operation; the resulting ALandscape is saved with the map and cooks
- * like any manually-created Landscape.
+ * The legacy class name is retained so existing maps and ParcelGenerator
+ * references keep loading. This actor no longer creates, imports or deletes an
+ * ALandscape, Water Zone or Water Body. It owns rules and PCG entry points;
+ * Unreal's native Landscape and Water systems own the actual world actors.
  */
 UCLASS()
 class AVENOR_API AProceduralTerrainGenerator : public AActor
@@ -54,17 +52,37 @@ class AVENOR_API AProceduralTerrainGenerator : public AActor
 public:
     AProceduralTerrainGenerator();
 
-    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain")
+    /** Rebuild deterministic rule data, then run each assigned PCG graph. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|World")
     void Regenerate();
 
-    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain")
+    /**
+     * Compatibility button. It cleans this actor's PCG output only; it never
+     * destroys the referenced Landscape or authored Water Bodies.
+     */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|World")
     void ClearGeneratedTerrain();
 
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateTerrain();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateWater();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateVegetation();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void RegenerateInfrastructure();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void ClearPCG();
+
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
+    void ClearVegetation();
+
     UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
-    float GetTerrainHeightAtSpineSpace(
-        float Chainage,
-        float Lateral
-    ) const;
+    float GetTerrainHeightAtSpineSpace(float Chainage, float Lateral) const;
 
     UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
     bool GetWaterSurfaceAtSpineSpace(
@@ -81,42 +99,37 @@ public:
     ) const;
 
     UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
-    ALandscape* GetGeneratedLandscape() const
+    ALandscape* GetGeneratedLandscape() const { return NativeLandscape; }
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|World")
+    int32 GetWorldSeed() const { return WorldSeed; }
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|World")
+    TArray<FGeneratedWatercourse> GetWatercourses() const
     {
-        return GeneratedLandscape;
+        return Watercourses;
     }
-
-    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
-    void RegenerateVegetation();
-
-    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
-    void ClearVegetation();
-
-protected:
-    virtual void OnConstruction(const FTransform& Transform) override;
 
 private:
     float EvaluateBaseHeight(float Chainage, float Lateral) const;
     float EvaluateTerrainHeight(float Chainage, float Lateral) const;
-    FVector SpineSpaceToWorld(
-        float Chainage,
-        float Lateral,
-        float Height
-    ) const;
-    void WorldToSpineSpace(
-        const FVector& WorldLocation,
-        float& OutChainage,
-        float& OutLateral
-    ) const;
-    void GenerateWatercourses();
-    void BuildLandscape();
-    void BuildNativeWater();
     float DistanceToSegment(
         const FVector2D& Point,
         const FVector2D& A,
         const FVector2D& B,
         float& OutAlpha
     ) const;
+    void GenerateWorldRules();
+    void GenerateWatercourses();
+    void ConfigurePCGComponent(
+        UPCGComponent* Component,
+        UPCGGraphInterface* Graph
+    );
+    void GeneratePCGComponent(
+        UPCGComponent* Component,
+        UPCGGraphInterface* Graph,
+        const TCHAR* DisplayName
+    );
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
@@ -125,35 +138,45 @@ private:
     TObjectPtr<UBoxComponent> PCGBounds;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGComponent> TerrainPCG;
+
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGComponent> WaterPCG;
+
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
     TObjectPtr<UPCGComponent> VegetationPCG;
 
-    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
-    TObjectPtr<ALandscape> GeneratedLandscape;
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGComponent> InfrastructurePCG;
 
-    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
-    TObjectPtr<AWaterZone> GeneratedWaterZone;
+    // Create one native Landscape in the editor and assign it here. It is
+    // never spawned, moved or destroyed by this actor.
+    UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
+    TObjectPtr<ALandscape> NativeLandscape;
 
-    UPROPERTY(VisibleInstanceOnly, Category = "Avenor|Generated")
-    TArray<TObjectPtr<AWaterBody>> GeneratedWaterBodies;
-
-    UPROPERTY(EditInstanceOnly, Category = "Avenor|Terrain")
+    UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<ASpineGenerator> Spine;
+
+    // Optional references to native Water Bodies produced/authored for this
+    // definition. They remain owned by the level and Water system.
+    UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
+    TArray<TObjectPtr<AWaterBody>> NativeWaterBodies;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Generation")
     int32 WorldSeed = 1847;
 
-    // Large native Landscapes should be rebuilt explicitly with Regenerate.
-    UPROPERTY(EditAnywhere, Category = "Avenor|Generation")
-    bool bRegenerateOnConstruction = false;
+    UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGGraphInterface> TerrainGraph;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
+    TObjectPtr<UPCGGraphInterface> WaterGraph;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
     TObjectPtr<UPCGGraphInterface> VegetationGraph;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
-    bool bRegenerateVegetationWithLandscape = true;
+    TObjectPtr<UPCGGraphInterface> InfrastructureGraph;
 
-    // Requested dimensions in centimetres. Actual dimensions are rounded up
-    // to whole Landscape components.
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "100000.0"))
     float Length = 1200000.0f;
@@ -162,28 +185,10 @@ private:
         meta = (ClampMin = "100000.0"))
     float HalfWidth = 1500000.0f;
 
-    // Native Landscape vertex spacing. 2000 cm gives a useful 20 m world-form
-    // grid; roads, banks and plots can add local detail without a huge base.
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
-        meta = (ClampMin = "100.0"))
-    float LandscapeVertexSpacing = 2000.0f;
-
-    // 63 quads is the standard one-section Landscape component size.
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
-        meta = (ClampMin = "7", ClampMax = "255"))
-    int32 LandscapeQuadsPerSection = 63;
-
-    // 400 supports approximately +/- 1,024 metres of vertical relief.
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landscape",
-        meta = (ClampMin = "25.0"))
-    float LandscapeZScale = 400.0f;
-
     UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
         meta = (ClampMin = "0.0"))
     float LowlandCoreDistance = 100000.0f;
 
-    // Keep the infrastructure itself exactly on the Spine datum, then blend
-    // gradually into the natural lowland relief.
     UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
         meta = (ClampMin = "0.0"))
     float SpineLevelHalfWidth = 3000.0f;
@@ -232,16 +237,8 @@ private:
         meta = (ClampMin = "100.0"))
     float RiverCarveDepth = 1200.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Water")
-    bool bGenerateNativeWater = true;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
-    TObjectPtr<UMaterialInterface> TerrainMaterial;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Materials")
-    TObjectPtr<UMaterialInterface> WaterMaterial;
-
-    UPROPERTY(VisibleAnywhere, Category = "Avenor|Generated")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Generated",
+        meta = (AllowPrivateAccess = "true"))
     TArray<FGeneratedWatercourse> Watercourses;
 
     TArray<FVector2D> MountainCentres;

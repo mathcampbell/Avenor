@@ -4,6 +4,8 @@
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
 #include "Engine/StaticMesh.h"
+#include "PCGComponent.h"
+#include "PCGGraph.h"
 #include "UObject/ConstructorHelpers.h"
 
 ASpineGenerator::ASpineGenerator()
@@ -27,6 +29,12 @@ ASpineGenerator::ASpineGenerator()
         ESplineCoordinateSpace::Local,
         true
     );
+
+    InfrastructurePCG = CreateDefaultSubobject<UPCGComponent>(
+        TEXT("InfrastructurePCG")
+    );
+    InfrastructurePCG->bIsComponentPartitioned = true;
+    InfrastructurePCG->bRegenerateInEditor = false;
 
     auto CreateInstances = [this](const TCHAR* Name)
     {
@@ -61,7 +69,47 @@ ASpineGenerator::ASpineGenerator()
 void ASpineGenerator::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-    RebuildStrip();
+    if (bUseLegacyBlockout)
+    {
+        RebuildStrip();
+    }
+    else
+    {
+        RoadInstances->ClearInstances();
+        MedianInstances->ClearInstances();
+        PavementInstances->ClearInstances();
+        ParcelInstances->ClearInstances();
+        MonorailInstances->ClearInstances();
+    }
+}
+
+void ASpineGenerator::RegenerateInfrastructure()
+{
+#if WITH_EDITOR
+    if (!InfrastructurePCG || !InfrastructureGraph)
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Assign a Spine Infrastructure PCG graph first.")
+        );
+        return;
+    }
+
+    InfrastructurePCG->SetGraphLocal(InfrastructureGraph);
+    InfrastructurePCG->CleanupLocal(true);
+    InfrastructurePCG->GenerateLocal(true);
+#endif
+}
+
+void ASpineGenerator::ClearInfrastructure()
+{
+#if WITH_EDITOR
+    if (InfrastructurePCG)
+    {
+        InfrastructurePCG->CleanupLocal(true);
+    }
+#endif
 }
 
 float ASpineGenerator::GetMinimumChainage() const
