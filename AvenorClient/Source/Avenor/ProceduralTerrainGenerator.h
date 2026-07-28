@@ -158,11 +158,11 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Lowlands",
         meta = (ClampMin = "0.0"))
-    float LowlandRelief = 1800.0f;
+    float LowlandRelief = 3000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hills",
         meta = (ClampMin = "0.0"))
-    float HillRelief = 9000.0f;
+    float HillRelief = 18000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Mountains",
         meta = (ClampMin = "0"))
