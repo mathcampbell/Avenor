@@ -73,15 +73,24 @@ static double DistanceToSegment(
 
 static double DistanceToPolyline(
     const FVector2D& Point,
-    const TArray<FVector2D>& Polyline
+    const TArray<FVector2D>& Polyline,
+    FVector2D* OutClosestPoint = nullptr
 )
 {
     if (Polyline.IsEmpty())
     {
+        if (OutClosestPoint)
+        {
+            *OutClosestPoint = Point;
+        }
         return TNumericLimits<double>::Max();
     }
     if (Polyline.Num() == 1)
     {
+        if (OutClosestPoint)
+        {
+            *OutClosestPoint = Polyline[0];
+        }
         return FVector2D::Distance(Point, Polyline[0]);
     }
 
@@ -89,15 +98,24 @@ static double DistanceToPolyline(
     for (int32 Index = 0; Index + 1 < Polyline.Num(); ++Index)
     {
         double Alpha = 0.0;
-        Best = FMath::Min(
-            Best,
-            DistanceToSegment(
-                Point,
-                Polyline[Index],
-                Polyline[Index + 1],
-                Alpha
-            )
+        const double Distance = DistanceToSegment(
+            Point,
+            Polyline[Index],
+            Polyline[Index + 1],
+            Alpha
         );
+        if (Distance < Best)
+        {
+            Best = Distance;
+            if (OutClosestPoint)
+            {
+                *OutClosestPoint = FMath::Lerp(
+                    Polyline[Index],
+                    Polyline[Index + 1],
+                    Alpha
+                );
+            }
+        }
     }
     return Best;
 }
@@ -115,6 +133,21 @@ static double Noise(const FVector2D& Point, double Scale)
     return FMath::PerlinNoise2D(Point / FMath::Max(1.0, Scale));
 }
 
+static double EvaluateRegionalHeight(
+    const FVector2D& Point,
+    const FVector2D& Offset,
+    const FSettings& Settings
+)
+{
+    const FVector2D Warp(
+        Noise(Point + Offset * 0.37, Settings.RegionalScale * 1.4),
+        Noise(Point + Offset * 0.61, Settings.RegionalScale * 1.4)
+    );
+    const FVector2D Warped = Point + Warp * Settings.HillScale * 0.55;
+    return Noise(Warped + Offset, Settings.RegionalScale) *
+        Settings.RegionalRelief;
+}
+
 static double EvaluateLand(
     const FVector2D& Point,
     const TArray<FVector2D>& SpinePoints,
@@ -123,19 +156,19 @@ static double EvaluateLand(
 )
 {
     const FVector2D Offset = SeedOffset(Settings.Seed);
+    FVector2D ClosestSpinePoint = Point;
+    const double DistanceFromSpine = DistanceToPolyline(
+        Point,
+        SpinePoints,
+        &ClosestSpinePoint
+    );
+
     const FVector2D Warp(
         Noise(Point + Offset * 0.37, Settings.RegionalScale * 1.4),
         Noise(Point + Offset * 0.61, Settings.RegionalScale * 1.4)
     );
     const FVector2D Warped = Point + Warp * Settings.HillScale * 0.55;
 
-    // This broad elevation exists on both sides of and underneath the Spine.
-    const double Regional =
-        Noise(Warped + Offset, Settings.RegionalScale) *
-        Settings.RegionalRelief;
-
-    const double DistanceFromSpine =
-        DistanceToPolyline(Point, SpinePoints);
     const double RoughnessTransition = Smooth01(
         (DistanceFromSpine - Settings.GentleCorridorHalfWidth) /
         FMath::Max(
@@ -144,6 +177,27 @@ static double EvaluateLand(
                 Settings.GentleCorridorHalfWidth
         )
     );
+
+    // Preserve broad elevation along the Spine, but near it use the elevation
+    // sampled at the nearest Spine point. This removes lateral hills and
+    // valleys across the development corridor without pinning the entire
+    // route to one absolute world height.
+    const double RegionalAtPoint = EvaluateRegionalHeight(
+        Point,
+        Offset,
+        Settings
+    );
+    const double RegionalAtSpine = EvaluateRegionalHeight(
+        ClosestSpinePoint,
+        Offset,
+        Settings
+    );
+    const double Regional = FMath::Lerp(
+        RegionalAtSpine,
+        RegionalAtPoint,
+        RoughnessTransition
+    );
+
     const double RoughnessWeight = FMath::Lerp(
         Settings.CorridorRoughnessFraction,
         1.0,
