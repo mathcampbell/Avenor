@@ -314,6 +314,7 @@ public:
 
             for (const FRiver& River : Rivers)
             {
+                double MaximumValleyWeight = 0.0;
                 for (int32 SegmentIndex = 0;
                      SegmentIndex + 1 < River.Points.Num();
                      ++SegmentIndex)
@@ -334,18 +335,16 @@ public:
                     const double ValleyWeight = FMath::Square(
                         1.0 - Distance / ValleyWidth
                     );
-                    const double BedHeight = FMath::Lerp(
-                        River.BedHeights[SegmentIndex],
-                        River.BedHeights[SegmentIndex + 1],
-                        Alpha
-                    );
-                    const double Target = BedHeight - River.Depth;
-                    Height = FMath::Lerp(
-                        Height,
-                        FMath::Min(Height, Target),
+                    MaximumValleyWeight = FMath::Max(
+                        MaximumValleyWeight,
                         ValleyWeight
                     );
                 }
+
+                // Carve relative to the terrain generated at this position.
+                // The river route determines where water travels; its depth
+                // must not pull mountain terrain towards a global datum.
+                Height -= River.Depth * MaximumValleyWeight;
             }
 
             WorldPosition.Z = BaseWorldZ + Height;
