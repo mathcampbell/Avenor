@@ -480,6 +480,11 @@ public:
         return Version;
     }
 
+    virtual bool DisableDDCWrite() const override
+    {
+        return false;
+    }
+
     FBox GlobalBounds;
     TSharedPtr<const FAvenorTerrainAnalysisData> Analysis;
 };
@@ -593,8 +598,10 @@ FBox UAvenorTerrainRefinementModifier::GetAnalysisWorldBounds() const
 
 TArray<FBox> UAvenorTerrainRefinementModifier::ComputeBounds() const
 {
-    const FBox Bounds = GetAnalysisWorldBounds();
-    return Bounds.IsValid ? TArray<FBox>{Bounds} : TArray<FBox>{};
+    const FBox AnalysisBounds = GetAnalysisWorldBounds();
+    return AnalysisBounds.IsValid
+        ? TArray<FBox>{AnalysisBounds}
+        : TArray<FBox>{};
 }
 
 TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
