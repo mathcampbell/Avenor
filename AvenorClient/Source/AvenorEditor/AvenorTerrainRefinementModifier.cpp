@@ -464,7 +464,22 @@ public:
             const double Delta =
                 Analysis->Sample(Analysis->RefinedHeight, Point) -
                 Analysis->Sample(Analysis->BaseHeight, Point);
-            WorldPosition.Z += Delta;
+            const double EdgeDistance = FMath::Min(
+                FMath::Min(
+                    Point.X - Analysis->Bounds.Min.X,
+                    Analysis->Bounds.Max.X - Point.X
+                ),
+                FMath::Min(
+                    Point.Y - Analysis->Bounds.Min.Y,
+                    Analysis->Bounds.Max.Y - Point.Y
+                )
+            );
+            const double EdgeWeight = FMath::SmoothStep(
+                0.0,
+                Analysis->CellSize * 2.0,
+                FMath::Max(0.0, EdgeDistance)
+            );
+            WorldPosition.Z += Delta * EdgeWeight;
             MeshView.SetVertexPos(
                 VertexIndex,
                 MeshTransform.InverseTransformPosition(WorldPosition)
@@ -475,7 +490,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("efda14e1-34dd-4e33-a455-4e37f015551b")
+            TEXT("263fd7f8-6a9a-455a-8a80-490793b1034f")
         );
         return Version;
     }
