@@ -6,9 +6,9 @@
 #include "Editor.h"
 #include "EngineUtils.h"
 #include "MeshPartition.h"
-#include "MeshPartitionLakeModifier.h"
-#include "MeshPartitionRiverModifier.h"
+#include "MeshPartitionModifierComponent.h"
 #include "Misc/ScopedSlowTask.h"
+#include "UObject/UObjectGlobals.h"
 #include "WaterBodyActor.h"
 #include "WaterBodyComponent.h"
 #include "WaterBodyLakeActor.h"
@@ -321,11 +321,12 @@ static TArray<int32> TraceRiver(const FGrid& Grid, int32 Source)
     return Path;
 }
 
-template<typename TWaterBodyActor, typename TModifier>
+template<typename TWaterBodyActor>
 static TWaterBodyActor* CreateWaterBody(
     UWorld* World,
     UE::MeshPartition::AMeshPartition* MeshPartition,
-    const FString& Label
+    const FString& Label,
+    const TCHAR* ModifierClassPath
 )
 {
     UActorFactory* Factory =
@@ -355,10 +356,22 @@ static TWaterBodyActor* CreateWaterBody(
 
     UWaterBodyComponent* WaterComponent =
         WaterBody->GetWaterBodyComponent();
-    TModifier* Modifier = NewObject<TModifier>(
+    UClass* ModifierClass =
+        LoadClass<UE::MeshPartition::UModifierComponent>(
+            nullptr,
+            ModifierClassPath
+        );
+    if (!ModifierClass)
+    {
+        World->EditorDestroyActor(WaterBody, true);
+        return nullptr;
+    }
+
+    UE::MeshPartition::UModifierComponent* Modifier =
+        NewObject<UE::MeshPartition::UModifierComponent>(
         WaterBody,
-        TModifier::StaticClass(),
-        TModifier::StaticClass()->GetFName()
+        ModifierClass,
+        ModifierClass->GetFName()
     );
     Modifier->SetAffectedMeshPartition(MeshPartition);
     WaterBody->AddInstanceComponent(Modifier);
@@ -516,13 +529,11 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         const FVector2D Centre = Grid.Position(LakeCell);
         const double SurfaceZ = Grid.FilledHeight[LakeCell];
 
-        AWaterBodyLake* Lake = CreateWaterBody<
-            AWaterBodyLake,
-            UE::MeshPartition::ULakeModifier
-        >(
+        AWaterBodyLake* Lake = CreateWaterBody<AWaterBodyLake>(
             World,
             MeshPartition,
-            FString::Printf(TEXT("Avenor_Lake_%02d"), LakeIndex + 1)
+            FString::Printf(TEXT("Avenor_Lake_%02d"), LakeIndex + 1),
+            TEXT("/Script/MeshPartitionWater.LakeModifier")
         );
         if (Lake)
         {
@@ -560,13 +571,11 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
             continue;
         }
 
-        AWaterBodyRiver* River = CreateWaterBody<
-            AWaterBodyRiver,
-            UE::MeshPartition::URiverModifier
-        >(
+        AWaterBodyRiver* River = CreateWaterBody<AWaterBodyRiver>(
             World,
             MeshPartition,
-            FString::Printf(TEXT("Avenor_River_%02d"), LakeIndex + 1)
+            FString::Printf(TEXT("Avenor_River_%02d"), LakeIndex + 1),
+            TEXT("/Script/MeshPartitionWater.RiverModifier")
         );
         if (!River)
         {
