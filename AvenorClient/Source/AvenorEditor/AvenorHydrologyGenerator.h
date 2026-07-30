@@ -66,6 +66,12 @@ private:
         meta = (ClampMin = "100.0"))
     double RiverBedDepth = 2500.0;
 
+    // Water surface is placed below the sampled valley floor so the water
+    // modifier can never lift the surrounding terrain toward its spline.
+    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
+        meta = (ClampMin = "1.0"))
+    double RiverSurfaceInset = 100.0;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
         meta = (ClampMin = "1", ClampMax = "16"))
     int32 RiverSplineStride = 2;
