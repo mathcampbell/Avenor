@@ -573,15 +573,19 @@ static void BuildFlow(FAvenorGeneratedWorld& Grid)
 static void CarveDrainage(
     FAvenorGeneratedWorld& Grid,
     bool bRivers,
+    bool bValleys,
     bool bCanyons,
     double StreamStart,
     double MaximumRiverDepth,
+    double ValleyStart,
+    double MaximumValleyDepth,
+    int32 MaximumValleyHalfWidth,
     double CanyonStart,
     double MaximumCanyonDepth,
     int32 Iterations
 )
 {
-    if (!bRivers && !bCanyons)
+    if (!bRivers && !bValleys && !bCanyons)
     {
         return;
     }
@@ -617,6 +621,26 @@ static void CarveDrainage(
                         3
                     );
                 }
+                if (bValleys && Area >= ValleyStart)
+                {
+                    const double Strength = FMath::Clamp(
+                        FMath::Loge(Area / ValleyStart + 1.0) / 5.0,
+                        0.0,
+                        1.0
+                    );
+                    Incision += MaximumValleyDepth * Strength /
+                        SafeIterations;
+                    Radius = FMath::Max(
+                        Radius,
+                        FMath::Clamp(
+                            2 + FMath::FloorToInt(
+                                FMath::Sqrt(Area / ValleyStart) * 0.18
+                            ),
+                            2,
+                            FMath::Max(2, MaximumValleyHalfWidth)
+                        )
+                    );
+                }
                 if (bCanyons && Area >= CanyonStart)
                 {
                     const double Strength = FMath::Clamp(
@@ -643,7 +667,14 @@ static void CarveDrainage(
                         {
                             continue;
                         }
-                        const int32 Affected = Grid.Index(X + OX, Y + OY);
+                        const int32 AffectedX = X + OX;
+                        const int32 AffectedY = Y + OY;
+                        if (!Grid.IsValid(AffectedX, AffectedY))
+                        {
+                            continue;
+                        }
+                        const int32 Affected =
+                            Grid.Index(AffectedX, AffectedY);
                         const double Falloff = FMath::Square(
                             FMath::Clamp(
                                 1.0 - Distance / (Radius + 0.5),
@@ -1164,6 +1195,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     bool bHills,
     bool bMountains,
     bool bMesas,
+    bool bValleys,
     bool bCanyons,
     bool bRivers,
     bool bLakes,
@@ -1184,6 +1216,9 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     double MesaScale,
     double MesaRelief,
     int32 MesaTerraces,
+    double ValleyStart,
+    double ValleyDepth,
+    int32 ValleyHalfWidth,
     double CanyonStart,
     double CanyonDepth,
     int32 ErosionIterations,
@@ -1321,9 +1356,13 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     CarveDrainage(
         *Grid,
         bRivers,
+        bValleys,
         bCanyons,
         StreamStart,
         RiverDepth,
+        ValleyStart,
+        ValleyDepth,
+        ValleyHalfWidth,
         CanyonStart,
         CanyonDepth,
         ErosionIterations
@@ -1587,6 +1626,7 @@ AAvenorWorldGenerator::GetOrGenerateWorld() const
             bGenerateRollingHills,
             bGenerateMountains,
             bGenerateMesas,
+            bGenerateValleys,
             bGenerateCanyons,
             bGenerateRivers,
             bGenerateLakes,
@@ -1607,6 +1647,9 @@ AAvenorWorldGenerator::GetOrGenerateWorld() const
             MesaScale,
             MesaRelief,
             MesaTerraceCount,
+            ValleyStartCatchmentCells,
+            ValleyMaximumDepth,
+            ValleyMaximumHalfWidthCells,
             CanyonStartCatchmentCells,
             CanyonMaximumDepth,
             ErosionIterations,
