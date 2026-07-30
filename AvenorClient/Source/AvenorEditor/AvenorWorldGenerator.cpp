@@ -23,6 +23,8 @@ struct FAvenorRiverDefinition
     double DischargeCells = 0.0;
     double Width = 600.0;
     double Depth = 250.0;
+    double ValleyHalfWidth = 35000.0;
+    double ValleyRelief = 2500.0;
     bool bContainsWaterfall = false;
     FBox2D InfluenceBounds = FBox2D(ForceInit);
 };
@@ -31,8 +33,10 @@ struct FAvenorLakeDefinition
 {
     TArray<FVector> Shoreline;
     double SurfaceHeight = 0.0;
+    double MaximumDepth = 1000.0;
     double Volume = 0.0;
     int32 CellCount = 0;
+    FBox2D InfluenceBounds = FBox2D(ForceInit);
 };
 
 struct FAvenorGeneratedWorld
@@ -136,6 +140,63 @@ struct FAvenorGeneratedWorld
     double SampleTerrainHeight(const FVector2D& Point) const
     {
         double Result = Sample(Height, Point);
+        for (const FAvenorLakeDefinition& Lake : Lakes)
+        {
+            if (!Lake.InfluenceBounds.IsInside(Point) ||
+                Lake.Shoreline.Num() < 3)
+            {
+                continue;
+            }
+            bool bInside = false;
+            double ShoreDistance = TNumericLimits<double>::Max();
+            for (int32 Index = 0; Index < Lake.Shoreline.Num(); ++Index)
+            {
+                const FVector2D A(Lake.Shoreline[Index]);
+                const FVector2D B(
+                    Lake.Shoreline[(Index + 1) % Lake.Shoreline.Num()]
+                );
+                const FVector2D Segment = B - A;
+                const double LengthSquared = Segment.SizeSquared();
+                const double Alpha =
+                    LengthSquared > UE_DOUBLE_KINDA_SMALL_NUMBER
+                    ? FMath::Clamp(
+                        FVector2D::DotProduct(Point - A, Segment) /
+                            LengthSquared,
+                        0.0,
+                        1.0
+                    )
+                    : 0.0;
+                ShoreDistance = FMath::Min(
+                    ShoreDistance,
+                    FVector2D::Distance(Point, A + Segment * Alpha)
+                );
+                const bool bCrosses =
+                    (A.Y > Point.Y) != (B.Y > Point.Y);
+                if (bCrosses)
+                {
+                    const double CrossingX = A.X +
+                        (Point.Y - A.Y) * (B.X - A.X) /
+                        (B.Y - A.Y);
+                    if (Point.X < CrossingX)
+                    {
+                        bInside = !bInside;
+                    }
+                }
+            }
+            if (bInside)
+            {
+                const double DepthAlpha = FMath::SmoothStep(
+                    0.0,
+                    FMath::Max(CellSize * 1.5, 1.0),
+                    ShoreDistance
+                );
+                Result = FMath::Min(
+                    Result,
+                    Lake.SurfaceHeight -
+                        Lake.MaximumDepth * DepthAlpha
+                );
+            }
+        }
         for (const FAvenorRiverDefinition& River : Rivers)
         {
             if (!River.InfluenceBounds.IsInside(Point))
@@ -170,9 +231,7 @@ struct FAvenorGeneratedWorld
                     FVector2D::Distance(Point, Closest);
                 const double HalfBedWidth =
                     FMath::Max(100.0, River.Width * 0.5);
-                const double BankWidth =
-                    FMath::Max(CellSize * 0.35, River.Width);
-                if (Distance >= HalfBedWidth + BankWidth)
+                if (Distance >= River.ValleyHalfWidth)
                 {
                     continue;
                 }
@@ -180,20 +239,34 @@ struct FAvenorGeneratedWorld
                     FMath::Lerp(A.Z, B.Z, Alpha);
                 const double BedHeight =
                     SurfaceHeight - River.Depth;
-                const double BankAlpha = FMath::Clamp(
-                    (Distance - HalfBedWidth) / BankWidth,
+                const double ValleyAlpha = FMath::Clamp(
+                    Distance / FMath::Max(1.0, River.ValleyHalfWidth),
                     0.0,
                     1.0
                 );
-                const double SmoothBankAlpha =
-                    BankAlpha * BankAlpha *
-                    (3.0 - 2.0 * BankAlpha);
-                const double Weight = Distance <= HalfBedWidth
-                    ? 1.0
-                    : 1.0 - SmoothBankAlpha;
+                const double SmoothValleyAlpha =
+                    ValleyAlpha * ValleyAlpha *
+                    (3.0 - 2.0 * ValleyAlpha);
+                const double ValleyFloor = BedHeight +
+                    River.ValleyRelief * SmoothValleyAlpha;
+                const double BedAlpha = FMath::Clamp(
+                    Distance / HalfBedWidth,
+                    0.0,
+                    1.0
+                );
+                const double ChannelFloor = FMath::Lerp(
+                    BedHeight,
+                    ValleyFloor,
+                    BedAlpha * BedAlpha *
+                        (3.0 - 2.0 * BedAlpha)
+                );
                 Result = FMath::Min(
                     Result,
-                    FMath::Lerp(Result, BedHeight, Weight)
+                    FMath::Lerp(
+                        ChannelFloor,
+                        Result,
+                        SmoothValleyAlpha
+                    )
                 );
             }
         }
@@ -859,17 +932,25 @@ static void AddMeanders(
             DistanceAlong[Index] / TotalLength;
         const double EndWeight =
             FMath::Sin(PI * NormalizedDistance);
-        // One broad bend plus a weaker secondary bend. Frequencies are based
-        // on the complete reach length, not the 25 m resampling interval; this
-        // prevents the close-up scallops seen in earlier builds.
+        // Bend the complete reach at landscape scale. EndWeight keeps
+        // tributary joins exact; kilometre-scale wavelengths prevent the
+        // drainage graph from reading as straight transport-map links.
+        const double BendCount = FMath::Clamp(
+            TotalLength / FMath::Max(Grid.CellSize * 9.0, 1.0),
+            1.25,
+            4.5
+        );
         const double MeanderSignal =
-            FMath::Sin(Phase + NormalizedDistance * PI) * 0.78 +
             FMath::Sin(
-                Phase * 1.61 + NormalizedDistance * 2.0 * PI
-            ) * 0.22;
+                Phase + NormalizedDistance * PI * BendCount
+            ) * 0.72 +
+            FMath::Sin(
+                Phase * 1.61 +
+                NormalizedDistance * PI * (BendCount * 0.47 + 0.5)
+            ) * 0.28;
         const double ReachAmplitude = FMath::Min(
-            TotalLength * 0.16,
-            Grid.CellSize * 0.55
+            TotalLength * 0.22,
+            Grid.CellSize * 3.25
         );
         const double Offset =
             MeanderSignal * ReachAmplitude * Strength *
@@ -1019,6 +1100,16 @@ static void ExtractRivers(
             MaximumDepth,
             WidthAlpha
         );
+        River.ValleyHalfWidth = FMath::Lerp(
+            Grid.CellSize * 1.35,
+            Grid.CellSize * 4.5,
+            WidthAlpha
+        );
+        River.ValleyRelief = FMath::Lerp(
+            FMath::Max(600.0, River.Depth * 0.65),
+            FMath::Max(1800.0, River.Depth * 1.35),
+            WidthAlpha
+        );
         double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
@@ -1062,8 +1153,7 @@ static void ExtractRivers(
             CentrelineBounds += FVector2D(Point);
         }
         River.InfluenceBounds = CentrelineBounds.ExpandBy(
-            FMath::Max(Grid.CellSize * 0.35, River.Width) +
-            River.Width * 0.5
+            River.ValleyHalfWidth
         );
         Grid.Rivers.Add(MoveTemp(River));
     }
@@ -1228,7 +1318,10 @@ static TArray<FVector> TraceLakeBoundary(
     {
         Reduced.Add(Largest[Index]);
     }
-    TArray<FVector> Shoreline = SmoothPolyline(Reduced, true, 2);
+    // Repeated closed Chaikin passes turn the analytical raster catchment
+    // into a continuous shoreline. The grid decides which basin fills; it
+    // does not dictate the final square outline.
+    TArray<FVector> Shoreline = SmoothPolyline(Reduced, true, 3);
     if (Shoreline.Num() >= 8)
     {
         const double Phase = FMath::Fmod(
@@ -1260,7 +1353,7 @@ static TArray<FVector> TraceLakeBoundary(
             Irregular[Index].Y +=
                 Normal.Y * ShoreVariation * Grid.CellSize * 0.12;
         }
-        Shoreline = SmoothPolyline(Irregular, true, 1);
+        Shoreline = SmoothPolyline(Irregular, true, 2);
     }
     return Shoreline;
 }
@@ -1417,11 +1510,20 @@ static void ExtractLakes(
 
         FAvenorLakeDefinition Lake;
         Lake.SurfaceHeight = Surface;
+        Lake.MaximumDepth = FMath::Clamp(
+            Surface - FloorHeight,
+            MinimumDepth,
+            Grid.CellSize * 0.45
+        );
         Lake.Volume = AvailableVolume;
         Lake.CellCount = Wet.Num();
         Lake.Shoreline = TraceLakeBoundary(Grid, Wet, Surface);
         if (Lake.Shoreline.Num() >= 4)
         {
+            for (const FVector& Point : Lake.Shoreline)
+            {
+                Lake.InfluenceBounds += FVector2D(Point);
+            }
             Grid.Lakes.Add(MoveTemp(Lake));
         }
     }
@@ -1679,6 +1781,11 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
         );
     }
     Grid->Height = Grid->BaseHeight;
+    // The raster incision pass exists only to establish drainage topology,
+    // catchments and lake levels. It must never be the rendered terrain:
+    // doing so exposes the 100 m analysis cells as straight rivers and
+    // rectangular lakes. Final carving below is evaluated continuously from
+    // the exact river and lake geometry also supplied to UE Water.
     CarveDrainage(
         *Grid,
         false,
@@ -1720,6 +1827,10 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             MinimumWaterfallDrop
         );
     }
+    // Discard the analysis raster's block-shaped cuts. Rivers and lakes in
+    // SampleTerrainHeight now carve BaseHeight from their shared continuous
+    // definitions, so terrain and Water splines cannot diverge.
+    Grid->Height = Grid->BaseHeight;
     if (bOceans)
     {
         const FVector Extent = Bounds.GetExtent();
