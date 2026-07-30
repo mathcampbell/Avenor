@@ -25,7 +25,7 @@ struct FAvenorRiverDefinition
     double Width = 600.0;
     double Depth = 250.0;
     double ValleyHalfWidth = 35000.0;
-    double ValleyRelief = 2500.0;
+    double ValleyDepth = 2500.0;
     bool bContainsWaterfall = false;
     FBox2D InfluenceBounds = FBox2D(ForceInit);
 };
@@ -35,6 +35,7 @@ struct FAvenorLakeDefinition
     TArray<FVector> Shoreline;
     double SurfaceHeight = 0.0;
     double MaximumDepth = 1000.0;
+    double FalloffWidth = 30000.0;
     double Volume = 0.0;
     int32 CellCount = 0;
     FBox2D InfluenceBounds = FBox2D(ForceInit);
@@ -188,7 +189,7 @@ struct FAvenorGeneratedWorld
             {
                 const double DepthAlpha = FMath::SmoothStep(
                     0.0,
-                    FMath::Max(CellSize * 1.5, 1.0),
+                    FMath::Max(Lake.FalloffWidth, 1.0),
                     ShoreDistance
                 );
                 Result = FMath::Min(
@@ -198,6 +199,8 @@ struct FAvenorGeneratedWorld
                 );
             }
         }
+        const double UnderlyingHeight = Sample(Height, Point);
+        double RiverHeight = UnderlyingHeight;
         for (const FAvenorRiverDefinition& River : Rivers)
         {
             if (!River.InfluenceBounds.IsInside(Point))
@@ -248,8 +251,9 @@ struct FAvenorGeneratedWorld
                 const double SmoothValleyAlpha =
                     ValleyAlpha * ValleyAlpha *
                     (3.0 - 2.0 * ValleyAlpha);
-                const double ValleyFloor = BedHeight +
-                    River.ValleyRelief * SmoothValleyAlpha;
+                const double ValleyFloor =
+                    UnderlyingHeight -
+                    River.ValleyDepth * (1.0 - SmoothValleyAlpha);
                 const double BedAlpha = FMath::Clamp(
                     Distance / HalfBedWidth,
                     0.0,
@@ -261,17 +265,10 @@ struct FAvenorGeneratedWorld
                     BedAlpha * BedAlpha *
                         (3.0 - 2.0 * BedAlpha)
                 );
-                Result = FMath::Min(
-                    Result,
-                    FMath::Lerp(
-                        ChannelFloor,
-                        Result,
-                        SmoothValleyAlpha
-                    )
-                );
+                RiverHeight = FMath::Min(RiverHeight, ChannelFloor);
             }
         }
-        return Result;
+        return FMath::Min(Result, RiverHeight);
     }
 };
 
@@ -1230,9 +1227,17 @@ static void SetDownhillSurface(
 static void ExtractRivers(
     FAvenorGeneratedWorld& Grid,
     double StreamStart,
+    bool bValleys,
+    double ValleyStart,
+    double MaximumValleyDepth,
+    int32 MaximumValleyHalfWidthCells,
+    bool bCanyons,
+    double CanyonStart,
+    double MaximumCanyonDepth,
     double HeadwaterWidth,
     double MainWidth,
     double MaximumDepth,
+    double RiverFalloffWidth,
     double MeanderStrength,
     int32 MaximumReaches,
     bool bWaterfalls,
@@ -1333,16 +1338,40 @@ static void ExtractRivers(
             MaximumDepth,
             WidthAlpha
         );
-        River.ValleyHalfWidth = FMath::Lerp(
-            Grid.CellSize * 1.35,
-            Grid.CellSize * 4.5,
-            WidthAlpha
+        const double ValleyStrength = bValleys
+            ? FMath::Clamp(
+                FMath::Loge(
+                    River.DischargeCells /
+                        FMath::Max(1.0, ValleyStart) +
+                    1.0
+                ) / 5.0,
+                0.0,
+                1.0
+            )
+            : 0.0;
+        const double CanyonStrength = bCanyons
+            ? FMath::Clamp(
+                FMath::Loge(
+                    River.DischargeCells /
+                        FMath::Max(1.0, CanyonStart) +
+                    1.0
+                ) / 4.0,
+                0.0,
+                1.0
+            )
+            : 0.0;
+        River.ValleyHalfWidth = FMath::Max(
+            River.Width * 0.5 + RiverFalloffWidth,
+            FMath::Lerp(
+                Grid.CellSize * 1.25,
+                Grid.CellSize *
+                    FMath::Max(1, MaximumValleyHalfWidthCells),
+                FMath::Max(WidthAlpha * 0.45, ValleyStrength)
+            )
         );
-        River.ValleyRelief = FMath::Lerp(
-            FMath::Max(600.0, River.Depth * 0.65),
-            FMath::Max(1800.0, River.Depth * 1.35),
-            WidthAlpha
-        );
+        River.ValleyDepth =
+            MaximumValleyDepth * ValleyStrength +
+            MaximumCanyonDepth * CanyonStrength;
         double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
@@ -1616,7 +1645,8 @@ static void ExtractLakes(
     double MinimumDepth,
     double RunoffDepth,
     double MaximumAreaSquareKilometres,
-    int32 MaximumLakes
+    int32 MaximumLakes,
+    double LakeFalloffWidth
 )
 {
     Grid.Lakes.Reset();
@@ -1767,6 +1797,7 @@ static void ExtractLakes(
             MinimumDepth,
             Grid.CellSize * 0.45
         );
+        Lake.FalloffWidth = LakeFalloffWidth;
         Lake.Volume = AvailableVolume;
         Lake.CellCount = Wet.Num();
         Lake.Shoreline = TraceLakeBoundary(Grid, Wet, Surface);
@@ -1836,11 +1867,13 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     double MainWidth,
     double Meander,
     int32 MaximumRivers,
+    double RiverFalloffWidth,
     double LakeCatchment,
     double LakeDepth,
     double RunoffDepth,
     double MaximumLakeArea,
     int32 MaximumLakes,
+    double LakeFalloffWidth,
     double CoastWidth,
     double OceanDepth,
     double SeaLevel,
@@ -2029,7 +2062,8 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             LakeDepth,
             RunoffDepth,
             MaximumLakeArea,
-            MaximumLakes
+            MaximumLakes,
+            LakeFalloffWidth
         );
     }
     if (bRivers)
@@ -2037,9 +2071,17 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
         ExtractRivers(
             *Grid,
             StreamStart,
+            bValleys,
+            ValleyStart,
+            ValleyDepth,
+            ValleyHalfWidth,
+            bCanyons,
+            CanyonStart,
+            CanyonDepth,
             HeadwaterWidth,
             MainWidth,
             RiverDepth,
+            RiverFalloffWidth,
             Meander,
             MaximumRivers,
             bWaterfalls,
@@ -2150,7 +2192,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("f3b0ac97-831d-4c56-9600-ffb683b2f219"));
+        return FGuid(TEXT("96a94bea-2c0d-4a7f-b92c-5043481d02f6"));
     }
 
     FBox GlobalBounds;
@@ -2327,11 +2369,13 @@ AAvenorWorldGenerator::GetOrGenerateWorld() const
             MainRiverWidth,
             LowlandMeanderStrength,
             MaximumRiverReaches,
+            RiverFalloffWidth,
             MinimumLakeCatchmentCells,
             MinimumLakeDepth,
             CatchmentRunoffDepth,
             MaximumLakeAreaSquareKilometres,
             MaximumLakeCount,
+            LakeFalloffWidth,
             CoastTransitionWidth,
             OceanDepth,
             SeaLevel,
