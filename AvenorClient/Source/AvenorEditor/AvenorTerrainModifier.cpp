@@ -289,64 +289,6 @@ public:
                 Settings
             );
 
-            for (const FLake& Lake : Lakes)
-            {
-                const double Distance =
-                    FVector2D::Distance(Point, Lake.Centre);
-                const double OuterRadius = Lake.Radius * 1.35;
-                if (Distance >= OuterRadius)
-                {
-                    continue;
-                }
-
-                const double BasinWeight = 1.0 - Smooth01(
-                    (Distance - Lake.Radius * 0.72) /
-                    FMath::Max(1.0, OuterRadius - Lake.Radius * 0.72)
-                );
-                const double BasinFloor =
-                    Lake.SurfaceHeight - Lake.Depth;
-                Height = FMath::Lerp(
-                    Height,
-                    FMath::Min(Height, BasinFloor),
-                    BasinWeight
-                );
-            }
-
-            for (const FRiver& River : Rivers)
-            {
-                double MaximumValleyWeight = 0.0;
-                for (int32 SegmentIndex = 0;
-                     SegmentIndex + 1 < River.Points.Num();
-                     ++SegmentIndex)
-                {
-                    double Alpha = 0.0;
-                    const double Distance = DistanceToSegment(
-                        Point,
-                        River.Points[SegmentIndex],
-                        River.Points[SegmentIndex + 1],
-                        Alpha
-                    );
-                    const double ValleyWidth = River.Width * 5.0;
-                    if (Distance >= ValleyWidth)
-                    {
-                        continue;
-                    }
-
-                    const double ValleyWeight = FMath::Square(
-                        1.0 - Distance / ValleyWidth
-                    );
-                    MaximumValleyWeight = FMath::Max(
-                        MaximumValleyWeight,
-                        ValleyWeight
-                    );
-                }
-
-                // Carve relative to the terrain generated at this position.
-                // The river route determines where water travels; its depth
-                // must not pull mountain terrain towards a global datum.
-                Height -= River.Depth * MaximumValleyWeight;
-            }
-
             WorldPosition.Z = BaseWorldZ + Height;
             MeshView.SetVertexPos(
                 VertexIndex,
@@ -358,7 +300,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("bbeb89be-2cbc-4f44-96ea-7d46fe4cd1f3")
+            TEXT("9cb06824-0dd5-45dc-8f89-bb3d9b49f488")
         );
         return Version;
     }
@@ -382,6 +324,112 @@ using namespace UE::Avenor::TerrainModifier;
 
 UAvenorTerrainModifier::UAvenorTerrainModifier()
 {
+}
+
+double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
+    const FVector2D& WorldPosition
+) const
+{
+    FSettings LocalSettings;
+    LocalSettings.Seed = WorldSeed;
+    LocalSettings.GentleCorridorHalfWidth = GentleCorridorHalfWidth;
+    LocalSettings.FullRoughnessDistance = FMath::Max(
+        GentleCorridorHalfWidth + 1.0,
+        FullRoughnessDistance
+    );
+    LocalSettings.CorridorRoughnessFraction =
+        CorridorRoughnessFraction;
+    LocalSettings.RegionalScale = RegionalScale;
+    LocalSettings.RegionalRelief = RegionalRelief;
+    LocalSettings.HillScale = HillScale;
+    LocalSettings.HillRelief = HillRelief;
+    LocalSettings.MountainMinimumSpineDistance =
+        MountainMinimumSpineDistance;
+
+    TArray<FVector2D> LocalSpinePoints;
+    if (Spine)
+    {
+        const double Start = -UnscaledCoverage.X * 0.5;
+        const double End = UnscaledCoverage.X * 0.5;
+        const double Step = FMath::Max(1000.0, SpineSampleSpacing);
+        for (double Chainage = Start; Chainage < End; Chainage += Step)
+        {
+            const FVector Position =
+                Spine->GetSpineLocationAtChainage(Chainage);
+            LocalSpinePoints.Emplace(Position.X, Position.Y);
+        }
+        const FVector EndPosition =
+            Spine->GetSpineLocationAtChainage(End);
+        LocalSpinePoints.Emplace(EndPosition.X, EndPosition.Y);
+    }
+    else
+    {
+        const FTransform Transform = GetComponentTransform();
+        const FVector Start = Transform.TransformPosition(
+            FVector(-UnscaledCoverage.X * 0.5, 0.0, 0.0)
+        );
+        const FVector End = Transform.TransformPosition(
+            FVector(UnscaledCoverage.X * 0.5, 0.0, 0.0)
+        );
+        LocalSpinePoints.Emplace(Start.X, Start.Y);
+        LocalSpinePoints.Emplace(End.X, End.Y);
+    }
+
+    TArray<FMountain> LocalMountains;
+    FRandomStream Random(WorldSeed);
+    const FTransform ComponentTransform = GetComponentTransform();
+    auto RandomWorldPoint = [&]()
+    {
+        const FVector Local(
+            Random.FRandRange(
+                -UnscaledCoverage.X * 0.5,
+                UnscaledCoverage.X * 0.5
+            ),
+            Random.FRandRange(
+                -UnscaledCoverage.Y * 0.5,
+                UnscaledCoverage.Y * 0.5
+            ),
+            0.0
+        );
+        const FVector World =
+            ComponentTransform.TransformPosition(Local);
+        return FVector2D(World.X, World.Y);
+    };
+
+    for (int32 Index = 0; Index < MountainRegionCount; ++Index)
+    {
+        FVector2D Centre;
+        for (int32 Attempt = 0; Attempt < 32; ++Attempt)
+        {
+            Centre = RandomWorldPoint();
+            if (DistanceToPolyline(Centre, LocalSpinePoints) >=
+                MountainMinimumSpineDistance)
+            {
+                break;
+            }
+        }
+
+        FMountain Mountain;
+        Mountain.Centre = Centre;
+        Mountain.Radius =
+            MountainRadius * Random.FRandRange(0.75, 1.35);
+        Mountain.Height =
+            MountainRelief * Random.FRandRange(0.65, 1.25);
+        LocalMountains.Add(Mountain);
+    }
+
+    return EvaluateLand(
+        WorldPosition,
+        LocalSpinePoints,
+        LocalMountains,
+        LocalSettings
+    );
+}
+
+FBox UAvenorTerrainModifier::GetTerrainWorldBounds() const
+{
+    const TArray<FBox> Bounds = ComputeBounds();
+    return Bounds.IsEmpty() ? FBox(ForceInit) : Bounds[0];
 }
 
 TArray<FBox> UAvenorTerrainModifier::ComputeBounds() const
