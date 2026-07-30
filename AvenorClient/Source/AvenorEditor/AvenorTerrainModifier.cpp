@@ -361,11 +361,12 @@ static double EvaluateLand(
             continue;
         }
 
-        const double LengthEnvelope = Quintic01(
-            1.0 - FMath::Abs(RangeX)
-        );
-        const double CrossEnvelope = FMath::Pow(
-            Quintic01(1.0 - FMath::Abs(RangeY)),
+        // The range boundary is elliptical, so its height envelope must use
+        // that same distance. Independent X/Y envelopes remain non-zero over
+        // most of the ellipse and produce a visible ring-shaped cliff where
+        // the hard boundary test above cuts the mountain contribution off.
+        const double RangeEnvelope = FMath::Pow(
+            Quintic01(1.0 - EllipseDistance),
             0.72
         );
         const double PeakTrain = 0.58 + 0.42 * FMath::Pow(
@@ -383,7 +384,7 @@ static double EvaluateLand(
             ))
         );
 
-        Height += Mountain.Height * LengthEnvelope * CrossEnvelope *
+        Height += Mountain.Height * RangeEnvelope *
             PeakTrain * RidgeDetail * RoughnessTransition;
     }
 
@@ -459,7 +460,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("4528fb41-697a-48dc-ab21-31d468c06d96")
+            TEXT("ef46a871-3446-43b5-b5e9-470059e88565")
         );
         return Version;
     }
