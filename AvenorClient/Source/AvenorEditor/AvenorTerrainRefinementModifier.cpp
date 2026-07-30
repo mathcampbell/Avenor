@@ -16,6 +16,7 @@ struct FAvenorTerrainAnalysisData
     TArray<double> RefinedHeight;
     TArray<double> Accumulation;
     TArray<int32> Downstream;
+    TArray<int32> DrainParent;
 
     int32 Index(int32 X, int32 Y) const
     {
@@ -119,6 +120,7 @@ static void FillDepressions(
 {
     const int32 Count = Grid.Columns * Grid.Rows;
     Grid.FilledHeight = Grid.BaseHeight;
+    Grid.DrainParent.Init(INDEX_NONE, Count);
     TArray<bool> Visited;
     Visited.Init(false, Count);
     std::priority_queue<
@@ -167,6 +169,7 @@ static void FillDepressions(
                 continue;
             }
             Visited[Cell] = true;
+            Grid.DrainParent[Cell] = Current.Index;
             Grid.FilledHeight[Cell] = FMath::Max(
                 Grid.BaseHeight[Cell],
                 Current.Height + Epsilon
@@ -190,8 +193,10 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
                 continue;
             }
             const int32 Current = Grid.Index(X, Y);
-            double BestHeight = Grid.FilledHeight[Current];
-            int32 Best = INDEX_NONE;
+            double BestHeight = Grid.BaseHeight[Current];
+            int32 Best = Grid.DrainParent.IsValidIndex(Current)
+                ? Grid.DrainParent[Current]
+                : INDEX_NONE;
             for (int32 Direction = 0; Direction < 8; ++Direction)
             {
                 const int32 NX = X + DX[Direction];
@@ -201,9 +206,11 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
                     continue;
                 }
                 const int32 Neighbour = Grid.Index(NX, NY);
-                if (Grid.FilledHeight[Neighbour] < BestHeight)
+                if (Grid.BaseHeight[Neighbour] < BestHeight &&
+                    Grid.FilledHeight[Neighbour] <
+                        Grid.FilledHeight[Current])
                 {
-                    BestHeight = Grid.FilledHeight[Neighbour];
+                    BestHeight = Grid.BaseHeight[Neighbour];
                     Best = Neighbour;
                 }
             }
@@ -490,7 +497,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("263fd7f8-6a9a-455a-8a80-490793b1034f")
+            TEXT("0fa34892-e33f-4c6e-b4f9-2a0f670a62c8")
         );
         return Version;
     }
