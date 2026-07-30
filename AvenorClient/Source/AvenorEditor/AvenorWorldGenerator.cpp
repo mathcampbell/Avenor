@@ -296,7 +296,6 @@ static double EvaluateBaseLandform(
     double CorridorFraction,
     double CoastWidth,
     double OceanDepth,
-    double SeaLevel,
     double EdgeBlendWidth
 )
 {
@@ -1238,6 +1237,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     int32 MaximumLakes,
     double CoastWidth,
     double OceanDepth,
+    double SeaLevel,
     double GentleHalfWidth,
     double FullRoughnessDistance,
     double CorridorFraction,
@@ -1602,10 +1602,12 @@ TArray<FBox> UAvenorGeneratedTerrainModifier::ComputeBounds() const
 {
     const AAvenorWorldGenerator* Generator =
         Cast<AAvenorWorldGenerator>(GetOwner());
-    const FBox Bounds = Generator
+    const FBox GenerationBounds = Generator
         ? Generator->GetGenerationBounds()
         : FBox(ForceInit);
-    return Bounds.IsValid ? TArray<FBox>{Bounds} : TArray<FBox>{};
+    return GenerationBounds.IsValid
+        ? TArray<FBox>{GenerationBounds}
+        : TArray<FBox>{};
 }
 
 TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
