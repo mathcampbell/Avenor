@@ -32,6 +32,7 @@ struct FGrid
     TArray<double> FilledHeight;
     TArray<double> Accumulation;
     TArray<int32> Downstream;
+    TArray<int32> DrainParent;
 
     int32 Index(int32 X, int32 Y) const
     {
@@ -96,6 +97,7 @@ static void FillDepressions(FGrid& Grid, double Epsilon)
 {
     const int32 Count = Grid.Columns * Grid.Rows;
     Grid.FilledHeight = Grid.TerrainHeight;
+    Grid.DrainParent.Init(INDEX_NONE, Count);
     TArray<bool> Visited;
     Visited.Init(false, Count);
 
@@ -141,6 +143,7 @@ static void FillDepressions(FGrid& Grid, double Epsilon)
                 continue;
             }
             Visited[Neighbour] = true;
+            Grid.DrainParent[Neighbour] = Current.Index;
             Grid.FilledHeight[Neighbour] = FMath::Max(
                 Grid.TerrainHeight[Neighbour],
                 Current.Height + Epsilon
@@ -169,8 +172,10 @@ static void BuildFlow(FGrid& Grid)
             }
 
             const int32 Current = Grid.Index(X, Y);
-            double BestHeight = Grid.FilledHeight[Current];
-            int32 Best = INDEX_NONE;
+            double BestHeight = Grid.TerrainHeight[Current];
+            int32 Best = Grid.DrainParent.IsValidIndex(Current)
+                ? Grid.DrainParent[Current]
+                : INDEX_NONE;
             for (int32 Direction = 0; Direction < 8; ++Direction)
             {
                 const int32 NX = X + DX[Direction];
@@ -181,9 +186,11 @@ static void BuildFlow(FGrid& Grid)
                 }
 
                 const int32 Neighbour = Grid.Index(NX, NY);
-                if (Grid.FilledHeight[Neighbour] < BestHeight)
+                if (Grid.TerrainHeight[Neighbour] < BestHeight &&
+                    Grid.FilledHeight[Neighbour] <
+                        Grid.FilledHeight[Current])
                 {
-                    BestHeight = Grid.FilledHeight[Neighbour];
+                    BestHeight = Grid.TerrainHeight[Neighbour];
                     Best = Neighbour;
                 }
             }
@@ -341,44 +348,99 @@ static TArray<int32> SelectRiverSources(
     return Selected;
 }
 
-static FVector2D FindLakeShore(
+static TArray<FVector2D> BuildLakeShoreline(
     const FGrid& Grid,
     int32 LakeCell,
-    double Angle,
     double MaximumRadius,
     double MinimumFillDepth
 )
 {
     const FVector2D Centre = Grid.Position(LakeCell);
-    const FVector2D Direction(FMath::Cos(Angle), FMath::Sin(Angle));
-    const double Step = Grid.CellSize * 0.5;
-    FVector2D LastInside =
-        Centre + Direction * FMath::Min(Step, MaximumRadius);
-    for (double Distance = Step;
-         Distance <= MaximumRadius;
-         Distance += Step)
+    TSet<int32> Basin;
+    TArray<int32> Queue;
+    Basin.Add(LakeCell);
+    Queue.Add(LakeCell);
+    int32 QueueHead = 0;
+
+    static constexpr int32 LakeDX[8] =
+        {-1, 0, 1, -1, 1, -1, 0, 1};
+    static constexpr int32 LakeDY[8] =
+        {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    while (QueueHead < Queue.Num() && Basin.Num() < 4096)
     {
-        const FVector2D Point = Centre + Direction * Distance;
-        const int32 X = FMath::FloorToInt(
-            (Point.X - Grid.Bounds.Min.X) / Grid.CellSize
-        );
-        const int32 Y = FMath::FloorToInt(
-            (Point.Y - Grid.Bounds.Min.Y) / Grid.CellSize
-        );
-        if (!Grid.IsValid(X, Y))
+        const int32 Current = Queue[QueueHead++];
+        const int32 X = Current % Grid.Columns;
+        const int32 Y = Current / Grid.Columns;
+        for (int32 Direction = 0; Direction < 8; ++Direction)
         {
-            break;
+            const int32 NX = X + LakeDX[Direction];
+            const int32 NY = Y + LakeDY[Direction];
+            if (!Grid.IsValid(NX, NY))
+            {
+                continue;
+            }
+            const int32 Neighbour = Grid.Index(NX, NY);
+            if (Basin.Contains(Neighbour) ||
+                FVector2D::Distance(
+                    Centre,
+                    Grid.Position(Neighbour)
+                ) > MaximumRadius)
+            {
+                continue;
+            }
+            const double FillDepth =
+                Grid.FilledHeight[Neighbour] -
+                Grid.TerrainHeight[Neighbour];
+            if (FillDepth >= MinimumFillDepth)
+            {
+                Basin.Add(Neighbour);
+                Queue.Add(Neighbour);
+            }
         }
-        const int32 Cell = Grid.Index(X, Y);
-        const double FillDepth =
-            Grid.FilledHeight[Cell] - Grid.TerrainHeight[Cell];
-        if (FillDepth < MinimumFillDepth)
-        {
-            break;
-        }
-        LastInside = Point;
     }
-    return LastInside;
+
+    TArray<int32> Boundary;
+    for (int32 Cell : Basin)
+    {
+        const int32 X = Cell % Grid.Columns;
+        const int32 Y = Cell / Grid.Columns;
+        bool bBoundary = false;
+        for (int32 Direction = 0; Direction < 8; ++Direction)
+        {
+            const int32 NX = X + LakeDX[Direction];
+            const int32 NY = Y + LakeDY[Direction];
+            if (!Grid.IsValid(NX, NY) ||
+                !Basin.Contains(Grid.Index(NX, NY)))
+            {
+                bBoundary = true;
+                break;
+            }
+        }
+        if (bBoundary)
+        {
+            Boundary.Add(Cell);
+        }
+    }
+
+    Boundary.Sort([&Grid, Centre](int32 A, int32 B)
+    {
+        const FVector2D DeltaA = Grid.Position(A) - Centre;
+        const FVector2D DeltaB = Grid.Position(B) - Centre;
+        const double AngleA = FMath::Atan2(DeltaA.Y, DeltaA.X);
+        const double AngleB = FMath::Atan2(DeltaB.Y, DeltaB.X);
+        return FMath::IsNearlyEqual(AngleA, AngleB)
+            ? A < B
+            : AngleA < AngleB;
+    });
+
+    TArray<FVector2D> Shoreline;
+    const int32 Stride = FMath::Max(1, Boundary.Num() / 48);
+    for (int32 Index = 0; Index < Boundary.Num(); Index += Stride)
+    {
+        Shoreline.Add(Grid.Position(Boundary[Index]));
+    }
+    return Shoreline;
 }
 
 static TArray<int32> TraceRiver(const FGrid& Grid, int32 Source)
@@ -630,6 +692,17 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
     {
         const int32 LakeCell = LakeCells[LakeIndex];
         const double SurfaceZ = Grid.FilledHeight[LakeCell];
+        const TArray<FVector2D> Shoreline =
+            BuildLakeShoreline(
+                Grid,
+                LakeCell,
+                LakeRadius * 3.0,
+                MinimumLakeFillDepth * 0.25
+            );
+        if (Shoreline.Num() < 3)
+        {
+            continue;
+        }
 
         AWaterBodyLake* Lake = CreateWaterBody<AWaterBodyLake>(
             World,
@@ -641,24 +714,12 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         if (Lake)
         {
             TArray<FVector> LakePoints;
-            constexpr int32 PointCount = 24;
-            for (int32 PointIndex = 0;
-                 PointIndex < PointCount;
-                 ++PointIndex)
+            LakePoints.Reserve(Shoreline.Num());
+            for (const FVector2D& ShorePoint : Shoreline)
             {
-                const double Angle =
-                    2.0 * PI * static_cast<double>(PointIndex) /
-                    static_cast<double>(PointCount);
-                const FVector2D Shore = FindLakeShore(
-                    Grid,
-                    LakeCell,
-                    Angle,
-                    LakeRadius,
-                    MinimumLakeFillDepth * 0.25
-                );
                 LakePoints.Emplace(
-                    Shore.X,
-                    Shore.Y,
+                    ShorePoint.X,
+                    ShorePoint.Y,
                     SurfaceZ
                 );
             }
@@ -701,7 +762,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
 
         TArray<FVector> RiverPoints;
         double PreviousWaterZ =
-            Grid.FilledHeight[SourceCell] + DrainageEpsilon;
+            Grid.TerrainHeight[SourceCell] - RiverSurfaceInset;
         const int32 Stride = FMath::Max(1, RiverSplineStride);
         for (int32 PathIndex = 0;
              PathIndex < RiverCells.Num();
@@ -711,7 +772,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
             const FVector2D Position = Grid.Position(Cell);
             const double WaterZ = FMath::Min(
                 PreviousWaterZ - DrainageEpsilon,
-                Grid.FilledHeight[Cell] + DrainageEpsilon
+                Grid.TerrainHeight[Cell] - RiverSurfaceInset
             );
             RiverPoints.Emplace(Position.X, Position.Y, WaterZ);
             PreviousWaterZ = WaterZ;
@@ -729,7 +790,8 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
                 LastPosition.Y,
                 FMath::Min(
                     PreviousWaterZ - DrainageEpsilon,
-                    Grid.FilledHeight[LastCell] + DrainageEpsilon
+                    Grid.TerrainHeight[LastCell] -
+                        RiverSurfaceInset
                 )
             );
         }
