@@ -91,7 +91,7 @@ static TWaterBodyActor* CreateWaterBody(
     return WaterBody;
 }
 
-static void ConfigureLinearSpline(
+static void ConfigureWaterSpline(
     UWaterSplineComponent& Spline,
     const TArray<FVector>& Points,
     bool bClosedLoop
@@ -109,7 +109,7 @@ static void ConfigureLinearSpline(
     {
         Spline.SetSplinePointType(
             Index,
-            ESplinePointType::Linear,
+            ESplinePointType::CurveClamped,
             false
         );
     }
@@ -254,7 +254,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         {
             continue;
         }
-        ConfigureLinearSpline(
+        ConfigureWaterSpline(
             *Lake->GetWaterBodyComponent()->GetWaterSpline(),
             Feature.Shoreline,
             true
@@ -284,7 +284,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         {
             continue;
         }
-        ConfigureLinearSpline(
+        ConfigureWaterSpline(
             *River->GetWaterBodyComponent()->GetWaterSpline(),
             Feature.Points,
             false
