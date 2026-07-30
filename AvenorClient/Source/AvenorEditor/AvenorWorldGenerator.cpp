@@ -22,7 +22,9 @@ struct FAvenorRiverDefinition
     TArray<FVector> Points;
     double DischargeCells = 0.0;
     double Width = 600.0;
+    double Depth = 250.0;
     bool bContainsWaterfall = false;
+    FBox2D InfluenceBounds = FBox2D(ForceInit);
 };
 
 struct FAvenorLakeDefinition
@@ -110,6 +112,76 @@ struct FAvenorGeneratedWorld
             ),
             AlphaY
         );
+    }
+
+    // The same curved river definitions used for UE Water splines cut the
+    // final sub-cell channel. The coarse drainage grid selects the route, but
+    // it never leaves a second, straight channel underneath the spline.
+    double SampleTerrainHeight(const FVector2D& Point) const
+    {
+        double Result = Sample(Height, Point);
+        for (const FAvenorRiverDefinition& River : Rivers)
+        {
+            if (!River.InfluenceBounds.IsInside(Point))
+            {
+                continue;
+            }
+            for (int32 Index = 0;
+                 Index + 1 < River.Points.Num();
+                 ++Index)
+            {
+                const FVector& A = River.Points[Index];
+                const FVector& B = River.Points[Index + 1];
+                const FVector2D Segment(
+                    B.X - A.X,
+                    B.Y - A.Y
+                );
+                const double LengthSquared = Segment.SizeSquared();
+                const double Alpha =
+                    LengthSquared > UE_DOUBLE_KINDA_SMALL_NUMBER
+                    ? FMath::Clamp(
+                        FVector2D::DotProduct(
+                            Point - FVector2D(A),
+                            Segment
+                        ) / LengthSquared,
+                        0.0,
+                        1.0
+                    )
+                    : 0.0;
+                const FVector2D Closest =
+                    FVector2D(A) + Segment * Alpha;
+                const double Distance =
+                    FVector2D::Distance(Point, Closest);
+                const double HalfBedWidth =
+                    FMath::Max(100.0, River.Width * 0.5);
+                const double BankWidth =
+                    FMath::Max(CellSize * 0.35, River.Width);
+                if (Distance >= HalfBedWidth + BankWidth)
+                {
+                    continue;
+                }
+                const double SurfaceHeight =
+                    FMath::Lerp(A.Z, B.Z, Alpha);
+                const double BedHeight =
+                    SurfaceHeight - River.Depth;
+                const double BankAlpha = FMath::Clamp(
+                    (Distance - HalfBedWidth) / BankWidth,
+                    0.0,
+                    1.0
+                );
+                const double SmoothBankAlpha =
+                    BankAlpha * BankAlpha *
+                    (3.0 - 2.0 * BankAlpha);
+                const double Weight = Distance <= HalfBedWidth
+                    ? 1.0
+                    : 1.0 - SmoothBankAlpha;
+                Result = FMath::Min(
+                    Result,
+                    FMath::Lerp(Result, BedHeight, Weight)
+                );
+            }
+        }
+        return Result;
     }
 };
 
@@ -736,9 +808,15 @@ static void AddMeanders(
             PI * static_cast<double>(Index) /
             static_cast<double>(Points.Num() - 1)
         );
+        // Two deterministic wavelengths avoid the regular single-sine look.
+        // Steep headwaters remain comparatively direct; broad lowland reaches
+        // receive the full lateral migration.
+        const double MeanderSignal =
+            FMath::Sin(Phase + Index * 0.82) * 0.72 +
+            FMath::Sin(Phase * 1.73 + Index * 1.91) * 0.28;
         const double Offset =
-            FMath::Sin(Phase + Index * 1.35) *
-            Grid.CellSize * Strength * Flatness * EndWeight;
+            MeanderSignal * Grid.CellSize * Strength *
+            Flatness * EndWeight;
         Points[Index].X += Normal.X * Offset;
         Points[Index].Y += Normal.Y * Offset;
     }
@@ -749,6 +827,7 @@ static void ExtractRivers(
     double StreamStart,
     double HeadwaterWidth,
     double MainWidth,
+    double MaximumDepth,
     double MeanderStrength,
     int32 MaximumReaches,
     bool bWaterfalls,
@@ -844,6 +923,11 @@ static void ExtractRivers(
             MainWidth,
             WidthAlpha
         );
+        River.Depth = FMath::Lerp(
+            FMath::Min(250.0, MaximumDepth),
+            MaximumDepth,
+            WidthAlpha
+        );
         double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
@@ -877,6 +961,15 @@ static void ExtractRivers(
             );
             PreviousSurface = Point.Z;
         }
+        FBox2D CentrelineBounds(ForceInit);
+        for (const FVector& Point : River.Points)
+        {
+            CentrelineBounds += FVector2D(Point);
+        }
+        River.InfluenceBounds = CentrelineBounds.ExpandBy(
+            FMath::Max(Grid.CellSize * 0.35, River.Width) +
+            River.Width * 0.5
+        );
         Grid.Rivers.Add(MoveTemp(River));
     }
     Grid.Rivers.Sort([](
@@ -1148,17 +1241,39 @@ static void ExtractLakes(
             continue;
         }
         TSet<int32> Wet;
+        int32 MinimumX = Grid.Columns;
+        int32 MinimumY = Grid.Rows;
+        int32 MaximumX = 0;
+        int32 MaximumY = 0;
         for (int32 Cell : Basin)
         {
             if (Grid.Height[Cell] < Surface - 1.0)
             {
                 Wet.Add(Cell);
+                const int32 X = Cell % Grid.Columns;
+                const int32 Y = Cell / Grid.Columns;
+                MinimumX = FMath::Min(MinimumX, X);
+                MinimumY = FMath::Min(MinimumY, Y);
+                MaximumX = FMath::Max(MaximumX, X);
+                MaximumY = FMath::Max(MaximumY, Y);
             }
         }
         const double AreaSquareKilometres =
             Wet.Num() * CellArea / 10000000000.0;
+        const int32 WidthCells = MaximumX - MinimumX + 1;
+        const int32 HeightCells = MaximumY - MinimumY + 1;
+        const int32 ShortAxis = FMath::Min(WidthCells, HeightCells);
+        const int32 LongAxis = FMath::Max(WidthCells, HeightCells);
+        const double AspectRatio = static_cast<double>(LongAxis) /
+            FMath::Max(1, ShortAxis);
+        const double FootprintOccupancy =
+            static_cast<double>(Wet.Num()) /
+            FMath::Max(1, WidthCells * HeightCells);
         if (Wet.Num() < 4 ||
-            AreaSquareKilometres > MaximumAreaSquareKilometres)
+            AreaSquareKilometres > MaximumAreaSquareKilometres ||
+            ShortAxis < 3 ||
+            AspectRatio > 4.0 ||
+            FootprintOccupancy < 0.18)
         {
             continue;
         }
@@ -1358,7 +1473,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     Grid->Height = Grid->BaseHeight;
     CarveDrainage(
         *Grid,
-        bRivers,
+        false,
         bValleys,
         bCanyons,
         StreamStart,
@@ -1390,6 +1505,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             StreamStart,
             HeadwaterWidth,
             MainWidth,
+            RiverDepth,
             Meander,
             MaximumRivers,
             bWaterfalls,
@@ -1478,10 +1594,10 @@ public:
             FVector3d WorldPosition = MeshTransform.TransformPosition(
                 MeshView.GetVertexPos(Vertex)
             );
-            WorldPosition.Z = BaseWorldZ + WorldData->Sample(
-                WorldData->Height,
-                FVector2D(WorldPosition.X, WorldPosition.Y)
-            );
+            WorldPosition.Z = BaseWorldZ +
+                WorldData->SampleTerrainHeight(
+                    FVector2D(WorldPosition.X, WorldPosition.Y)
+                );
             MeshView.SetVertexPos(
                 Vertex,
                 MeshTransform.InverseTransformPosition(WorldPosition)
@@ -1507,11 +1623,7 @@ public:
 template<typename TWaterBodyActor>
 static TWaterBodyActor* CreateWaterBody(
     UWorld* World,
-    UE::MeshPartition::AMeshPartition* MeshPartition,
-    const FString& Label,
-    const TCHAR* ModifierClassPath,
-    double FalloffWidth,
-    UE::MeshPartition::UModifierComponent*& OutLastModifier
+    const FString& Label
 )
 {
     UActorFactory* Factory =
@@ -1536,37 +1648,9 @@ static TWaterBodyActor* CreateWaterBody(
     WaterBody->SetActorLabel(Label);
     WaterBody->SetFolderPath(TEXT("Avenor/Generated/Water"));
     WaterBody->Tags.AddUnique(GeneratedWaterTag);
-    UWaterBodyComponent* WaterComponent =
-        WaterBody->GetWaterBodyComponent();
-    WaterComponent->WaterHeightmapSettings.FalloffSettings.FalloffMode =
-        EWaterBrushFalloffMode::Width;
-    WaterComponent->WaterHeightmapSettings.FalloffSettings.FalloffWidth =
-        FalloffWidth;
-
-    UClass* ModifierClass =
-        LoadClass<UE::MeshPartition::UModifierComponent>(
-            nullptr,
-            ModifierClassPath
-        );
-    if (!ModifierClass)
-    {
-        World->EditorDestroyActor(WaterBody, true);
-        return nullptr;
-    }
-    UE::MeshPartition::UModifierComponent* Modifier =
-        NewObject<UE::MeshPartition::UModifierComponent>(
-            WaterBody,
-            ModifierClass,
-            ModifierClass->GetFName()
-        );
-    WaterBody->AddInstanceComponent(Modifier);
-    Modifier->AttachToComponent(
-        WaterComponent,
-        FAttachmentTransformRules::KeepWorldTransform
-    );
-    Modifier->RegisterComponent();
-    Modifier->SetAffectedMeshPartition(MeshPartition);
-    OutLastModifier = Modifier;
+    // The unified generator has already carved this exact shoreline/channel
+    // into its heightfield. Attaching MeshPartitionWater modifiers here would
+    // apply a second deformation and raise lake margins into platforms.
     return WaterBody;
 }
 
@@ -1738,7 +1822,7 @@ double AAvenorWorldGenerator::GetGeneratedHeightAtWorldPosition(
         GetOrGenerateWorld();
     return Data
         ? GetActorLocation().Z +
-            Data->Sample(Data->Height, WorldPosition)
+            Data->SampleTerrainHeight(WorldPosition)
         : GetActorLocation().Z;
 }
 
@@ -1796,16 +1880,11 @@ void AAvenorWorldGenerator::CreateWaterBodies(
         return;
     }
 
-    UE::MeshPartition::UModifierComponent* LastModifier = nullptr;
     if (WorldData->OceanBoundary.Num() >= 4)
     {
         AWaterBodyOcean* Ocean = CreateWaterBody<AWaterBodyOcean>(
             World,
-            MeshPartition,
-            TEXT("Avenor_Ocean"),
-            TEXT("/Script/MeshPartitionWater.OceanModifier"),
-            CoastTransitionWidth,
-            LastModifier
+            TEXT("Avenor_Ocean")
         );
         if (Ocean)
         {
@@ -1828,11 +1907,7 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             WorldData->Lakes[Index];
         AWaterBodyLake* Lake = CreateWaterBody<AWaterBodyLake>(
             World,
-            MeshPartition,
-            FString::Printf(TEXT("Avenor_Lake_%02d"), Index + 1),
-            TEXT("/Script/MeshPartitionWater.LakeModifier"),
-            LakeFalloffWidth,
-            LastModifier
+            FString::Printf(TEXT("Avenor_Lake_%02d"), Index + 1)
         );
         if (Lake)
         {
@@ -1855,11 +1930,7 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             WorldData->Rivers[Index];
         AWaterBodyRiver* River = CreateWaterBody<AWaterBodyRiver>(
             World,
-            MeshPartition,
-            FString::Printf(TEXT("Avenor_River_%03d"), Index + 1),
-            TEXT("/Script/MeshPartitionWater.RiverModifier"),
-            RiverFalloffWidth,
-            LastModifier
+            FString::Printf(TEXT("Avenor_River_%03d"), Index + 1)
         );
         if (River)
         {
@@ -1875,11 +1946,6 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             );
             River->PostEditChange();
         }
-    }
-    if (LastModifier)
-    {
-        LastModifier->SetAffectedMeshPartition(nullptr);
-        LastModifier->BP_SetAffectedMegaMesh(MeshPartition);
     }
 #endif
 }
