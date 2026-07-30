@@ -16,6 +16,8 @@ struct FAvenorTerrainAnalysisData
     TArray<double> RefinedHeight;
     TArray<double> Accumulation;
     TArray<int32> Downstream;
+    TArray<int32> SecondaryDownstream;
+    TArray<double> PrimaryFlowWeight;
     TArray<int32> DrainParent;
 
     int32 Index(int32 X, int32 Y) const
@@ -105,8 +107,10 @@ struct FSettings
     bool bStreamIncision = true;
     double StreamStartArea = 20.0;
     double MaximumIncision = 6000.0;
+    int32 FluvialIterations = 12;
+    double HeadwaterSlopeExponent = 0.5;
     double MinimumLakeFillDepth = 1000.0;
-    double LakeBedDepth = 2500.0;
+    double MinimumLakeCatchment = 80.0;
     bool bFloodplains = true;
     double FloodplainStartArea = 80.0;
     double FloodplainSmoothing = 0.35;
@@ -121,7 +125,7 @@ static void FillDepressions(
 )
 {
     const int32 Count = Grid.Columns * Grid.Rows;
-    Grid.FilledHeight = Grid.BaseHeight;
+    Grid.FilledHeight = Grid.RefinedHeight;
     Grid.DrainParent.Init(INDEX_NONE, Count);
     TArray<bool> Visited;
     Visited.Init(false, Count);
@@ -173,7 +177,7 @@ static void FillDepressions(
             Visited[Cell] = true;
             Grid.DrainParent[Cell] = Current.Index;
             Grid.FilledHeight[Cell] = FMath::Max(
-                Grid.BaseHeight[Cell],
+                Grid.RefinedHeight[Cell],
                 Current.Height + Epsilon
             );
             Queue.push({Grid.FilledHeight[Cell], Cell});
@@ -185,6 +189,8 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
 {
     const int32 Count = Grid.Columns * Grid.Rows;
     Grid.Downstream.Init(INDEX_NONE, Count);
+    Grid.SecondaryDownstream.Init(INDEX_NONE, Count);
+    Grid.PrimaryFlowWeight.Init(1.0, Count);
     Grid.Accumulation.Init(1.0, Count);
     for (int32 Y = 0; Y < Grid.Rows; ++Y)
     {
@@ -195,10 +201,10 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
                 continue;
             }
             const int32 Current = Grid.Index(X, Y);
-            double BestHeight = Grid.BaseHeight[Current];
-            int32 Best = Grid.DrainParent.IsValidIndex(Current)
-                ? Grid.DrainParent[Current]
-                : INDEX_NONE;
+            double BestSlope = 0.0;
+            double SecondSlope = 0.0;
+            int32 Best = INDEX_NONE;
+            int32 Second = INDEX_NONE;
             for (int32 Direction = 0; Direction < 8; ++Direction)
             {
                 const int32 NX = X + DX[Direction];
@@ -208,15 +214,39 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
                     continue;
                 }
                 const int32 Neighbour = Grid.Index(NX, NY);
-                if (Grid.BaseHeight[Neighbour] < BestHeight &&
-                    Grid.FilledHeight[Neighbour] <
-                        Grid.FilledHeight[Current])
+                const double Distance = Grid.CellSize *
+                    ((DX[Direction] != 0 && DY[Direction] != 0)
+                        ? 1.4142135623730951
+                        : 1.0);
+                const double Slope =
+                    (Grid.FilledHeight[Current] -
+                        Grid.FilledHeight[Neighbour]) / Distance;
+                if (Slope > BestSlope)
                 {
-                    BestHeight = Grid.BaseHeight[Neighbour];
+                    SecondSlope = BestSlope;
+                    Second = Best;
+                    BestSlope = Slope;
                     Best = Neighbour;
                 }
+                else if (Slope > SecondSlope)
+                {
+                    SecondSlope = Slope;
+                    Second = Neighbour;
+                }
+            }
+            if (Best == INDEX_NONE &&
+                Grid.DrainParent.IsValidIndex(Current))
+            {
+                Best = Grid.DrainParent[Current];
+                BestSlope = 1.0;
             }
             Grid.Downstream[Current] = Best;
+            Grid.SecondaryDownstream[Current] = Second;
+            const double TotalSlope = BestSlope + SecondSlope;
+            Grid.PrimaryFlowWeight[Current] =
+                Second != INDEX_NONE && TotalSlope > 0.0
+                    ? BestSlope / TotalSlope
+                    : 1.0;
         }
     }
 
@@ -235,7 +265,16 @@ static void BuildFlow(FAvenorTerrainAnalysisData& Grid)
         const int32 Downstream = Grid.Downstream[Cell];
         if (Downstream != INDEX_NONE)
         {
-            Grid.Accumulation[Downstream] += Grid.Accumulation[Cell];
+            const double PrimaryShare =
+                Grid.Accumulation[Cell] *
+                Grid.PrimaryFlowWeight[Cell];
+            Grid.Accumulation[Downstream] += PrimaryShare;
+            const int32 Secondary = Grid.SecondaryDownstream[Cell];
+            if (Secondary != INDEX_NONE)
+            {
+                Grid.Accumulation[Secondary] +=
+                    Grid.Accumulation[Cell] - PrimaryShare;
+            }
         }
     }
 }
@@ -301,94 +340,141 @@ static void ApplyThermalErosion(
     }
 }
 
-static void ApplyDrainageRefinement(
-    FAvenorTerrainAnalysisData& Grid,
-    const FSettings& Settings
+static double DownstreamSlope(
+    const FAvenorTerrainAnalysisData& Grid,
+    int32 Cell
 )
 {
-    TArray<double> ChannelDelta;
-    ChannelDelta.SetNumZeroed(Grid.RefinedHeight.Num());
+    const int32 Downstream = Grid.Downstream[Cell];
+    if (Downstream == INDEX_NONE)
+    {
+        return 0.0;
+    }
+    const FVector2D A = Grid.Position(Cell);
+    const FVector2D B = Grid.Position(Downstream);
+    return FMath::Max(
+        0.0,
+        (Grid.FilledHeight[Cell] -
+            Grid.FilledHeight[Downstream]) /
+            FMath::Max(1.0, FVector2D::Distance(A, B))
+    );
+}
+
+static double ChannelMetric(
+    const FAvenorTerrainAnalysisData& Grid,
+    const FSettings& Settings,
+    int32 Cell
+)
+{
+    const double NormalizedSlope = FMath::Max(
+        0.05,
+        DownstreamSlope(Grid, Cell) / 0.01
+    );
+    return Grid.Accumulation[Cell] * FMath::Pow(
+        NormalizedSlope,
+        Settings.HeadwaterSlopeExponent
+    );
+}
+
+static void ApplyFluvialErosionIteration(
+    FAvenorTerrainAnalysisData& Grid,
+    const FSettings& Settings,
+    double IterationStrength
+)
+{
+    if (!Settings.bStreamIncision)
+    {
+        return;
+    }
+    TArray<double> Delta;
+    Delta.SetNumZeroed(Grid.RefinedHeight.Num());
     for (int32 Y = 1; Y < Grid.Rows - 1; ++Y)
     {
         for (int32 X = 1; X < Grid.Columns - 1; ++X)
         {
             const int32 Cell = Grid.Index(X, Y);
-            const double Area = Grid.Accumulation[Cell];
-            if (Settings.bStreamIncision &&
-                Area >= Settings.StreamStartArea)
+            const double Metric = ChannelMetric(Grid, Settings, Cell);
+            if (Metric < Settings.StreamStartArea)
             {
-                const double Strength = FMath::Clamp(
-                    FMath::Loge(
-                        Area / Settings.StreamStartArea + 1.0
-                    ) / 5.0,
-                    0.0,
-                    1.0
-                );
-                const double Incision =
-                    Settings.MaximumIncision * Strength;
-                const int32 Radius = FMath::Clamp(
-                    FMath::FloorToInt(
-                        FMath::Sqrt(
-                            Area / Settings.StreamStartArea
-                        ) * 0.45
-                    ),
-                    0,
-                    3
-                );
-                for (int32 OffsetY = -Radius;
-                     OffsetY <= Radius;
-                     ++OffsetY)
+                continue;
+            }
+            const double Slope = DownstreamSlope(Grid, Cell);
+            const double StreamPower =
+                FMath::Pow(
+                    Metric / Settings.StreamStartArea,
+                    0.45
+                ) *
+                FMath::Pow(FMath::Max(0.0001, Slope), 0.8);
+            const double Incision = FMath::Min(
+                Settings.MaximumIncision * IterationStrength,
+                Settings.MaximumIncision *
+                    IterationStrength *
+                    StreamPower * 4.0
+            );
+            const int32 Radius = FMath::Clamp(
+                1 + FMath::FloorToInt(
+                    FMath::Sqrt(
+                        Grid.Accumulation[Cell] /
+                        Settings.StreamStartArea
+                    ) * 0.2
+                ),
+                1,
+                3
+            );
+            for (int32 OffsetY = -Radius;
+                 OffsetY <= Radius;
+                 ++OffsetY)
+            {
+                for (int32 OffsetX = -Radius;
+                     OffsetX <= Radius;
+                     ++OffsetX)
                 {
-                    for (int32 OffsetX = -Radius;
-                         OffsetX <= Radius;
-                         ++OffsetX)
+                    const double Distance = FMath::Sqrt(
+                        static_cast<double>(
+                            OffsetX * OffsetX +
+                            OffsetY * OffsetY
+                        )
+                    );
+                    if (Distance > Radius + 0.25)
                     {
-                        const double Distance = FMath::Sqrt(
-                            static_cast<double>(
-                                OffsetX * OffsetX +
-                                OffsetY * OffsetY
-                            )
-                        );
-                        if (Distance > Radius + 0.25)
-                        {
-                            continue;
-                        }
-                        const int32 AffectedX = X + OffsetX;
-                        const int32 AffectedY = Y + OffsetY;
-                        if (!Grid.IsValid(AffectedX, AffectedY))
-                        {
-                            continue;
-                        }
-                        const int32 Affected = Grid.Index(
-                            AffectedX,
-                            AffectedY
-                        );
-                        const double Falloff = Radius > 0
-                            ? 1.0 - Distance / (Radius + 0.5)
-                            : 1.0;
-                        ChannelDelta[Affected] = FMath::Min(
-                            ChannelDelta[Affected],
-                            -Incision * Falloff
-                        );
+                        continue;
                     }
+                    const int32 AffectedX = X + OffsetX;
+                    const int32 AffectedY = Y + OffsetY;
+                    if (!Grid.IsValid(AffectedX, AffectedY))
+                    {
+                        continue;
+                    }
+                    const int32 Affected = Grid.Index(
+                        AffectedX,
+                        AffectedY
+                    );
+                    const double Falloff = FMath::Square(
+                        FMath::Clamp(
+                            1.0 - Distance / (Radius + 0.5),
+                            0.0,
+                            1.0
+                        )
+                    );
+                    Delta[Affected] = FMath::Min(
+                        Delta[Affected],
+                        -Incision * Falloff
+                    );
                 }
             }
         }
     }
     for (int32 Cell = 0; Cell < Grid.RefinedHeight.Num(); ++Cell)
     {
-        Grid.RefinedHeight[Cell] += ChannelDelta[Cell];
-        const double FillDepth =
-            Grid.FilledHeight[Cell] - Grid.BaseHeight[Cell];
-        if (FillDepth >= Settings.MinimumLakeFillDepth)
-        {
-            Grid.RefinedHeight[Cell] = FMath::Min(
-                Grid.RefinedHeight[Cell],
-                Grid.FilledHeight[Cell] - Settings.LakeBedDepth
-            );
-        }
+        Grid.RefinedHeight[Cell] += Delta[Cell];
     }
+}
 
+static void ApplyFloodplainRefinement(
+    FAvenorTerrainAnalysisData& Grid,
+    const FSettings& Settings
+)
+{
     if (!Settings.bFloodplains)
     {
         return;
@@ -400,8 +486,7 @@ static void ApplyDrainageRefinement(
         {
             const int32 Cell = Grid.Index(X, Y);
             const double Area = Grid.Accumulation[Cell];
-            if (Settings.bFloodplains &&
-                Area >= Settings.FloodplainStartArea)
+            if (Area >= Settings.FloodplainStartArea)
             {
                 double NeighbourAverage = 0.0;
                 for (int32 Direction = 0; Direction < 8; ++Direction)
@@ -485,10 +570,34 @@ static TSharedPtr<const FAvenorTerrainAnalysisData> BuildAnalysis(
             );
     }
     Grid->RefinedHeight = Grid->BaseHeight;
-    FillDepressions(*Grid, FMath::Max(0.01, Settings.DrainageEpsilon));
-    BuildFlow(*Grid);
     ApplyThermalErosion(*Grid, Settings);
-    ApplyDrainageRefinement(*Grid, Settings);
+    const int32 Iterations = Settings.bStreamIncision
+        ? FMath::Max(1, Settings.FluvialIterations)
+        : 1;
+    for (int32 Iteration = 0; Iteration < Iterations; ++Iteration)
+    {
+        FillDepressions(
+            *Grid,
+            FMath::Max(0.01, Settings.DrainageEpsilon)
+        );
+        BuildFlow(*Grid);
+        ApplyFluvialErosionIteration(
+            *Grid,
+            Settings,
+            1.0 / Iterations
+        );
+    }
+    FillDepressions(
+        *Grid,
+        FMath::Max(0.01, Settings.DrainageEpsilon)
+    );
+    BuildFlow(*Grid);
+    ApplyFloodplainRefinement(*Grid, Settings);
+    FillDepressions(
+        *Grid,
+        FMath::Max(0.01, Settings.DrainageEpsilon)
+    );
+    BuildFlow(*Grid);
     return Grid;
 }
 
@@ -614,34 +723,159 @@ static TArray<FIntPoint> TraceLargestBoundary(
     return Largest;
 }
 
+static TArray<FVector> SmoothPolyline(
+    const TArray<FVector>& Input,
+    bool bClosed,
+    int32 Iterations
+)
+{
+    TArray<FVector> Points = Input;
+    for (int32 Iteration = 0;
+         Iteration < Iterations && Points.Num() >= (bClosed ? 3 : 2);
+         ++Iteration)
+    {
+        TArray<FVector> Smoothed;
+        if (!bClosed)
+        {
+            Smoothed.Add(Points[0]);
+        }
+        const int32 SegmentCount = bClosed
+            ? Points.Num()
+            : Points.Num() - 1;
+        for (int32 Index = 0; Index < SegmentCount; ++Index)
+        {
+            const FVector& A = Points[Index];
+            const FVector& B = Points[(Index + 1) % Points.Num()];
+            Smoothed.Add(FMath::Lerp(A, B, 0.25));
+            Smoothed.Add(FMath::Lerp(A, B, 0.75));
+        }
+        if (!bClosed)
+        {
+            Smoothed.Add(Points.Last());
+        }
+        Points = MoveTemp(Smoothed);
+    }
+    return Points;
+}
+
+static void AddLowlandMeanders(
+    const FAvenorTerrainAnalysisData& Grid,
+    TArray<FVector>& Points
+)
+{
+    if (Points.Num() < 4)
+    {
+        return;
+    }
+    const double Phase = FMath::Fmod(
+        FMath::Abs(
+            Points[0].X * 0.000017 +
+            Points[0].Y * 0.000031
+        ),
+        2.0 * PI
+    );
+    for (int32 Index = 1; Index < Points.Num() - 1; ++Index)
+    {
+        const FVector2D Previous(Points[Index - 1]);
+        const FVector2D Next(Points[Index + 1]);
+        const FVector2D Direction =
+            (Next - Previous).GetSafeNormal();
+        if (Direction.IsNearlyZero())
+        {
+            continue;
+        }
+        const double Run = FMath::Max(
+            1.0,
+            FVector2D::Distance(Previous, Next)
+        );
+        const double Slope = FMath::Abs(
+            Points[Index - 1].Z - Points[Index + 1].Z
+        ) / Run;
+        const double Flatness = 1.0 - FMath::SmoothStep(
+            0.002,
+            0.02,
+            Slope
+        );
+        const double EndWeight = FMath::Sin(
+            PI * static_cast<double>(Index) /
+            (Points.Num() - 1)
+        );
+        const double Offset =
+            FMath::Sin(Phase + Index * 1.35) *
+            Grid.CellSize * 0.22 *
+            Flatness * EndWeight;
+        const FVector2D Normal(-Direction.Y, Direction.X);
+        Points[Index].X += Normal.X * Offset;
+        Points[Index].Y += Normal.Y * Offset;
+    }
+}
+
 static void ExtractRiverReaches(
     const FAvenorTerrainAnalysisData& Grid,
     double StreamThreshold,
+    double SlopeExponent,
     int32 MaximumReaches,
     double SurfaceInset,
     TArray<FAvenorRiverReach>& OutRivers
 )
 {
     const int32 Count = Grid.Downstream.Num();
-    TArray<bool> IsChannel;
-    IsChannel.Init(false, Count);
-    TArray<int32> UpstreamCount;
-    UpstreamCount.Init(0, Count);
-    for (int32 Cell = 0; Cell < Count; ++Cell)
+    auto Metric = [&Grid, SlopeExponent](int32 Cell)
     {
-        IsChannel[Cell] =
-            Grid.Accumulation[Cell] >= StreamThreshold &&
-            Grid.Downstream[Cell] != INDEX_NONE;
-    }
-    for (int32 Cell = 0; Cell < Count; ++Cell)
+        const double NormalizedSlope = FMath::Max(
+            0.05,
+            DownstreamSlope(Grid, Cell) / 0.01
+        );
+        return Grid.Accumulation[Cell] *
+            FMath::Pow(NormalizedSlope, SlopeExponent);
+    };
+    auto BuildChannelMask = [&](
+        double Threshold,
+        TArray<bool>& OutMask,
+        TArray<int32>& OutUpstreamCount
+    )
     {
-        const int32 Downstream = Grid.Downstream[Cell];
-        if (IsChannel[Cell] &&
-            Downstream != INDEX_NONE &&
-            IsChannel[Downstream])
+        OutMask.Init(false, Count);
+        OutUpstreamCount.Init(0, Count);
+        for (int32 Cell = 0; Cell < Count; ++Cell)
         {
-            ++UpstreamCount[Downstream];
+            OutMask[Cell] =
+                Metric(Cell) >= Threshold &&
+                Grid.Downstream[Cell] != INDEX_NONE;
         }
+        for (int32 Cell = 0; Cell < Count; ++Cell)
+        {
+            const int32 Downstream = Grid.Downstream[Cell];
+            if (OutMask[Cell] &&
+                Downstream != INDEX_NONE &&
+                OutMask[Downstream])
+            {
+                ++OutUpstreamCount[Downstream];
+            }
+        }
+    };
+
+    TArray<bool> IsChannel;
+    TArray<int32> UpstreamCount;
+    double EffectiveThreshold = StreamThreshold;
+    for (int32 Attempt = 0; Attempt < 24; ++Attempt)
+    {
+        BuildChannelMask(
+            EffectiveThreshold,
+            IsChannel,
+            UpstreamCount
+        );
+        int32 ReachCount = 0;
+        for (int32 Cell = 0; Cell < Count; ++Cell)
+        {
+            ReachCount += IsChannel[Cell] &&
+                UpstreamCount[Cell] != 1;
+        }
+        if (MaximumReaches < 0 || ReachCount <= MaximumReaches)
+        {
+            break;
+        }
+        EffectiveThreshold *= 1.35;
     }
 
     for (int32 Start = 0; Start < Count; ++Start)
@@ -682,20 +916,32 @@ static void ExtractRiverReaches(
 
         FAvenorRiverReach Reach;
         Reach.DischargeCells = Grid.Accumulation[Cells.Last()];
-        Reach.Points.Reserve(Cells.Num());
+        TArray<FVector> RawPoints;
+        RawPoints.Reserve(Cells.Num());
         double PreviousZ = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
             const FVector2D XY = Grid.Position(Cell);
-            // The refined height is the carved bed. The water surface follows
-            // the pre-incision landform, inset slightly, and is constrained
-            // to run downhill along the same drainage reach.
             const double Z = FMath::Min(
                 PreviousZ - 1.0,
-                Grid.BaseHeight[Cell] - SurfaceInset
+                Grid.RefinedHeight[Cell] - SurfaceInset
             );
-            Reach.Points.Emplace(XY.X, XY.Y, Z);
+            RawPoints.Emplace(XY.X, XY.Y, Z);
             PreviousZ = Z;
+        }
+        AddLowlandMeanders(Grid, RawPoints);
+        Reach.Points = SmoothPolyline(RawPoints, false, 2);
+        PreviousZ = TNumericLimits<double>::Max();
+        for (FVector& Point : Reach.Points)
+        {
+            Point.Z = FMath::Min(
+                PreviousZ - 1.0,
+                Grid.Sample(
+                    Grid.RefinedHeight,
+                    FVector2D(Point)
+                ) - SurfaceInset
+            );
+            PreviousZ = Point.Z;
         }
         OutRivers.Add(MoveTemp(Reach));
     }
@@ -707,15 +953,12 @@ static void ExtractRiverReaches(
     {
         return A.DischargeCells > B.DischargeCells;
     });
-    if (MaximumReaches >= 0 && OutRivers.Num() > MaximumReaches)
-    {
-        OutRivers.SetNum(MaximumReaches);
-    }
 }
 
 static void ExtractLakeBasins(
     const FAvenorTerrainAnalysisData& Grid,
     double MinimumFillDepth,
+    double MinimumCatchment,
     int32 MaximumLakes,
     TArray<FAvenorLakeBasin>& OutLakes
 )
@@ -729,7 +972,7 @@ static void ExtractLakeBasins(
     for (int32 Seed = 0; Seed < Count; ++Seed)
     {
         if (Visited[Seed] ||
-            Grid.FilledHeight[Seed] - Grid.BaseHeight[Seed] <
+            Grid.FilledHeight[Seed] - Grid.RefinedHeight[Seed] <
                 MinimumFillDepth)
         {
             continue;
@@ -741,6 +984,7 @@ static void ExtractLakeBasins(
         Visited[Seed] = true;
         bool bTouchesBoundary = false;
         double SurfaceHeight = TNumericLimits<double>::Lowest();
+        double MaximumCatchment = 0.0;
         for (int32 Head = 0; Head < Queue.Num(); ++Head)
         {
             const int32 Cell = Queue[Head];
@@ -751,6 +995,10 @@ static void ExtractLakeBasins(
             SurfaceHeight = FMath::Max(
                 SurfaceHeight,
                 Grid.FilledHeight[Cell]
+            );
+            MaximumCatchment = FMath::Max(
+                MaximumCatchment,
+                Grid.Accumulation[Cell]
             );
             const int32 X = Cell % Grid.Columns;
             const int32 Y = Cell / Grid.Columns;
@@ -766,7 +1014,7 @@ static void ExtractLakeBasins(
                 const int32 Neighbour = Grid.Index(NX, NY);
                 if (!Visited[Neighbour] &&
                     Grid.FilledHeight[Neighbour] -
-                        Grid.BaseHeight[Neighbour] >=
+                        Grid.RefinedHeight[Neighbour] >=
                             MinimumFillDepth)
                 {
                     Visited[Neighbour] = true;
@@ -774,7 +1022,9 @@ static void ExtractLakeBasins(
                 }
             }
         }
-        if (bTouchesBoundary || Basin.Num() < 4)
+        if (bTouchesBoundary ||
+            Basin.Num() < 4 ||
+            MaximumCatchment < MinimumCatchment)
         {
             continue;
         }
@@ -790,17 +1040,23 @@ static void ExtractLakeBasins(
         Lake.SurfaceHeight = SurfaceHeight;
         Lake.CellCount = Basin.Num();
         const int32 Stride = FMath::Max(1, Boundary.Num() / 96);
+        TArray<FVector> RawShoreline;
         for (int32 Index = 0;
              Index < Boundary.Num();
              Index += Stride)
         {
             const FIntPoint Corner = Boundary[Index];
-            Lake.Shoreline.Emplace(
+            RawShoreline.Emplace(
                 Grid.Bounds.Min.X + Corner.X * Grid.CellSize,
                 Grid.Bounds.Min.Y + Corner.Y * Grid.CellSize,
                 SurfaceHeight
             );
         }
+        Lake.Shoreline = SmoothPolyline(
+            RawShoreline,
+            true,
+            2
+        );
         OutLakes.Add(MoveTemp(Lake));
     }
 
@@ -885,7 +1141,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("52c542a7-314f-45ae-a304-d0080d9ddcf4")
+            TEXT("8ed665c4-a4ac-4f7f-8148-7b996f10c75f")
         );
         return Version;
     }
@@ -947,8 +1203,10 @@ UAvenorTerrainRefinementModifier::GetOrBuildAnalysis() const
     Settings.bStreamIncision = bEnableStreamIncision;
     Settings.StreamStartArea = StreamStartAreaCells;
     Settings.MaximumIncision = MaximumStreamIncision;
+    Settings.FluvialIterations = FluvialErosionIterations;
+    Settings.HeadwaterSlopeExponent = HeadwaterSlopeExponent;
     Settings.MinimumLakeFillDepth = MinimumLakeFillDepth;
-    Settings.LakeBedDepth = LakeBedDepth;
+    Settings.MinimumLakeCatchment = MinimumLakeCatchmentCells;
     Settings.bFloodplains = bEnableFloodplains;
     Settings.FloodplainStartArea = FloodplainStartAreaCells;
     Settings.FloodplainSmoothing = FloodplainSmoothing;
@@ -997,7 +1255,7 @@ UAvenorTerrainRefinementModifier::EvaluateLakeFillDepthAtWorldPosition(
         ? FMath::Max(
             0.0,
             Analysis->Sample(Analysis->FilledHeight, WorldPosition) -
-            Analysis->Sample(Analysis->BaseHeight, WorldPosition)
+            Analysis->Sample(Analysis->RefinedHeight, WorldPosition)
         )
         : 0.0;
 }
@@ -1022,6 +1280,7 @@ bool UAvenorTerrainRefinementModifier::GetHydrologyFeatures(
     ExtractRiverReaches(
         *Analysis,
         StreamStartAreaCells,
+        HeadwaterSlopeExponent,
         MaximumRiverReaches,
         FMath::Max(1.0, RiverSurfaceInset),
         OutRivers
@@ -1029,6 +1288,7 @@ bool UAvenorTerrainRefinementModifier::GetHydrologyFeatures(
     ExtractLakeBasins(
         *Analysis,
         MinimumLakeFillDepth,
+        MinimumLakeCatchmentCells,
         MaximumLakes,
         OutLakes
     );
