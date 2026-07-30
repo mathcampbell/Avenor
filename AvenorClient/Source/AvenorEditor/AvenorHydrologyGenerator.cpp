@@ -6,6 +6,7 @@
 #include "Editor.h"
 #include "EngineUtils.h"
 #include "MeshPartition.h"
+#include "MeshPartitionEditorComponent.h"
 #include "MeshPartitionModifierComponent.h"
 #include "Misc/ScopedSlowTask.h"
 #include "UObject/UObjectGlobals.h"
@@ -219,6 +220,20 @@ static TArray<int32> SelectLakeCells(
     double MinimumSeparation
 )
 {
+    TArray<bool> HasQualifyingUpstream;
+    HasQualifyingUpstream.Init(false, Grid.Downstream.Num());
+    for (int32 Upstream = 0;
+         Upstream < Grid.Downstream.Num();
+         ++Upstream)
+    {
+        const int32 Downstream = Grid.Downstream[Upstream];
+        if (Downstream != INDEX_NONE &&
+            Grid.Accumulation[Upstream] >= MinimumCatchmentCells)
+        {
+            HasQualifyingUpstream[Downstream] = true;
+        }
+    }
+
     TArray<int32> Candidates;
     for (int32 Index = 0; Index < Grid.TerrainHeight.Num(); ++Index)
     {
@@ -245,25 +260,60 @@ static TArray<int32> SelectLakeCells(
         return Grid.Accumulation[A] > Grid.Accumulation[B];
     });
 
-    // If the terrain contains no deep closed basin, use the strongest inland
-    // drainage points rather than inventing a basin at world datum.
-    if (Candidates.IsEmpty())
+    TArray<int32> Selected;
+    for (int32 Candidate : Candidates)
     {
-        for (int32 Index = 0; Index < Grid.TerrainHeight.Num(); ++Index)
+        bool bSeparated = true;
+        for (int32 Existing : Selected)
         {
-            const int32 X = Index % Grid.Columns;
-            const int32 Y = Index / Grid.Columns;
-            if (X > 2 && Y > 2 &&
-                X < Grid.Columns - 3 && Y < Grid.Rows - 3)
+            if (FVector2D::Distance(
+                    Grid.Position(Candidate),
+                    Grid.Position(Existing)
+                ) < MinimumSeparation)
             {
-                Candidates.Add(Index);
+                bSeparated = false;
+                break;
             }
         }
-        Candidates.Sort([&Grid](int32 A, int32 B)
+        if (bSeparated)
         {
-            return Grid.Accumulation[A] > Grid.Accumulation[B];
-        });
+            Selected.Add(Candidate);
+            if (Selected.Num() >= RequestedCount)
+            {
+                break;
+            }
+        }
     }
+    return Selected;
+}
+
+static TArray<int32> SelectRiverSources(
+    const FGrid& Grid,
+    int32 RequestedCount,
+    double MinimumCatchmentCells,
+    double MinimumSeparation
+)
+{
+    TArray<int32> Candidates;
+    for (int32 Cell = 0; Cell < Grid.Accumulation.Num(); ++Cell)
+    {
+        const int32 X = Cell % Grid.Columns;
+        const int32 Y = Cell / Grid.Columns;
+        if (Grid.IsBoundary(X, Y) ||
+            Grid.Accumulation[Cell] < MinimumCatchmentCells)
+        {
+            continue;
+        }
+
+        if (!HasQualifyingUpstream[Cell])
+        {
+            Candidates.Add(Cell);
+        }
+    }
+    Candidates.Sort([&Grid](int32 A, int32 B)
+    {
+        return Grid.Accumulation[A] > Grid.Accumulation[B];
+    });
 
     TArray<int32> Selected;
     for (int32 Candidate : Candidates)
@@ -290,6 +340,46 @@ static TArray<int32> SelectLakeCells(
         }
     }
     return Selected;
+}
+
+static FVector2D FindLakeShore(
+    const FGrid& Grid,
+    int32 LakeCell,
+    double Angle,
+    double MaximumRadius,
+    double MinimumFillDepth
+)
+{
+    const FVector2D Centre = Grid.Position(LakeCell);
+    const FVector2D Direction(FMath::Cos(Angle), FMath::Sin(Angle));
+    const double Step = Grid.CellSize * 0.5;
+    FVector2D LastInside =
+        Centre + Direction * FMath::Min(Step, MaximumRadius);
+    for (double Distance = Step;
+         Distance <= MaximumRadius;
+         Distance += Step)
+    {
+        const FVector2D Point = Centre + Direction * Distance;
+        const int32 X = FMath::FloorToInt(
+            (Point.X - Grid.Bounds.Min.X) / Grid.CellSize
+        );
+        const int32 Y = FMath::FloorToInt(
+            (Point.Y - Grid.Bounds.Min.Y) / Grid.CellSize
+        );
+        if (!Grid.IsValid(X, Y))
+        {
+            break;
+        }
+        const int32 Cell = Grid.Index(X, Y);
+        const double FillDepth =
+            Grid.FilledHeight[Cell] - Grid.TerrainHeight[Cell];
+        if (FillDepth < MinimumFillDepth)
+        {
+            break;
+        }
+        LastInside = Point;
+    }
+    return LastInside;
 }
 
 static TArray<int32> TraceRiver(const FGrid& Grid, int32 Source)
@@ -326,7 +416,8 @@ static TWaterBodyActor* CreateWaterBody(
     UWorld* World,
     UE::MeshPartition::AMeshPartition* MeshPartition,
     const FString& Label,
-    const TCHAR* ModifierClassPath
+    const TCHAR* ModifierClassPath,
+    double FalloffWidth
 )
 {
     UActorFactory* Factory =
@@ -356,6 +447,10 @@ static TWaterBodyActor* CreateWaterBody(
 
     UWaterBodyComponent* WaterComponent =
         WaterBody->GetWaterBodyComponent();
+    WaterComponent->WaterHeightmapSettings.FalloffSettings.FalloffMode =
+        EWaterBrushFalloffMode::Width;
+    WaterComponent->WaterHeightmapSettings.FalloffSettings.FalloffWidth =
+        FalloffWidth;
     UClass* ModifierClass =
         LoadClass<UE::MeshPartition::UModifierComponent>(
             nullptr,
@@ -508,6 +603,12 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         MinimumLakeFillDepth,
         LakeRadius * 2.5
     );
+    const TArray<int32> RiverSources = SelectRiverSources(
+        Grid,
+        RiverCount,
+        MinimumRiverCatchmentCells,
+        Grid.CellSize * 8.0
+    );
 
     Progress.EnterProgressFrame(
         1.0f,
@@ -526,14 +627,14 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
          ++LakeIndex)
     {
         const int32 LakeCell = LakeCells[LakeIndex];
-        const FVector2D Centre = Grid.Position(LakeCell);
         const double SurfaceZ = Grid.FilledHeight[LakeCell];
 
         AWaterBodyLake* Lake = CreateWaterBody<AWaterBodyLake>(
             World,
             MeshPartition,
             FString::Printf(TEXT("Avenor_Lake_%02d"), LakeIndex + 1),
-            TEXT("/Script/MeshPartitionWater.LakeModifier")
+            TEXT("/Script/MeshPartitionWater.LakeModifier"),
+            LakeRadius * 0.35
         );
         if (Lake)
         {
@@ -546,9 +647,16 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
                 const double Angle =
                     2.0 * PI * static_cast<double>(PointIndex) /
                     static_cast<double>(PointCount);
+                const FVector2D Shore = FindLakeShore(
+                    Grid,
+                    LakeCell,
+                    Angle,
+                    LakeRadius,
+                    MinimumLakeFillDepth * 0.25
+                );
                 LakePoints.Emplace(
-                    Centre.X + FMath::Cos(Angle) * LakeRadius,
-                    Centre.Y + FMath::Sin(Angle) * LakeRadius,
+                    Shore.X,
+                    Shore.Y,
                     SurfaceZ
                 );
             }
@@ -563,9 +671,15 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
             Lake->PostEditChange();
             ++CreatedLakes;
         }
+    }
 
+    for (int32 RiverIndex = 0;
+         RiverIndex < RiverSources.Num();
+         ++RiverIndex)
+    {
+        const int32 SourceCell = RiverSources[RiverIndex];
         const TArray<int32> RiverCells =
-            TraceRiver(Grid, LakeCell);
+            TraceRiver(Grid, SourceCell);
         if (RiverCells.Num() < 2)
         {
             continue;
@@ -574,8 +688,9 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         AWaterBodyRiver* River = CreateWaterBody<AWaterBodyRiver>(
             World,
             MeshPartition,
-            FString::Printf(TEXT("Avenor_River_%02d"), LakeIndex + 1),
-            TEXT("/Script/MeshPartitionWater.RiverModifier")
+            FString::Printf(TEXT("Avenor_River_%02d"), RiverIndex + 1),
+            TEXT("/Script/MeshPartitionWater.RiverModifier"),
+            Grid.CellSize * 0.75
         );
         if (!River)
         {
@@ -583,7 +698,8 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         }
 
         TArray<FVector> RiverPoints;
-        double PreviousWaterZ = SurfaceZ;
+        double PreviousWaterZ =
+            Grid.FilledHeight[SourceCell] + DrainageEpsilon;
         const int32 Stride = FMath::Max(1, RiverSplineStride);
         for (int32 PathIndex = 0;
              PathIndex < RiverCells.Num();
@@ -591,11 +707,9 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         {
             const int32 Cell = RiverCells[PathIndex];
             const FVector2D Position = Grid.Position(Cell);
-            const double LocalBed =
-                Grid.TerrainHeight[Cell] - RiverBedDepth;
             const double WaterZ = FMath::Min(
                 PreviousWaterZ - DrainageEpsilon,
-                LocalBed
+                Grid.FilledHeight[Cell] + DrainageEpsilon
             );
             RiverPoints.Emplace(Position.X, Position.Y, WaterZ);
             PreviousWaterZ = WaterZ;
@@ -613,7 +727,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
                 LastPosition.Y,
                 FMath::Min(
                     PreviousWaterZ - DrainageEpsilon,
-                    Grid.TerrainHeight[LastCell] - RiverBedDepth
+                    Grid.FilledHeight[LastCell] + DrainageEpsilon
                 )
             );
         }
@@ -639,6 +753,37 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         RiverSpline->UpdateSpline();
         River->PostEditChange();
         ++CreatedRivers;
+    }
+
+    if (UE::MeshPartition::UMeshPartitionEditorComponent*
+            EditorComponent =
+                Cast<UE::MeshPartition::UMeshPartitionEditorComponent>(
+                    MeshPartition->GetMeshPartitionComponent()
+                ))
+    {
+        EditorComponent->OnModifierAssigned();
+    }
+
+    bool bHasWaterZone = false;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (It->GetClass()->GetName() == TEXT("WaterZone"))
+        {
+            bHasWaterZone = true;
+            break;
+        }
+    }
+    if (!bHasWaterZone)
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT(
+                "Water Body actors were generated, but the level has no "
+                "Water Zone. Add a Water Zone covering the terrain to render "
+                "their water surfaces."
+            )
+        );
     }
 
     UE_LOG(
