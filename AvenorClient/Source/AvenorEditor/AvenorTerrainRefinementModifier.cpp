@@ -111,7 +111,6 @@ struct FSettings
     double HeadwaterSlopeExponent = 0.5;
     double MinimumLakeFillDepth = 1000.0;
     double MinimumLakeCatchment = 80.0;
-    double MaximumLakeAreaSquareKilometres = 25.0;
     bool bFloodplains = true;
     double FloodplainStartArea = 80.0;
     double FloodplainSmoothing = 0.35;
@@ -119,6 +118,9 @@ struct FSettings
 
 static constexpr int32 DX[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
 static constexpr int32 DY[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+static constexpr double MaximumGeneratedLakeAreaSquareKilometres = 25.0;
+static constexpr double StoredRunoffDepth = 50.0;
+static constexpr double MinimumGeneratedLakeWaterDepth = 200.0;
 
 static void FillDepressions(
     FAvenorTerrainAnalysisData& Grid,
@@ -1050,8 +1052,8 @@ static void ExtractLakeBasins(
         double SurfaceHeight = TNumericLimits<double>::Lowest();
         double MaximumCatchment = 0.0;
         double MaximumDepth = 0.0;
-        const double ShorelineDepthThreshold =
-            FMath::Max(1.0, MinimumFillDepth * 0.02);
+        double MinimumTerrainHeight = TNumericLimits<double>::Max();
+        const double ShorelineDepthThreshold = 1.0;
         for (int32 Head = 0; Head < Queue.Num(); ++Head)
         {
             const int32 Cell = Queue[Head];
@@ -1071,6 +1073,10 @@ static void ExtractLakeBasins(
                 MaximumDepth,
                 Grid.FilledHeight[Cell] -
                     Grid.RefinedHeight[Cell]
+            );
+            MinimumTerrainHeight = FMath::Min(
+                MinimumTerrainHeight,
+                Grid.RefinedHeight[Cell]
             );
             const int32 X = Cell % Grid.Columns;
             const int32 Y = Cell / Grid.Columns;
@@ -1094,15 +1100,78 @@ static void ExtractLakeBasins(
                 }
             }
         }
-        const double BasinAreaSquareKilometres =
-            Basin.Num() *
-            Grid.CellSize * Grid.CellSize /
-            10000000000.0;
         if (bTouchesBoundary ||
             Basin.Num() < 4 ||
             MaximumDepth < MinimumFillDepth ||
-            MaximumCatchment < MinimumCatchment ||
-            BasinAreaSquareKilometres >
+            MaximumCatchment < MinimumCatchment)
+        {
+            continue;
+        }
+
+        // A priority-filled depression gives its maximum spill elevation,
+        // not its actual water level. Supply a finite retained runoff volume
+        // from the catchment and solve the basin hypsometry for the resulting
+        // water surface.
+        const double CellArea = Grid.CellSize * Grid.CellSize;
+        double BasinCapacity = 0.0;
+        for (int32 Cell : Basin)
+        {
+            BasinCapacity += FMath::Max(
+                0.0,
+                SurfaceHeight - Grid.RefinedHeight[Cell]
+            ) * CellArea;
+        }
+        const double AvailableWaterVolume = FMath::Min(
+            BasinCapacity,
+            MaximumCatchment * CellArea * StoredRunoffDepth
+        );
+        if (AvailableWaterVolume <= 0.0)
+        {
+            continue;
+        }
+
+        double LowWaterLevel = MinimumTerrainHeight;
+        double HighWaterLevel = SurfaceHeight;
+        for (int32 Iteration = 0; Iteration < 32; ++Iteration)
+        {
+            const double CandidateLevel =
+                (LowWaterLevel + HighWaterLevel) * 0.5;
+            double CandidateVolume = 0.0;
+            for (int32 Cell : Basin)
+            {
+                CandidateVolume += FMath::Max(
+                    0.0,
+                    CandidateLevel - Grid.RefinedHeight[Cell]
+                ) * CellArea;
+            }
+            if (CandidateVolume < AvailableWaterVolume)
+            {
+                LowWaterLevel = CandidateLevel;
+            }
+            else
+            {
+                HighWaterLevel = CandidateLevel;
+            }
+        }
+        SurfaceHeight = (LowWaterLevel + HighWaterLevel) * 0.5;
+        if (SurfaceHeight - MinimumTerrainHeight <
+            MinimumGeneratedLakeWaterDepth)
+        {
+            continue;
+        }
+
+        TSet<int32> WetBasin;
+        for (int32 Cell : Basin)
+        {
+            if (Grid.RefinedHeight[Cell] < SurfaceHeight - 1.0)
+            {
+                WetBasin.Add(Cell);
+            }
+        }
+        const double LakeAreaSquareKilometres =
+            WetBasin.Num() * CellArea / 10000000000.0;
+        if (WetBasin.Num() < 4 ||
+            LakeAreaSquareKilometres >
                 MaximumAreaSquareKilometres)
         {
             continue;
@@ -1111,7 +1180,7 @@ static void ExtractLakeBasins(
         const TArray<FVector2D> Boundary =
             TraceLargestBoundary(
                 Grid,
-                Basin,
+                WetBasin,
                 SurfaceHeight
             );
         if (Boundary.Num() < 4)
@@ -1121,7 +1190,7 @@ static void ExtractLakeBasins(
 
         FAvenorLakeBasin Lake;
         Lake.SurfaceHeight = SurfaceHeight;
-        Lake.CellCount = Basin.Num();
+        Lake.CellCount = WetBasin.Num();
         const int32 Stride = FMath::Max(1, Boundary.Num() / 96);
         TArray<FVector> RawShoreline;
         for (int32 Index = 0;
@@ -1224,7 +1293,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("b6789751-c6e3-4b6d-90c9-cffed17f6d6d")
+            TEXT("cc94c7dc-2114-4359-b0c4-4fe1acae6b0f")
         );
         return Version;
     }
@@ -1290,8 +1359,6 @@ UAvenorTerrainRefinementModifier::GetOrBuildAnalysis() const
     Settings.HeadwaterSlopeExponent = HeadwaterSlopeExponent;
     Settings.MinimumLakeFillDepth = MinimumLakeFillDepth;
     Settings.MinimumLakeCatchment = MinimumLakeCatchmentCells;
-    Settings.MaximumLakeAreaSquareKilometres =
-        MaximumLakeAreaSquareKilometres;
     Settings.bFloodplains = bEnableFloodplains;
     Settings.FloodplainStartArea = FloodplainStartAreaCells;
     Settings.FloodplainSmoothing = FloodplainSmoothing;
@@ -1374,7 +1441,7 @@ bool UAvenorTerrainRefinementModifier::GetHydrologyFeatures(
         *Analysis,
         MinimumLakeFillDepth,
         MinimumLakeCatchmentCells,
-        MaximumLakeAreaSquareKilometres,
+        MaximumGeneratedLakeAreaSquareKilometres,
         MaximumLakes,
         OutLakes
     );
