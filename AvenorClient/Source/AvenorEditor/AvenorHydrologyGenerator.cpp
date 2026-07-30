@@ -1,6 +1,7 @@
 #include "AvenorHydrologyGenerator.h"
 
 #include "AvenorTerrainModifier.h"
+#include "AvenorTerrainRefinementModifier.h"
 #include "ActorFactories/ActorFactory.h"
 #include "Editor.h"
 #include "EngineUtils.h"
@@ -387,6 +388,15 @@ AAvenorHydrologyGenerator::ResolveTerrainModifier() const
         : nullptr;
 }
 
+UAvenorTerrainRefinementModifier*
+AAvenorHydrologyGenerator::ResolveRefinementModifier() const
+{
+    return RefinementModifierActor
+        ? RefinementModifierActor->FindComponentByClass<
+            UAvenorTerrainRefinementModifier>()
+        : nullptr;
+}
+
 void AAvenorHydrologyGenerator::ClearGeneratedHydrology()
 {
 #if WITH_EDITOR
@@ -415,23 +425,25 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
 {
 #if WITH_EDITOR
     UAvenorTerrainModifier* Terrain = ResolveTerrainModifier();
+    UAvenorTerrainRefinementModifier* Refinement =
+        ResolveRefinementModifier();
     UE::MeshPartition::AMeshPartition* MeshPartition =
         Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
     UWorld* World = GetWorld();
-    if (!Terrain || !MeshPartition || !World)
+    if (!Terrain || !Refinement || !MeshPartition || !World)
     {
         UE_LOG(
             LogTemp,
             Error,
             TEXT(
-                "Avenor hydrology requires Terrain Modifier Actor and "
+                "Avenor hydrology requires Base Terrain, Refinement, and "
                 "Mesh Partition Actor references."
             )
         );
         return;
     }
 
-    const FBox Bounds = Terrain->GetTerrainWorldBounds();
+    const FBox Bounds = Refinement->GetAnalysisWorldBounds();
     if (!Bounds.IsValid)
     {
         UE_LOG(LogTemp, Error, TEXT("Avenor terrain bounds are invalid."));
@@ -465,7 +477,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
     for (int32 Index = 0; Index < CellCount; ++Index)
     {
         Grid.TerrainHeight[Index] =
-            Terrain->EvaluateBaseHeightAtWorldPosition(
+            Refinement->EvaluateRefinedHeightAtWorldPosition(
                 Grid.Position(Index)
             );
     }
