@@ -141,12 +141,22 @@ private:
     double MaximumStreamIncision = 6000.0;
 
     UPROPERTY(EditAnywhere, Category = "Drainage",
+        meta = (ClampMin = "1", ClampMax = "64",
+            EditCondition = "bEnableStreamIncision"))
+    int32 FluvialErosionIterations = 12;
+
+    UPROPERTY(EditAnywhere, Category = "Drainage",
+        meta = (ClampMin = "0.0", ClampMax = "2.0",
+            EditCondition = "bEnableStreamIncision"))
+    double HeadwaterSlopeExponent = 0.5;
+
+    UPROPERTY(EditAnywhere, Category = "Drainage",
         meta = (ClampMin = "0.0"))
     double MinimumLakeFillDepth = 1000.0;
 
     UPROPERTY(EditAnywhere, Category = "Drainage",
-        meta = (ClampMin = "0.0"))
-    double LakeBedDepth = 2500.0;
+        meta = (ClampMin = "1.0"))
+    double MinimumLakeCatchmentCells = 80.0;
 
     UPROPERTY(EditAnywhere, Category = "Drainage")
     bool bEnableFloodplains = true;
