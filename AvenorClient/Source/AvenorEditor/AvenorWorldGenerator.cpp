@@ -10,6 +10,7 @@
 #include "WaterBodyActor.h"
 #include "WaterBodyComponent.h"
 #include "WaterBodyLakeActor.h"
+#include "WaterBodyOceanActor.h"
 #include "WaterBodyRiverActor.h"
 #include "WaterSplineComponent.h"
 
@@ -46,6 +47,7 @@ struct FAvenorGeneratedWorld
     TArray<int32> DrainParent;
     TArray<FAvenorRiverDefinition> Rivers;
     TArray<FAvenorLakeDefinition> Lakes;
+    TArray<FVector> OceanBoundary;
 
     int32 Index(int32 X, int32 Y) const
     {
@@ -294,6 +296,7 @@ static double EvaluateBaseLandform(
     double CorridorFraction,
     double CoastWidth,
     double OceanDepth,
+    double SeaLevel,
     double EdgeBlendWidth
 )
 {
@@ -1393,6 +1396,47 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             MinimumWaterfallDrop
         );
     }
+    if (bOceans)
+    {
+        const FVector Extent = Bounds.GetExtent();
+        const double Inset = FMath::Clamp(
+            CoastWidth * 0.5,
+            Grid->CellSize,
+            FMath::Min(Extent.X, Extent.Y) * 0.4
+        );
+        const FVector2D Corners[4] = {
+            FVector2D(Bounds.Min.X + Inset, Bounds.Min.Y + Inset),
+            FVector2D(Bounds.Max.X - Inset, Bounds.Min.Y + Inset),
+            FVector2D(Bounds.Max.X - Inset, Bounds.Max.Y - Inset),
+            FVector2D(Bounds.Min.X + Inset, Bounds.Max.Y - Inset)
+        };
+        constexpr int32 PointsPerSide = 12;
+        for (int32 Side = 0; Side < 4; ++Side)
+        {
+            for (int32 PointIndex = 0;
+                 PointIndex < PointsPerSide;
+                 ++PointIndex)
+            {
+                const double Alpha =
+                    static_cast<double>(PointIndex) / PointsPerSide;
+                const FVector2D Point = FMath::Lerp(
+                    Corners[Side],
+                    Corners[(Side + 1) % 4],
+                    Alpha
+                );
+                Grid->OceanBoundary.Emplace(
+                    Point.X,
+                    Point.Y,
+                    SeaLevel
+                );
+            }
+        }
+        Grid->OceanBoundary = SmoothPolyline(
+            Grid->OceanBoundary,
+            true,
+            1
+        );
+    }
     return Grid;
 }
 
@@ -1666,6 +1710,7 @@ AAvenorWorldGenerator::GetOrGenerateWorld() const
             MaximumLakeCount,
             CoastTransitionWidth,
             OceanDepth,
+            SeaLevel,
             GentleCorridorHalfWidth,
             FullRoughnessDistance,
             CorridorRoughnessFraction,
@@ -1750,6 +1795,31 @@ void AAvenorWorldGenerator::CreateWaterBodies(
     }
 
     UE::MeshPartition::UModifierComponent* LastModifier = nullptr;
+    if (WorldData->OceanBoundary.Num() >= 4)
+    {
+        AWaterBodyOcean* Ocean = CreateWaterBody<AWaterBodyOcean>(
+            World,
+            MeshPartition,
+            TEXT("Avenor_Ocean"),
+            TEXT("/Script/MeshPartitionWater.OceanModifier"),
+            CoastTransitionWidth,
+            LastModifier
+        );
+        if (Ocean)
+        {
+            TArray<FVector> WorldBoundary = WorldData->OceanBoundary;
+            for (FVector& Point : WorldBoundary)
+            {
+                Point.Z += GetActorLocation().Z;
+            }
+            ConfigureSpline(
+                *Ocean->GetWaterBodyComponent()->GetWaterSpline(),
+                WorldBoundary,
+                true
+            );
+            Ocean->PostEditChange();
+        }
+    }
     for (int32 Index = 0; Index < WorldData->Lakes.Num(); ++Index)
     {
         const FAvenorLakeDefinition& Definition =
