@@ -158,10 +158,6 @@ private:
         meta = (ClampMin = "1.0"))
     double MinimumLakeCatchmentCells = 80.0;
 
-    UPROPERTY(EditAnywhere, Category = "Drainage",
-        meta = (ClampMin = "0.1", ClampMax = "500.0"))
-    double MaximumLakeAreaSquareKilometres = 25.0;
-
     UPROPERTY(EditAnywhere, Category = "Drainage")
     bool bEnableFloodplains = true;
 
