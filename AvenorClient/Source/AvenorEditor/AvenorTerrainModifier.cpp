@@ -569,8 +569,10 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
 
 FBox UAvenorTerrainModifier::GetTerrainWorldBounds() const
 {
-    const TArray<FBox> Bounds = ComputeBounds();
-    return Bounds.IsEmpty() ? FBox(ForceInit) : Bounds[0];
+    const TArray<FBox> TerrainBounds = ComputeBounds();
+    return TerrainBounds.IsEmpty()
+        ? FBox(ForceInit)
+        : TerrainBounds[0];
 }
 
 TArray<FBox> UAvenorTerrainModifier::ComputeBounds() const
