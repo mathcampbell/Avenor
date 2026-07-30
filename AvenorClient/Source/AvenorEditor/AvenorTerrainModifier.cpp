@@ -7,7 +7,12 @@ namespace UE::Avenor::TerrainModifier
 struct FMountain
 {
     FVector2D Centre = FVector2D::ZeroVector;
-    double Radius = 1.0;
+    FVector2D Along = FVector2D(1.0, 0.0);
+    FVector2D Across = FVector2D(0.0, 1.0);
+    double HalfLength = 1.0;
+    double HalfWidth = 1.0;
+    double PeakSpacing = 1.0;
+    double Phase = 0.0;
     double Height = 0.0;
 };
 
@@ -56,6 +61,7 @@ struct FSettings
     FVector2D BoundsExtent = FVector2D(1.0, 1.0);
     double CoastalTransitionWidth = 1.0;
     double OceanBasinDepth = 0.0;
+    double WorldEdgeBlendWidth = 0.0;
     double MountainMinimumSpineDistance = 0.0;
 };
 
@@ -332,25 +338,65 @@ static double EvaluateLand(
 
     for (const FMountain& Mountain : Mountains)
     {
-        const double NormalisedDistance =
-            FVector2D::Distance(Point, Mountain.Centre) /
-            FMath::Max(1.0, Mountain.Radius);
-        if (NormalisedDistance >= 1.0)
+        const FVector2D Delta = Point - Mountain.Centre;
+        const double AlongDistance =
+            FVector2D::DotProduct(Delta, Mountain.Along);
+        const double AcrossDistance =
+            FVector2D::DotProduct(Delta, Mountain.Across);
+        const double Meander =
+            FMath::Sin(
+                AlongDistance /
+                FMath::Max(1.0, Mountain.PeakSpacing) * PI +
+                Mountain.Phase
+            ) * Mountain.HalfWidth * 0.22;
+        const double RangeX =
+            AlongDistance / FMath::Max(1.0, Mountain.HalfLength);
+        const double RangeY =
+            (AcrossDistance - Meander) /
+            FMath::Max(1.0, Mountain.HalfWidth);
+        const double EllipseDistance =
+            FMath::Sqrt(RangeX * RangeX + RangeY * RangeY);
+        if (EllipseDistance >= 1.0)
         {
             continue;
         }
 
-        const double Envelope = Quintic01(1.0 - NormalisedDistance);
-        const double LocalVariation = 0.78 + 0.22 * (
-            0.5 + 0.5 * Noise(
+        const double LengthEnvelope = Quintic01(
+            1.0 - FMath::Abs(RangeX)
+        );
+        const double CrossEnvelope = FMath::Pow(
+            Quintic01(1.0 - FMath::Abs(RangeY)),
+            0.72
+        );
+        const double PeakTrain = 0.58 + 0.42 * FMath::Pow(
+            0.5 + 0.5 * FMath::Cos(
+                AlongDistance /
+                FMath::Max(1.0, Mountain.PeakSpacing) * 2.0 * PI +
+                Mountain.Phase
+            ),
+            1.7
+        );
+        const double RidgeDetail = 0.72 + 0.28 * (
+            1.0 - FMath::Abs(Noise(
                 Point + Offset * 4.17,
-                Settings.HillScale
-            )
+                Settings.HillScale * 0.55
+            ))
         );
 
-        // Suppression is based on roughness permission, not added elevation.
-        Height += Mountain.Height * Envelope * LocalVariation *
-            RoughnessTransition;
+        Height += Mountain.Height * LengthEnvelope * CrossEnvelope *
+            PeakTrain * RidgeDetail * RoughnessTransition;
+    }
+
+    if (Settings.WorldEdgeBlendWidth > 0.0)
+    {
+        const FVector2D FromCentre = Point - Settings.BoundsCentre;
+        const double EdgeDistance = FMath::Min(
+            Settings.BoundsExtent.X - FMath::Abs(FromCentre.X),
+            Settings.BoundsExtent.Y - FMath::Abs(FromCentre.Y)
+        );
+        Height *= Smooth01(
+            EdgeDistance / Settings.WorldEdgeBlendWidth
+        );
     }
     return Height;
 }
@@ -413,7 +459,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("5ce45a6f-dfb3-47e3-a3a4-faa68f5dc5fe")
+            TEXT("4528fb41-697a-48dc-ab21-31d468c06d96")
         );
         return Version;
     }
@@ -482,6 +528,7 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
     );
     LocalSettings.CoastalTransitionWidth = CoastalTransitionWidth;
     LocalSettings.OceanBasinDepth = OceanBasinDepth;
+    LocalSettings.WorldEdgeBlendWidth = WorldEdgeBlendWidth;
     LocalSettings.MountainMinimumSpineDistance =
         MountainMinimumSpineDistance;
 
@@ -552,8 +599,24 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
 
         FMountain Mountain;
         Mountain.Centre = Centre;
-        Mountain.Radius =
-            MountainRadius * Random.FRandRange(0.75, 1.35);
+        const double Angle = Random.FRandRange(-PI, PI);
+        Mountain.Along = FVector2D(
+            FMath::Cos(Angle),
+            FMath::Sin(Angle)
+        );
+        Mountain.Across = FVector2D(
+            -Mountain.Along.Y,
+            Mountain.Along.X
+        );
+        Mountain.HalfLength =
+            MountainRangeLength * 0.5 *
+            Random.FRandRange(0.75, 1.25);
+        Mountain.HalfWidth =
+            MountainRangeWidth * 0.5 *
+            Random.FRandRange(0.75, 1.30);
+        Mountain.PeakSpacing =
+            MountainPeakSpacing * Random.FRandRange(0.8, 1.2);
+        Mountain.Phase = Random.FRandRange(-PI, PI);
         Mountain.Height =
             MountainRelief * Random.FRandRange(0.65, 1.25);
         LocalMountains.Add(Mountain);
@@ -638,6 +701,7 @@ UAvenorTerrainModifier::CreateBackgroundOp(
     );
     Op->Settings.CoastalTransitionWidth = CoastalTransitionWidth;
     Op->Settings.OceanBasinDepth = OceanBasinDepth;
+    Op->Settings.WorldEdgeBlendWidth = WorldEdgeBlendWidth;
     Op->Settings.MountainMinimumSpineDistance =
         MountainMinimumSpineDistance;
 
@@ -709,8 +773,24 @@ UAvenorTerrainModifier::CreateBackgroundOp(
 
         FMountain Mountain;
         Mountain.Centre = Centre;
-        Mountain.Radius =
-            MountainRadius * Random.FRandRange(0.75, 1.35);
+        const double Angle = Random.FRandRange(-PI, PI);
+        Mountain.Along = FVector2D(
+            FMath::Cos(Angle),
+            FMath::Sin(Angle)
+        );
+        Mountain.Across = FVector2D(
+            -Mountain.Along.Y,
+            Mountain.Along.X
+        );
+        Mountain.HalfLength =
+            MountainRangeLength * 0.5 *
+            Random.FRandRange(0.75, 1.25);
+        Mountain.HalfWidth =
+            MountainRangeWidth * 0.5 *
+            Random.FRandRange(0.75, 1.30);
+        Mountain.PeakSpacing =
+            MountainPeakSpacing * Random.FRandRange(0.8, 1.2);
+        Mountain.Phase = Random.FRandRange(-PI, PI);
         Mountain.Height =
             MountainRelief * Random.FRandRange(0.65, 1.25);
         Op->Mountains.Add(Mountain);
