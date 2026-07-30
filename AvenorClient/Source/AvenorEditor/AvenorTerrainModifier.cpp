@@ -30,6 +30,16 @@ struct FRiver
 struct FSettings
 {
     int32 Seed = 0;
+    bool bPlains = true;
+    bool bRollingHills = true;
+    bool bUplands = true;
+    bool bValleys = true;
+    bool bDesert = false;
+    bool bOceanBasins = false;
+    double PlainsCoverage = 0.55;
+    double RollingHillsCoverage = 0.28;
+    double UplandsCoverage = 0.12;
+    double DesertCoverage = 0.05;
     double GentleCorridorHalfWidth = 0.0;
     double FullRoughnessDistance = 1.0;
     double CorridorRoughnessFraction = 0.0;
@@ -37,6 +47,15 @@ struct FSettings
     double RegionalRelief = 0.0;
     double HillScale = 1.0;
     double HillRelief = 0.0;
+    double PlainRelief = 0.0;
+    double UplandRelief = 0.0;
+    double LandformRegionScale = 1.0;
+    double ValleyScale = 1.0;
+    double ValleyDepth = 0.0;
+    FVector2D BoundsCentre = FVector2D::ZeroVector;
+    FVector2D BoundsExtent = FVector2D(1.0, 1.0);
+    double CoastalTransitionWidth = 1.0;
+    double OceanBasinDepth = 0.0;
     double MountainMinimumSpineDistance = 0.0;
 };
 
@@ -169,6 +188,55 @@ static double EvaluateLand(
     );
     const FVector2D Warped = Point + Warp * Settings.HillScale * 0.55;
 
+    // One very broad control field allocates coherent regions rather than
+    // applying full hill relief everywhere. Disabled families contribute no
+    // weight, and enabled coverage values are normalised automatically.
+    const double Selector = 0.5 + 0.5 * Noise(
+        Point + Offset * 5.37,
+        Settings.LandformRegionScale
+    );
+    const double PlainShare = Settings.bPlains
+        ? FMath::Max(0.0, Settings.PlainsCoverage) : 0.0;
+    const double HillShare = Settings.bRollingHills
+        ? FMath::Max(0.0, Settings.RollingHillsCoverage) : 0.0;
+    const double UplandShare = Settings.bUplands
+        ? FMath::Max(0.0, Settings.UplandsCoverage) : 0.0;
+    const double DesertShare = Settings.bDesert
+        ? FMath::Max(0.0, Settings.DesertCoverage) : 0.0;
+    const double ShareTotal = FMath::Max(
+        UE_DOUBLE_KINDA_SMALL_NUMBER,
+        PlainShare + HillShare + UplandShare + DesertShare
+    );
+    const double PlainEnd = PlainShare / ShareTotal;
+    const double HillEnd = PlainEnd + HillShare / ShareTotal;
+    const double UplandEnd = HillEnd + UplandShare / ShareTotal;
+    const double BlendWidth = 0.035;
+
+    const double PlainMask = Settings.bPlains
+        ? 1.0 - Smooth01((Selector - PlainEnd + BlendWidth) /
+            (2.0 * BlendWidth))
+        : 0.0;
+    const double HillMask = Settings.bRollingHills
+        ? Smooth01((Selector - PlainEnd + BlendWidth) /
+            (2.0 * BlendWidth)) *
+          (1.0 - Smooth01((Selector - HillEnd + BlendWidth) /
+            (2.0 * BlendWidth)))
+        : 0.0;
+    const double UplandMask = Settings.bUplands
+        ? Smooth01((Selector - HillEnd + BlendWidth) /
+            (2.0 * BlendWidth)) *
+          (1.0 - Smooth01((Selector - UplandEnd + BlendWidth) /
+            (2.0 * BlendWidth)))
+        : 0.0;
+    const double DesertMask = Settings.bDesert
+        ? Smooth01((Selector - UplandEnd + BlendWidth) /
+            (2.0 * BlendWidth))
+        : 0.0;
+    const double MaskTotal = FMath::Max(
+        UE_DOUBLE_KINDA_SMALL_NUMBER,
+        PlainMask + HillMask + UplandMask + DesertMask
+    );
+
     const double RoughnessTransition = Smooth01(
         (DistanceFromSpine - Settings.GentleCorridorHalfWidth) /
         FMath::Max(
@@ -213,9 +281,54 @@ static double EvaluateLand(
     const double Ridges =
         ((1.0 - FMath::Abs(RidgeNoise)) * 2.0 - 1.0) * 0.15;
 
+    const double PlainHeight = BroadHills * Settings.PlainRelief;
+    const double HillHeight = (
+        BroadHills + MediumHills * 0.65 + Ridges * 0.35
+    ) * Settings.HillRelief;
+    const double UplandHeight = (
+        FMath::Abs(BroadHills) * 0.42 +
+        MediumHills * 0.35 + Ridges * 0.75
+    ) * Settings.UplandRelief;
+    const double MesaNoise = Noise(
+        Warped + Offset * 6.71,
+        Settings.HillScale * 1.8
+    );
+    const double DesertHeight = FMath::RoundToDouble(MesaNoise * 3.0) /
+        3.0 * Settings.HillRelief * 0.55;
+
     double Height = Regional + (
-        BroadHills + MediumHills + Ridges
-    ) * Settings.HillRelief * RoughnessWeight;
+        PlainHeight * PlainMask +
+        HillHeight * HillMask +
+        UplandHeight * UplandMask +
+        DesertHeight * DesertMask
+    ) / MaskTotal * RoughnessWeight;
+
+    if (Settings.bValleys)
+    {
+        const double ValleyField = Noise(
+            Point + Offset * 8.13,
+            Settings.ValleyScale
+        );
+        const double ValleyAxis = 1.0 - FMath::Abs(ValleyField);
+        const double ValleyMask = Smooth01((ValleyAxis - 0.72) / 0.24);
+        Height -= ValleyMask * Settings.ValleyDepth * RoughnessWeight;
+    }
+
+    if (Settings.bOceanBasins)
+    {
+        const FVector2D FromCentre = Point - Settings.BoundsCentre;
+        const double EdgeDistance = FMath::Min(
+            Settings.BoundsExtent.X - FMath::Abs(FromCentre.X),
+            Settings.BoundsExtent.Y - FMath::Abs(FromCentre.Y)
+        );
+        const double BrokenCoast = EdgeDistance +
+            Noise(Point + Offset * 9.41, Settings.LandformRegionScale) *
+            Settings.CoastalTransitionWidth * 0.8;
+        const double OceanMask = 1.0 - Smooth01(
+            BrokenCoast / FMath::Max(1.0, Settings.CoastalTransitionWidth)
+        );
+        Height -= OceanMask * Settings.OceanBasinDepth;
+    }
 
     for (const FMountain& Mountain : Mountains)
     {
@@ -300,7 +413,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("9cb06824-0dd5-45dc-8f89-bb3d9b49f488")
+            TEXT("5ce45a6f-dfb3-47e3-a3a4-faa68f5dc5fe")
         );
         return Version;
     }
@@ -332,6 +445,16 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
 {
     FSettings LocalSettings;
     LocalSettings.Seed = WorldSeed;
+    LocalSettings.bPlains = bGeneratePlains;
+    LocalSettings.bRollingHills = bGenerateRollingHills;
+    LocalSettings.bUplands = bGenerateUplands;
+    LocalSettings.bValleys = bGenerateValleys;
+    LocalSettings.bDesert = bGenerateDesertLandforms;
+    LocalSettings.bOceanBasins = bGenerateOceanBasins;
+    LocalSettings.PlainsCoverage = PlainsCoverage;
+    LocalSettings.RollingHillsCoverage = RollingHillsCoverage;
+    LocalSettings.UplandsCoverage = UplandsCoverage;
+    LocalSettings.DesertCoverage = DesertCoverage;
     LocalSettings.GentleCorridorHalfWidth = GentleCorridorHalfWidth;
     LocalSettings.FullRoughnessDistance = FMath::Max(
         GentleCorridorHalfWidth + 1.0,
@@ -343,6 +466,22 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
     LocalSettings.RegionalRelief = RegionalRelief;
     LocalSettings.HillScale = HillScale;
     LocalSettings.HillRelief = HillRelief;
+    LocalSettings.PlainRelief = PlainRelief;
+    LocalSettings.UplandRelief = UplandRelief;
+    LocalSettings.LandformRegionScale = LandformRegionScale;
+    LocalSettings.ValleyScale = ValleyScale;
+    LocalSettings.ValleyDepth = ValleyDepth;
+    const FBox WorldBounds = GetTerrainWorldBounds();
+    LocalSettings.BoundsCentre = FVector2D(
+        WorldBounds.GetCenter().X,
+        WorldBounds.GetCenter().Y
+    );
+    LocalSettings.BoundsExtent = FVector2D(
+        WorldBounds.GetExtent().X,
+        WorldBounds.GetExtent().Y
+    );
+    LocalSettings.CoastalTransitionWidth = CoastalTransitionWidth;
+    LocalSettings.OceanBasinDepth = OceanBasinDepth;
     LocalSettings.MountainMinimumSpineDistance =
         MountainMinimumSpineDistance;
 
@@ -396,7 +535,9 @@ double UAvenorTerrainModifier::EvaluateBaseHeightAtWorldPosition(
         return FVector2D(World.X, World.Y);
     };
 
-    for (int32 Index = 0; Index < MountainRegionCount; ++Index)
+    const int32 LocalMountainCount =
+        bGenerateMountains ? MountainRegionCount : 0;
+    for (int32 Index = 0; Index < LocalMountainCount; ++Index)
     {
         FVector2D Centre;
         for (int32 Attempt = 0; Attempt < 32; ++Attempt)
@@ -458,6 +599,16 @@ UAvenorTerrainModifier::CreateBackgroundOp(
     Op->GlobalBounds = ComputeCombinedBounds();
     Op->BaseWorldZ = GetComponentLocation().Z;
     Op->Settings.Seed = WorldSeed;
+    Op->Settings.bPlains = bGeneratePlains;
+    Op->Settings.bRollingHills = bGenerateRollingHills;
+    Op->Settings.bUplands = bGenerateUplands;
+    Op->Settings.bValleys = bGenerateValleys;
+    Op->Settings.bDesert = bGenerateDesertLandforms;
+    Op->Settings.bOceanBasins = bGenerateOceanBasins;
+    Op->Settings.PlainsCoverage = PlainsCoverage;
+    Op->Settings.RollingHillsCoverage = RollingHillsCoverage;
+    Op->Settings.UplandsCoverage = UplandsCoverage;
+    Op->Settings.DesertCoverage = DesertCoverage;
     Op->Settings.GentleCorridorHalfWidth = GentleCorridorHalfWidth;
     Op->Settings.FullRoughnessDistance = FMath::Max(
         GentleCorridorHalfWidth + 1.0,
@@ -469,6 +620,22 @@ UAvenorTerrainModifier::CreateBackgroundOp(
     Op->Settings.RegionalRelief = RegionalRelief;
     Op->Settings.HillScale = HillScale;
     Op->Settings.HillRelief = HillRelief;
+    Op->Settings.PlainRelief = PlainRelief;
+    Op->Settings.UplandRelief = UplandRelief;
+    Op->Settings.LandformRegionScale = LandformRegionScale;
+    Op->Settings.ValleyScale = ValleyScale;
+    Op->Settings.ValleyDepth = ValleyDepth;
+    const FBox WorldBounds = GetTerrainWorldBounds();
+    Op->Settings.BoundsCentre = FVector2D(
+        WorldBounds.GetCenter().X,
+        WorldBounds.GetCenter().Y
+    );
+    Op->Settings.BoundsExtent = FVector2D(
+        WorldBounds.GetExtent().X,
+        WorldBounds.GetExtent().Y
+    );
+    Op->Settings.CoastalTransitionWidth = CoastalTransitionWidth;
+    Op->Settings.OceanBasinDepth = OceanBasinDepth;
     Op->Settings.MountainMinimumSpineDistance =
         MountainMinimumSpineDistance;
 
@@ -523,7 +690,9 @@ UAvenorTerrainModifier::CreateBackgroundOp(
         return FVector2D(World.X, World.Y);
     };
 
-    for (int32 Index = 0; Index < MountainRegionCount; ++Index)
+    const int32 GeneratedMountainCount =
+        bGenerateMountains ? MountainRegionCount : 0;
+    for (int32 Index = 0; Index < GeneratedMountainCount; ++Index)
     {
         FVector2D Centre;
         for (int32 Attempt = 0; Attempt < 32; ++Attempt)
