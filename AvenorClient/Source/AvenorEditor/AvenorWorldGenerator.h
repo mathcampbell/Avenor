@@ -119,7 +119,7 @@ private:
     bool bGenerateMesas = false;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bGenerateCanyons = true;
+    bool bGenerateCanyons = false;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateValleys = true;
@@ -214,7 +214,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Valleys",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateValleys"))
-    double ValleyMaximumDepth = 9000.0;
+    double ValleyMaximumDepth = 4500.0;
 
     UPROPERTY(EditAnywhere, Category = "Valleys",
         meta = (ClampMin = "1", ClampMax = "12",
@@ -223,7 +223,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Canyons",
         meta = (ClampMin = "1.0", EditCondition = "bGenerateCanyons"))
-    double CanyonStartCatchmentCells = 180.0;
+    double CanyonStartCatchmentCells = 600.0;
 
     UPROPERTY(EditAnywhere, Category = "Canyons",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateCanyons"))
@@ -251,7 +251,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateRivers"))
-    double MaximumRiverDepth = 6000.0;
+    double MaximumRiverDepth = 1800.0;
 
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "100.0", EditCondition = "bGenerateRivers"))
@@ -264,7 +264,7 @@ private:
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "0.0", ClampMax = "1.0",
             EditCondition = "bGenerateRivers"))
-    double LowlandMeanderStrength = 0.22;
+    double LowlandMeanderStrength = 0.75;
 
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "1", ClampMax = "512",
