@@ -33,6 +33,14 @@ class AVENOREDITOR_API UAvenorTerrainModifier
 public:
     UAvenorTerrainModifier();
 
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    double EvaluateBaseHeightAtWorldPosition(
+        const FVector2D& WorldPosition
+    ) const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Terrain")
+    FBox GetTerrainWorldBounds() const;
+
     virtual TArray<FBox> ComputeBounds() const override;
     virtual TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
         CreateBackgroundOp(
