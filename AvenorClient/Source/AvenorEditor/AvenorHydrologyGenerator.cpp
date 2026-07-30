@@ -6,7 +6,6 @@
 #include "Editor.h"
 #include "EngineUtils.h"
 #include "MeshPartition.h"
-#include "MeshPartitionEditorComponent.h"
 #include "MeshPartitionModifierComponent.h"
 #include "Misc/ScopedSlowTask.h"
 #include "UObject/UObjectGlobals.h"
@@ -475,6 +474,9 @@ static TWaterBodyActor* CreateWaterBody(
         FAttachmentTransformRules::KeepWorldTransform
     );
     Modifier->RegisterComponent();
+    // The Blueprint-facing setter deliberately notifies Mesh Partition that
+    // its modifier list and affected sections must be rebuilt.
+    Modifier->BP_SetAffectedMegaMesh(MeshPartition);
     return WaterBody;
 }
 } // namespace UE::Avenor::Hydrology
@@ -753,15 +755,6 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         RiverSpline->UpdateSpline();
         River->PostEditChange();
         ++CreatedRivers;
-    }
-
-    if (UE::MeshPartition::UMeshPartitionEditorComponent*
-            EditorComponent =
-                Cast<UE::MeshPartition::UMeshPartitionEditorComponent>(
-                    MeshPartition->GetMeshPartitionComponent()
-                ))
-    {
-        EditorComponent->OnModifierAssigned();
     }
 
     bool bHasWaterZone = false;
