@@ -48,6 +48,7 @@ struct FAvenorGeneratedWorld
     TArray<int32> Downstream;
     TArray<int32> DrainParent;
     TArray<FVector2D> DrainagePosition;
+    TArray<FVector2D> ChannelPosition;
     TArray<FAvenorRiverDefinition> Rivers;
     TArray<FAvenorLakeDefinition> Lakes;
     TArray<FVector> OceanBoundary;
@@ -82,6 +83,13 @@ struct FAvenorGeneratedWorld
         return DrainagePosition.IsValidIndex(Cell)
             ? DrainagePosition[Cell]
             : Position(Cell);
+    }
+
+    FVector2D RiverPosition(int32 Cell) const
+    {
+        return ChannelPosition.IsValidIndex(Cell)
+            ? ChannelPosition[Cell]
+            : FlowPosition(Cell);
     }
 
     double Sample(
@@ -808,6 +816,21 @@ static void AddMeanders(
     {
         return;
     }
+    TArray<double> DistanceAlong;
+    DistanceAlong.SetNumZeroed(Points.Num());
+    for (int32 Index = 1; Index < Points.Num(); ++Index)
+    {
+        DistanceAlong[Index] = DistanceAlong[Index - 1] +
+            FVector2D::Distance(
+                FVector2D(Points[Index - 1]),
+                FVector2D(Points[Index])
+            );
+    }
+    const double TotalLength = DistanceAlong.Last();
+    if (TotalLength <= 1.0)
+    {
+        return;
+    }
     const double Phase = FMath::Fmod(
         FMath::Abs(Points[0].X * 0.000017 +
             Points[0].Y * 0.000031),
@@ -832,19 +855,24 @@ static void AddMeanders(
             1.0 - FMath::SmoothStep(0.002, 0.02, Slope)
         );
         const FVector2D Normal(-Direction.Y, Direction.X);
-        const double EndWeight = FMath::Sin(
-            PI * static_cast<double>(Index) /
-            static_cast<double>(Points.Num() - 1)
-        );
-        // Two deterministic wavelengths avoid the regular single-sine look.
-        // Steep headwaters remain comparatively direct; broad lowland reaches
-        // receive the full lateral migration.
+        const double NormalizedDistance =
+            DistanceAlong[Index] / TotalLength;
+        const double EndWeight =
+            FMath::Sin(PI * NormalizedDistance);
+        // One broad bend plus a weaker secondary bend. Frequencies are based
+        // on the complete reach length, not the 25 m resampling interval; this
+        // prevents the close-up scallops seen in earlier builds.
         const double MeanderSignal =
-            FMath::Sin(Phase + Index * 0.55) * 0.76 +
-            FMath::Sin(Phase * 1.73 + Index * 1.27) * 0.24;
-        const double EffectiveStrength = FMath::Max(0.65, Strength);
+            FMath::Sin(Phase + NormalizedDistance * PI) * 0.78 +
+            FMath::Sin(
+                Phase * 1.61 + NormalizedDistance * 2.0 * PI
+            ) * 0.22;
+        const double ReachAmplitude = FMath::Min(
+            TotalLength * 0.16,
+            Grid.CellSize * 0.55
+        );
         const double Offset =
-            MeanderSignal * Grid.CellSize * EffectiveStrength *
+            MeanderSignal * ReachAmplitude * Strength *
             Flatness * EndWeight;
         Points[Index].X += Normal.X * Offset;
         Points[Index].Y += Normal.Y * Offset;
@@ -994,7 +1022,7 @@ static void ExtractRivers(
         double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
-            const FVector2D XY = Grid.FlowPosition(Cell);
+            const FVector2D XY = Grid.RiverPosition(Cell);
             const double LocalDepth = FMath::Lerp(
                 80.0,
                 350.0,
@@ -1549,6 +1577,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
 
     const int32 CellCount = static_cast<int32>(CellCount64);
     Grid->DrainagePosition.SetNumUninitialized(CellCount);
+    Grid->ChannelPosition.SetNumUninitialized(CellCount);
     const FVector2D DrainageSeedOffset(
         static_cast<double>(Seed) * 31.73,
         static_cast<double>(Seed) * -19.91
@@ -1577,6 +1606,46 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             WarpX,
             WarpY
         ) * Grid->CellSize * 0.75;
+    }
+    // A separate, much broader displacement field controls the visible river
+    // course. The drainage grid determines connectivity and downhill flow;
+    // this field makes the whole shared network wander over kilometre-scale
+    // distances instead of adding tiny wiggles to straight grid segments.
+    const double BroadChannelScale = Grid->CellSize * 11.0;
+    const double MediumChannelScale = Grid->CellSize * 5.5;
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const int32 X = Cell % Grid->Columns;
+        const int32 Y = Cell / Grid->Columns;
+        const FVector2D Centre = Grid->DrainagePosition[Cell];
+        if (Grid->IsBoundary(X, Y))
+        {
+            Grid->ChannelPosition[Cell] = Centre;
+            continue;
+        }
+        const FVector2D BroadInput =
+            (Grid->Position(Cell) + DrainageSeedOffset * 2.31) /
+            BroadChannelScale;
+        const FVector2D MediumInput =
+            (Grid->Position(Cell) - DrainageSeedOffset * 1.17) /
+            MediumChannelScale;
+        const FVector2D BroadWarp(
+            FMath::PerlinNoise2D(BroadInput),
+            FMath::PerlinNoise2D(FVector2D(
+                BroadInput.Y + 41.7,
+                -BroadInput.X - 23.9
+            ))
+        );
+        const FVector2D MediumWarp(
+            FMath::PerlinNoise2D(MediumInput),
+            FMath::PerlinNoise2D(FVector2D(
+                -MediumInput.Y + 7.3,
+                MediumInput.X + 61.1
+            ))
+        );
+        Grid->ChannelPosition[Cell] = Centre +
+            BroadWarp * Grid->CellSize * 2.25 +
+            MediumWarp * Grid->CellSize * 0.65;
     }
     Grid->BaseHeight.SetNumUninitialized(CellCount);
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
@@ -1751,7 +1820,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("b629672d-2241-4d92-83db-fd9dc60d9529"));
+        return FGuid(TEXT("2eb1d444-c235-4706-8985-130ee50d954a"));
     }
 
     FBox GlobalBounds;
