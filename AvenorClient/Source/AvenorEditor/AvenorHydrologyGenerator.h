@@ -5,6 +5,7 @@
 #include "AvenorHydrologyGenerator.generated.h"
 
 class UAvenorTerrainModifier;
+class UAvenorTerrainRefinementModifier;
 
 /**
  * Editor-only deterministic drainage solver and native UE Water generator.
@@ -25,9 +26,14 @@ public:
 
 private:
     UAvenorTerrainModifier* ResolveTerrainModifier() const;
+    UAvenorTerrainRefinementModifier*
+        ResolveRefinementModifier() const;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<AActor> TerrainModifierActor;
+
+    UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
+    TObjectPtr<AActor> RefinementModifierActor;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<AActor> MeshPartitionActor;
