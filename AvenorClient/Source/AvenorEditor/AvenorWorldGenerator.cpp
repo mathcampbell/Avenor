@@ -605,26 +605,40 @@ static void BuildFlow(FAvenorGeneratedWorld& Grid)
             const int32 Cell = Grid.Index(X, Y);
             double BestSlope = 0.0;
             int32 Best = INDEX_NONE;
-            for (int32 Direction = 0; Direction < 8; ++Direction)
+            // D8 drainage is responsible for the conspicuous horizontal,
+            // vertical and 45-degree "rail map" channels. Search a 5x5
+            // neighbourhood instead, giving the flow graph many intermediate
+            // bearings while retaining deterministic downhill topology.
+            for (int32 OffsetY = -2; OffsetY <= 2; ++OffsetY)
             {
-                const int32 Neighbour = Grid.Index(
-                    X + DX[Direction],
-                    Y + DY[Direction]
-                );
-                const double Distance = FMath::Max(
-                    1.0,
-                    FVector2D::Distance(
-                        Grid.FlowPosition(Cell),
-                        Grid.FlowPosition(Neighbour)
-                    )
-                );
-                const double Slope =
-                    (Grid.FilledHeight[Cell] -
-                        Grid.FilledHeight[Neighbour]) / Distance;
-                if (Slope > BestSlope)
+                for (int32 OffsetX = -2; OffsetX <= 2; ++OffsetX)
                 {
-                    BestSlope = Slope;
-                    Best = Neighbour;
+                    if (OffsetX == 0 && OffsetY == 0)
+                    {
+                        continue;
+                    }
+                    const int32 NX = X + OffsetX;
+                    const int32 NY = Y + OffsetY;
+                    if (!Grid.IsValid(NX, NY))
+                    {
+                        continue;
+                    }
+                    const int32 Neighbour = Grid.Index(NX, NY);
+                    const double Distance = FMath::Max(
+                        1.0,
+                        FVector2D::Distance(
+                            Grid.FlowPosition(Cell),
+                            Grid.FlowPosition(Neighbour)
+                        )
+                    );
+                    const double Slope =
+                        (Grid.FilledHeight[Cell] -
+                            Grid.FilledHeight[Neighbour]) / Distance;
+                    if (Slope > BestSlope)
+                    {
+                        BestSlope = Slope;
+                        Best = Neighbour;
+                    }
                 }
             }
             if (Best == INDEX_NONE)
@@ -813,7 +827,7 @@ static void AddMeanders(
             Points[Index - 1].Z - Points[Index + 1].Z
         ) / Run;
         const double Flatness = FMath::Lerp(
-            0.35,
+            0.70,
             1.0,
             1.0 - FMath::SmoothStep(0.002, 0.02, Slope)
         );
@@ -828,8 +842,9 @@ static void AddMeanders(
         const double MeanderSignal =
             FMath::Sin(Phase + Index * 0.55) * 0.76 +
             FMath::Sin(Phase * 1.73 + Index * 1.27) * 0.24;
+        const double EffectiveStrength = FMath::Max(0.65, Strength);
         const double Offset =
-            MeanderSignal * Grid.CellSize * Strength *
+            MeanderSignal * Grid.CellSize * EffectiveStrength *
             Flatness * EndWeight;
         Points[Index].X += Normal.X * Offset;
         Points[Index].Y += Normal.Y * Offset;
@@ -1177,7 +1192,49 @@ static TArray<FVector> TraceLakeBoundary(
             Largest = MoveTemp(Loop);
         }
     }
-    return SmoothPolyline(Largest, true, 2);
+    TArray<FVector> Reduced;
+    const int32 BoundaryStride = FMath::Max(1, Largest.Num() / 64);
+    for (int32 Index = 0;
+         Index < Largest.Num();
+         Index += BoundaryStride)
+    {
+        Reduced.Add(Largest[Index]);
+    }
+    TArray<FVector> Shoreline = SmoothPolyline(Reduced, true, 2);
+    if (Shoreline.Num() >= 8)
+    {
+        const double Phase = FMath::Fmod(
+            FMath::Abs(
+                Shoreline[0].X * 0.000021 +
+                Shoreline[0].Y * 0.000037
+            ),
+            2.0 * PI
+        );
+        TArray<FVector> Irregular = Shoreline;
+        for (int32 Index = 0; Index < Shoreline.Num(); ++Index)
+        {
+            const FVector2D Previous(
+                Shoreline[
+                    (Index - 1 + Shoreline.Num()) % Shoreline.Num()
+                ]
+            );
+            const FVector2D Next(
+                Shoreline[(Index + 1) % Shoreline.Num()]
+            );
+            const FVector2D Tangent =
+                (Next - Previous).GetSafeNormal();
+            const FVector2D Normal(-Tangent.Y, Tangent.X);
+            const double ShoreVariation =
+                FMath::Sin(Phase + Index * 0.37) * 0.65 +
+                FMath::Sin(Phase * 1.81 + Index * 0.91) * 0.35;
+            Irregular[Index].X +=
+                Normal.X * ShoreVariation * Grid.CellSize * 0.12;
+            Irregular[Index].Y +=
+                Normal.Y * ShoreVariation * Grid.CellSize * 0.12;
+        }
+        Shoreline = SmoothPolyline(Irregular, true, 1);
+    }
+    return Shoreline;
 }
 
 static void ExtractLakes(
@@ -1519,7 +1576,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
         Grid->DrainagePosition[Cell] = Centre + FVector2D(
             WarpX,
             WarpY
-        ) * Grid->CellSize * 0.48;
+        ) * Grid->CellSize * 0.75;
     }
     Grid->BaseHeight.SetNumUninitialized(CellCount);
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
@@ -1694,7 +1751,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("87324657-2698-420c-987b-a0a1e9252d96"));
+        return FGuid(TEXT("b629672d-2241-4d92-83db-fd9dc60d9529"));
     }
 
     FBox GlobalBounds;
