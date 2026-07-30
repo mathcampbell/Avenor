@@ -909,55 +909,48 @@ static void AddMeanders(
             Points[0].Y * 0.000031),
         2.0 * PI
     );
+    const double BendCount = FMath::Clamp(
+        TotalLength / FMath::Max(Grid.CellSize * 14.0, 1.0),
+        1.25,
+        5.0
+    );
+    const double ReachAmplitude = FMath::Min(
+        TotalLength * 0.20,
+        Grid.CellSize * 4.5
+    );
+    TArray<FVector> Curved = Points;
     for (int32 Index = 1; Index < Points.Num() - 1; ++Index)
     {
         const FVector2D Previous(Points[Index - 1]);
         const FVector2D Next(Points[Index + 1]);
         const FVector2D Direction =
             (Next - Previous).GetSafeNormal();
-        const double Run = FMath::Max(
-            1.0,
-            FVector2D::Distance(Previous, Next)
-        );
-        const double Slope = FMath::Abs(
-            Points[Index - 1].Z - Points[Index + 1].Z
-        ) / Run;
-        const double Flatness = FMath::Lerp(
-            0.70,
-            1.0,
-            1.0 - FMath::SmoothStep(0.002, 0.02, Slope)
-        );
         const FVector2D Normal(-Direction.Y, Direction.X);
         const double NormalizedDistance =
             DistanceAlong[Index] / TotalLength;
-        const double EndWeight =
-            FMath::Sin(PI * NormalizedDistance);
-        // Bend the complete reach at landscape scale. EndWeight keeps
-        // tributary joins exact; kilometre-scale wavelengths prevent the
-        // drainage graph from reading as straight transport-map links.
-        const double BendCount = FMath::Clamp(
-            TotalLength / FMath::Max(Grid.CellSize * 9.0, 1.0),
-            1.25,
-            4.5
+        const double EndWeight = FMath::Pow(
+            FMath::Sin(PI * NormalizedDistance),
+            0.65
         );
+        // Only landscape-scale bends belong here. The drainage graph owns
+        // the endpoints and tributary joins; these sparse controls stop its
+        // finite neighbour bearings becoming visible as straight links.
         const double MeanderSignal =
             FMath::Sin(
-                Phase + NormalizedDistance * PI * BendCount
-            ) * 0.72 +
+                Phase + NormalizedDistance * 2.0 * PI * BendCount
+            ) * 0.78 +
             FMath::Sin(
                 Phase * 1.61 +
-                NormalizedDistance * PI * (BendCount * 0.47 + 0.5)
-            ) * 0.28;
-        const double ReachAmplitude = FMath::Min(
-            TotalLength * 0.22,
-            Grid.CellSize * 3.25
-        );
+                NormalizedDistance * 2.0 * PI *
+                    (BendCount * 0.43 + 0.37)
+            ) * 0.22;
         const double Offset =
             MeanderSignal * ReachAmplitude * Strength *
-            Flatness * EndWeight;
-        Points[Index].X += Normal.X * Offset;
-        Points[Index].Y += Normal.Y * Offset;
+            EndWeight;
+        Curved[Index].X += Normal.X * Offset;
+        Curved[Index].Y += Normal.Y * Offset;
     }
+    Points = MoveTemp(Curved);
 }
 
 static TArray<FVector> ResampleRiverCentreline(
@@ -972,24 +965,33 @@ static TArray<FVector> ResampleRiverCentreline(
     }
     Result.Add(Input[0]);
     const double SafeSpacing = FMath::Max(100.0, Spacing);
+    double DistanceSinceSample = 0.0;
     for (int32 Index = 0; Index + 1 < Input.Num(); ++Index)
     {
-        const FVector& A = Input[Index];
+        FVector A = Input[Index];
         const FVector& B = Input[Index + 1];
-        const double SegmentLength =
+        double SegmentLength =
             FVector2D::Distance(FVector2D(A), FVector2D(B));
-        const int32 Steps = FMath::Max(
-            2,
-            FMath::CeilToInt(SegmentLength / SafeSpacing)
-        );
-        for (int32 Step = 1; Step <= Steps; ++Step)
+        while (SegmentLength > UE_DOUBLE_KINDA_SMALL_NUMBER &&
+            DistanceSinceSample + SegmentLength >= SafeSpacing)
         {
-            Result.Add(FMath::Lerp(
+            const double Step = SafeSpacing - DistanceSinceSample;
+            const FVector Sample = FMath::Lerp(
                 A,
                 B,
-                static_cast<double>(Step) / Steps
-            ));
+                Step / SegmentLength
+            );
+            Result.Add(Sample);
+            A = Sample;
+            SegmentLength =
+                FVector2D::Distance(FVector2D(A), FVector2D(B));
+            DistanceSinceSample = 0.0;
         }
+        DistanceSinceSample += SegmentLength;
+    }
+    if (!Result.Last().Equals(Input.Last(), 1.0))
+    {
+        Result.Add(Input.Last());
     }
     return Result;
 }
@@ -1134,10 +1136,10 @@ static void ExtractRivers(
         }
         River.Points = ResampleRiverCentreline(
             River.Points,
-            Grid.CellSize * 0.25
+            Grid.CellSize * 3.0
         );
         AddMeanders(Grid, River.Points, MeanderStrength);
-        River.Points = SmoothPolyline(River.Points, false, 2);
+        River.Points = SmoothPolyline(River.Points, false, 1);
         PreviousSurface = TNumericLimits<double>::Max();
         for (FVector& Point : River.Points)
         {
@@ -1311,7 +1313,7 @@ static TArray<FVector> TraceLakeBoundary(
         }
     }
     TArray<FVector> Reduced;
-    const int32 BoundaryStride = FMath::Max(1, Largest.Num() / 64);
+    const int32 BoundaryStride = FMath::Max(1, Largest.Num() / 24);
     for (int32 Index = 0;
          Index < Largest.Num();
          Index += BoundaryStride)
@@ -1321,7 +1323,7 @@ static TArray<FVector> TraceLakeBoundary(
     // Repeated closed Chaikin passes turn the analytical raster catchment
     // into a continuous shoreline. The grid decides which basin fills; it
     // does not dictate the final square outline.
-    TArray<FVector> Shoreline = SmoothPolyline(Reduced, true, 3);
+    TArray<FVector> Shoreline = SmoothPolyline(Reduced, true, 2);
     if (Shoreline.Num() >= 8)
     {
         const double Phase = FMath::Fmod(
@@ -1709,45 +1711,12 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
             WarpY
         ) * Grid->CellSize * 0.75;
     }
-    // A separate, much broader displacement field controls the visible river
-    // course. The drainage grid determines connectivity and downhill flow;
-    // this field makes the whole shared network wander over kilometre-scale
-    // distances instead of adding tiny wiggles to straight grid segments.
-    const double BroadChannelScale = Grid->CellSize * 11.0;
-    const double MediumChannelScale = Grid->CellSize * 5.5;
+    // FlowPosition is used unchanged for the sparse reach anchors. Broad
+    // curvature is added once per complete reach below; applying another
+    // per-cell noise field here only creates dense, jittering Water splines.
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
-        const int32 X = Cell % Grid->Columns;
-        const int32 Y = Cell / Grid->Columns;
-        const FVector2D Centre = Grid->DrainagePosition[Cell];
-        if (Grid->IsBoundary(X, Y))
-        {
-            Grid->ChannelPosition[Cell] = Centre;
-            continue;
-        }
-        const FVector2D BroadInput =
-            (Grid->Position(Cell) + DrainageSeedOffset * 2.31) /
-            BroadChannelScale;
-        const FVector2D MediumInput =
-            (Grid->Position(Cell) - DrainageSeedOffset * 1.17) /
-            MediumChannelScale;
-        const FVector2D BroadWarp(
-            FMath::PerlinNoise2D(BroadInput),
-            FMath::PerlinNoise2D(FVector2D(
-                BroadInput.Y + 41.7,
-                -BroadInput.X - 23.9
-            ))
-        );
-        const FVector2D MediumWarp(
-            FMath::PerlinNoise2D(MediumInput),
-            FMath::PerlinNoise2D(FVector2D(
-                -MediumInput.Y + 7.3,
-                MediumInput.X + 61.1
-            ))
-        );
-        Grid->ChannelPosition[Cell] = Centre +
-            BroadWarp * Grid->CellSize * 2.25 +
-            MediumWarp * Grid->CellSize * 0.65;
+        Grid->ChannelPosition[Cell] = Grid->DrainagePosition[Cell];
     }
     Grid->BaseHeight.SetNumUninitialized(CellCount);
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
