@@ -20,6 +20,7 @@
 struct FAvenorRiverDefinition
 {
     TArray<FVector> Points;
+    TArray<FVector> SplinePoints;
     double DischargeCells = 0.0;
     double Width = 600.0;
     double Depth = 250.0;
@@ -879,6 +880,68 @@ static void CarveDrainage(
     BuildFlow(Grid);
 }
 
+static TArray<FVector> SimplifyPolylineDouglasPeucker(
+    const TArray<FVector>& Points,
+    double Tolerance
+)
+{
+    if (Points.Num() < 3)
+    {
+        return Points;
+    }
+    TArray<bool> Keep;
+    Keep.Init(false, Points.Num());
+    Keep[0] = true;
+    Keep.Last() = true;
+
+    struct FRange
+    {
+        int32 Start = 0;
+        int32 End = 0;
+    };
+    TArray<FRange> Stack;
+    Stack.Push({0, Points.Num() - 1});
+    const double ToleranceSquared = Tolerance * Tolerance;
+    while (!Stack.IsEmpty())
+    {
+        const FRange Range = Stack.Pop();
+        const FVector2D A(Points[Range.Start]);
+        const FVector2D B(Points[Range.End]);
+        double MaximumDistanceSquared = 0.0;
+        int32 Furthest = INDEX_NONE;
+        for (int32 Index = Range.Start + 1;
+             Index < Range.End;
+             ++Index)
+        {
+            const double DistanceSquared = FMath::Square(
+                DistanceToSegment(FVector2D(Points[Index]), A, B)
+            );
+            if (DistanceSquared > MaximumDistanceSquared)
+            {
+                MaximumDistanceSquared = DistanceSquared;
+                Furthest = Index;
+            }
+        }
+        if (Furthest != INDEX_NONE &&
+            MaximumDistanceSquared > ToleranceSquared)
+        {
+            Keep[Furthest] = true;
+            Stack.Push({Range.Start, Furthest});
+            Stack.Push({Furthest, Range.End});
+        }
+    }
+
+    TArray<FVector> Result;
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        if (Keep[Index])
+        {
+            Result.Add(Points[Index]);
+        }
+    }
+    return Result;
+}
+
 static void AddMeanders(
     const FAvenorGeneratedWorld& Grid,
     TArray<FVector>& Points,
@@ -910,13 +973,14 @@ static void AddMeanders(
         2.0 * PI
     );
     const double BendCount = FMath::Clamp(
-        TotalLength / FMath::Max(Grid.CellSize * 14.0, 1.0),
-        1.25,
-        5.0
+        TotalLength / FMath::Max(Grid.CellSize * 20.0, 1.0),
+        0.75,
+        6.0
     );
-    const double ReachAmplitude = FMath::Min(
-        TotalLength * 0.20,
-        Grid.CellSize * 4.5
+    const double ReachAmplitude = FMath::Clamp(
+        TotalLength * 0.08,
+        Grid.CellSize * 1.25,
+        Grid.CellSize * 8.0
     );
     TArray<FVector> Curved = Points;
     for (int32 Index = 1; Index < Points.Num() - 1; ++Index)
@@ -944,11 +1008,46 @@ static void AddMeanders(
                 NormalizedDistance * 2.0 * PI *
                     (BendCount * 0.43 + 0.37)
             ) * 0.22;
-        const double Offset =
+        const double DesiredOffset =
             MeanderSignal * ReachAmplitude * Strength *
             EndWeight;
-        Curved[Index].X += Normal.X * Offset;
-        Curved[Index].Y += Normal.Y * Offset;
+        // Keep the deliberate broad bend, then move it within a limited
+        // cross-channel search to favour naturally lower ground. This avoids
+        // blindly pushing a cosmetic sine curve through a neighbouring ridge
+        // while retaining guaranteed curvature on an otherwise straight
+        // two-endpoint raster reach.
+        double BestOffset = DesiredOffset;
+        double BestScore = TNumericLimits<double>::Max();
+        for (int32 CandidateIndex = -2;
+             CandidateIndex <= 2;
+             ++CandidateIndex)
+        {
+            const double CandidateOffset = DesiredOffset +
+                CandidateIndex * ReachAmplitude * 0.16;
+            const FVector2D Candidate =
+                FVector2D(Points[Index]) +
+                Normal * CandidateOffset;
+            const double TerrainHeight =
+                Grid.Sample(Grid.BaseHeight, Candidate);
+            const double ShapePenalty =
+                FMath::Abs(CandidateOffset - DesiredOffset) * 0.08;
+            const double Score = TerrainHeight + ShapePenalty;
+            if (Score < BestScore)
+            {
+                BestScore = Score;
+                BestOffset = CandidateOffset;
+            }
+        }
+        Curved[Index].X = FMath::Clamp(
+            Points[Index].X + Normal.X * BestOffset,
+            Grid.Bounds.Min.X + Grid.CellSize,
+            Grid.Bounds.Max.X - Grid.CellSize
+        );
+        Curved[Index].Y = FMath::Clamp(
+            Points[Index].Y + Normal.Y * BestOffset,
+            Grid.Bounds.Min.Y + Grid.CellSize,
+            Grid.Bounds.Max.Y - Grid.CellSize
+        );
     }
     Points = MoveTemp(Curved);
 }
@@ -994,6 +1093,138 @@ static TArray<FVector> ResampleRiverCentreline(
         Result.Add(Input.Last());
     }
     return Result;
+}
+
+static TArray<FVector> ResampleClosedPolyline(
+    const TArray<FVector>& Input,
+    double Spacing
+)
+{
+    if (Input.Num() < 3)
+    {
+        return Input;
+    }
+    TArray<double> Distance;
+    Distance.SetNumZeroed(Input.Num() + 1);
+    for (int32 Index = 0; Index < Input.Num(); ++Index)
+    {
+        Distance[Index + 1] = Distance[Index] +
+            FVector2D::Distance(
+                FVector2D(Input[Index]),
+                FVector2D(Input[(Index + 1) % Input.Num()])
+            );
+    }
+    const double Perimeter = Distance.Last();
+    if (Perimeter <= 1.0)
+    {
+        return Input;
+    }
+    const int32 SampleCount = FMath::Clamp(
+        FMath::CeilToInt(
+            Perimeter / FMath::Max(100.0, Spacing)
+        ),
+        8,
+        48
+    );
+    TArray<FVector> Result;
+    Result.Reserve(SampleCount);
+    int32 Segment = 0;
+    for (int32 SampleIndex = 0;
+         SampleIndex < SampleCount;
+         ++SampleIndex)
+    {
+        const double TargetDistance =
+            Perimeter * SampleIndex / SampleCount;
+        while (Segment + 1 < Input.Num() &&
+            Distance[Segment + 1] < TargetDistance)
+        {
+            ++Segment;
+        }
+        const double SegmentLength =
+            Distance[Segment + 1] - Distance[Segment];
+        const double Alpha = SegmentLength > 1.0
+            ? (TargetDistance - Distance[Segment]) / SegmentLength
+            : 0.0;
+        Result.Add(FMath::Lerp(
+            Input[Segment],
+            Input[(Segment + 1) % Input.Num()],
+            Alpha
+        ));
+    }
+    return Result;
+}
+
+static FVector EvaluateCatmullRom(
+    const FVector& P0,
+    const FVector& P1,
+    const FVector& P2,
+    const FVector& P3,
+    double Alpha
+)
+{
+    const double AlphaSquared = Alpha * Alpha;
+    const double AlphaCubed = AlphaSquared * Alpha;
+    return 0.5 * (
+        2.0 * P1 +
+        (-P0 + P2) * Alpha +
+        (2.0 * P0 - 5.0 * P1 + 4.0 * P2 - P3) *
+            AlphaSquared +
+        (-P0 + 3.0 * P1 - 3.0 * P2 + P3) *
+            AlphaCubed
+    );
+}
+
+static TArray<FVector> ResampleCatmullRom(
+    const TArray<FVector>& ControlPoints,
+    double Spacing
+)
+{
+    if (ControlPoints.Num() < 3)
+    {
+        return ControlPoints;
+    }
+    TArray<FVector> Dense;
+    constexpr int32 StepsPerSegment = 12;
+    const int32 Last = ControlPoints.Num() - 1;
+    Dense.Reserve(ControlPoints.Num() * StepsPerSegment);
+    for (int32 Index = 0; Index < Last; ++Index)
+    {
+        const FVector& P0 =
+            ControlPoints[FMath::Max(0, Index - 1)];
+        const FVector& P1 = ControlPoints[Index];
+        const FVector& P2 = ControlPoints[Index + 1];
+        const FVector& P3 =
+            ControlPoints[FMath::Min(Last, Index + 2)];
+        for (int32 Step = 0; Step < StepsPerSegment; ++Step)
+        {
+            Dense.Add(EvaluateCatmullRom(
+                P0,
+                P1,
+                P2,
+                P3,
+                static_cast<double>(Step) / StepsPerSegment
+            ));
+        }
+    }
+    Dense.Add(ControlPoints.Last());
+    return ResampleRiverCentreline(Dense, Spacing);
+}
+
+static void SetDownhillSurface(
+    const FAvenorGeneratedWorld& Grid,
+    TArray<FVector>& Points,
+    double SurfaceInset
+)
+{
+    double PreviousSurface = TNumericLimits<double>::Max();
+    for (FVector& Point : Points)
+    {
+        Point.Z = FMath::Min(
+            PreviousSurface - 1.0,
+            Grid.Sample(Grid.Height, FVector2D(Point)) + SurfaceInset
+        );
+        PreviousSurface = Point.Z;
+    }
 }
 
 static void ExtractRivers(
@@ -1134,21 +1365,27 @@ static void ExtractRivers(
             River.Points.Emplace(XY.X, XY.Y, Surface);
             PreviousSurface = Surface;
         }
+        // The raster route owns hydrological topology, but not final visual
+        // bearings. Simplify its staircase, then guarantee sparse controls
+        // along every long reach before adding landscape-scale curvature.
+        // Even a perfectly straight route therefore receives intermediate
+        // controls and cannot collapse back to a two-point rail line.
+        River.Points = SimplifyPolylineDouglasPeucker(
+            River.Points,
+            Grid.CellSize * 0.6
+        );
         River.Points = ResampleRiverCentreline(
             River.Points,
-            Grid.CellSize * 3.0
+            Grid.CellSize * 6.0
         );
         AddMeanders(Grid, River.Points, MeanderStrength);
-        River.Points = SmoothPolyline(River.Points, false, 1);
-        PreviousSurface = TNumericLimits<double>::Max();
-        for (FVector& Point : River.Points)
-        {
-            Point.Z = FMath::Min(
-                PreviousSurface - 1.0,
-                Grid.Sample(Grid.Height, FVector2D(Point)) + 100.0
-            );
-            PreviousSurface = Point.Z;
-        }
+        SetDownhillSurface(Grid, River.Points, 100.0);
+        River.SplinePoints = River.Points;
+        River.Points = ResampleCatmullRom(
+            River.SplinePoints,
+            Grid.CellSize * 0.75
+        );
+        SetDownhillSurface(Grid, River.Points, 100.0);
         FBox2D CentrelineBounds(ForceInit);
         for (const FVector& Point : River.Points)
         {
@@ -1347,17 +1584,30 @@ static TArray<FVector> TraceLakeBoundary(
             const FVector2D Tangent =
                 (Next - Previous).GetSafeNormal();
             const FVector2D Normal(-Tangent.Y, Tangent.X);
+            const double PerimeterAlpha =
+                static_cast<double>(Index) / Shoreline.Num();
             const double ShoreVariation =
-                FMath::Sin(Phase + Index * 0.37) * 0.65 +
-                FMath::Sin(Phase * 1.81 + Index * 0.91) * 0.35;
+                FMath::Sin(
+                    Phase + PerimeterAlpha * 2.0 * PI * 2.0
+                ) * 0.70 +
+                FMath::Sin(
+                    Phase * 1.81 +
+                    PerimeterAlpha * 2.0 * PI * 3.7
+                ) * 0.30;
             Irregular[Index].X +=
-                Normal.X * ShoreVariation * Grid.CellSize * 0.12;
+                Normal.X * ShoreVariation * Grid.CellSize * 0.18;
             Irregular[Index].Y +=
-                Normal.Y * ShoreVariation * Grid.CellSize * 0.12;
+                Normal.Y * ShoreVariation * Grid.CellSize * 0.18;
         }
         Shoreline = SmoothPolyline(Irregular, true, 2);
     }
-    return Shoreline;
+    // UE Water only needs sparse controls. The interpolated basin contour is
+    // retained, while hundreds of post-smoothing points are collapsed to a
+    // bounded set of evenly spaced shoreline controls.
+    return ResampleClosedPolyline(
+        Shoreline,
+        Grid.CellSize * 2.0
+    );
 }
 
 static void ExtractLakes(
@@ -1900,7 +2150,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("2eb1d444-c235-4706-8985-130ee50d954a"));
+        return FGuid(TEXT("f3b0ac97-831d-4c56-9600-ffb683b2f219"));
     }
 
     FBox GlobalBounds;
@@ -2222,7 +2472,10 @@ void AAvenorWorldGenerator::CreateWaterBodies(
         );
         if (River)
         {
-            TArray<FVector> WorldPoints = Definition.Points;
+            TArray<FVector> WorldPoints =
+                Definition.SplinePoints.Num() >= 2
+                ? Definition.SplinePoints
+                : Definition.Points;
             for (FVector& Point : WorldPoints)
             {
                 Point.Z += GetActorLocation().Z;
