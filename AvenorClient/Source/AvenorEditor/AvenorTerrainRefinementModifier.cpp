@@ -111,6 +111,7 @@ struct FSettings
     double HeadwaterSlopeExponent = 0.5;
     double MinimumLakeFillDepth = 1000.0;
     double MinimumLakeCatchment = 80.0;
+    double MaximumLakeAreaSquareKilometres = 25.0;
     bool bFloodplains = true;
     double FloodplainStartArea = 80.0;
     double FloodplainSmoothing = 0.35;
@@ -605,6 +606,7 @@ struct FBoundaryEdge
 {
     FIntPoint Start;
     FIntPoint End;
+    FVector2D ContourPoint = FVector2D::ZeroVector;
     bool bUsed = false;
 };
 
@@ -621,18 +623,58 @@ static double SignedArea(const TArray<FIntPoint>& Loop)
     return Area * 0.5;
 }
 
-static TArray<FIntPoint> TraceLargestBoundary(
+static TArray<FVector2D> TraceLargestBoundary(
     const FAvenorTerrainAnalysisData& Grid,
-    const TSet<int32>& Basin
+    const TSet<int32>& Basin,
+    double SurfaceHeight
 )
 {
     TArray<FBoundaryEdge> Edges;
     auto AddEdge = [&Edges](
         const FIntPoint& Start,
+        const FIntPoint& End,
+        const FVector2D& ContourPoint
+    )
+    {
+        Edges.Add({Start, End, ContourPoint, false});
+    };
+    auto InterpolateCrossing = [&Grid, SurfaceHeight](
+        int32 InsideCell,
+        int32 OutsideX,
+        int32 OutsideY,
+        const FIntPoint& Start,
         const FIntPoint& End
     )
     {
-        Edges.Add({Start, End, false});
+        if (Grid.IsValid(OutsideX, OutsideY))
+        {
+            const int32 OutsideCell =
+                Grid.Index(OutsideX, OutsideY);
+            const double InsideHeight =
+                Grid.RefinedHeight[InsideCell];
+            const double OutsideHeight =
+                Grid.RefinedHeight[OutsideCell];
+            const double Denominator =
+                OutsideHeight - InsideHeight;
+            const double Alpha = FMath::Abs(Denominator) > 1.0
+                ? FMath::Clamp(
+                    (SurfaceHeight - InsideHeight) / Denominator,
+                    0.05,
+                    0.95
+                )
+                : 0.5;
+            return FMath::Lerp(
+                Grid.Position(InsideCell),
+                Grid.Position(OutsideCell),
+                Alpha
+            );
+        }
+        return FVector2D(
+            Grid.Bounds.Min.X +
+                (Start.X + End.X) * 0.5 * Grid.CellSize,
+            Grid.Bounds.Min.Y +
+                (Start.Y + End.Y) * 0.5 * Grid.CellSize
+        );
     };
 
     for (int32 Cell : Basin)
@@ -641,31 +683,49 @@ static TArray<FIntPoint> TraceLargestBoundary(
         const int32 Y = Cell / Grid.Columns;
         if (Y == 0 || !Basin.Contains(Grid.Index(X, Y - 1)))
         {
-            AddEdge(FIntPoint(X, Y), FIntPoint(X + 1, Y));
+            const FIntPoint Start(X, Y);
+            const FIntPoint End(X + 1, Y);
+            AddEdge(
+                Start,
+                End,
+                InterpolateCrossing(Cell, X, Y - 1, Start, End)
+            );
         }
         if (X == Grid.Columns - 1 ||
             !Basin.Contains(Grid.Index(X + 1, Y)))
         {
+            const FIntPoint Start(X + 1, Y);
+            const FIntPoint End(X + 1, Y + 1);
             AddEdge(
-                FIntPoint(X + 1, Y),
-                FIntPoint(X + 1, Y + 1)
+                Start,
+                End,
+                InterpolateCrossing(Cell, X + 1, Y, Start, End)
             );
         }
         if (Y == Grid.Rows - 1 ||
             !Basin.Contains(Grid.Index(X, Y + 1)))
         {
+            const FIntPoint Start(X + 1, Y + 1);
+            const FIntPoint End(X, Y + 1);
             AddEdge(
-                FIntPoint(X + 1, Y + 1),
-                FIntPoint(X, Y + 1)
+                Start,
+                End,
+                InterpolateCrossing(Cell, X, Y + 1, Start, End)
             );
         }
         if (X == 0 || !Basin.Contains(Grid.Index(X - 1, Y)))
         {
-            AddEdge(FIntPoint(X, Y + 1), FIntPoint(X, Y));
+            const FIntPoint Start(X, Y + 1);
+            const FIntPoint End(X, Y);
+            AddEdge(
+                Start,
+                End,
+                InterpolateCrossing(Cell, X - 1, Y, Start, End)
+            );
         }
     }
 
-    TArray<FIntPoint> Largest;
+    TArray<FVector2D> Largest;
     double LargestArea = 0.0;
     for (int32 StartEdge = 0;
          StartEdge < Edges.Num();
@@ -677,6 +737,7 @@ static TArray<FIntPoint> TraceLargestBoundary(
         }
 
         TArray<FIntPoint> Loop;
+        TArray<FVector2D> Contour;
         int32 EdgeIndex = StartEdge;
         const FIntPoint First = Edges[StartEdge].Start;
         for (int32 Guard = 0; Guard <= Edges.Num(); ++Guard)
@@ -688,6 +749,7 @@ static TArray<FIntPoint> TraceLargestBoundary(
             }
             Edge.bUsed = true;
             Loop.Add(Edge.Start);
+            Contour.Add(Edge.ContourPoint);
             const FIntPoint NextStart = Edge.End;
             if (NextStart == First)
             {
@@ -709,6 +771,7 @@ static TArray<FIntPoint> TraceLargestBoundary(
             if (EdgeIndex == INDEX_NONE)
             {
                 Loop.Reset();
+                Contour.Reset();
                 break;
             }
         }
@@ -717,7 +780,7 @@ static TArray<FIntPoint> TraceLargestBoundary(
         if (Loop.Num() >= 4 && Area > LargestArea)
         {
             LargestArea = Area;
-            Largest = MoveTemp(Loop);
+            Largest = MoveTemp(Contour);
         }
     }
     return Largest;
@@ -959,6 +1022,7 @@ static void ExtractLakeBasins(
     const FAvenorTerrainAnalysisData& Grid,
     double MinimumFillDepth,
     double MinimumCatchment,
+    double MaximumAreaSquareKilometres,
     int32 MaximumLakes,
     TArray<FAvenorLakeBasin>& OutLakes
 )
@@ -985,6 +1049,9 @@ static void ExtractLakeBasins(
         bool bTouchesBoundary = false;
         double SurfaceHeight = TNumericLimits<double>::Lowest();
         double MaximumCatchment = 0.0;
+        double MaximumDepth = 0.0;
+        const double ShorelineDepthThreshold =
+            FMath::Max(1.0, MinimumFillDepth * 0.02);
         for (int32 Head = 0; Head < Queue.Num(); ++Head)
         {
             const int32 Cell = Queue[Head];
@@ -999,6 +1066,11 @@ static void ExtractLakeBasins(
             MaximumCatchment = FMath::Max(
                 MaximumCatchment,
                 Grid.Accumulation[Cell]
+            );
+            MaximumDepth = FMath::Max(
+                MaximumDepth,
+                Grid.FilledHeight[Cell] -
+                    Grid.RefinedHeight[Cell]
             );
             const int32 X = Cell % Grid.Columns;
             const int32 Y = Cell / Grid.Columns;
@@ -1015,22 +1087,33 @@ static void ExtractLakeBasins(
                 if (!Visited[Neighbour] &&
                     Grid.FilledHeight[Neighbour] -
                         Grid.RefinedHeight[Neighbour] >=
-                            MinimumFillDepth)
+                            ShorelineDepthThreshold)
                 {
                     Visited[Neighbour] = true;
                     Queue.Add(Neighbour);
                 }
             }
         }
+        const double BasinAreaSquareKilometres =
+            Basin.Num() *
+            Grid.CellSize * Grid.CellSize /
+            10000000000.0;
         if (bTouchesBoundary ||
             Basin.Num() < 4 ||
-            MaximumCatchment < MinimumCatchment)
+            MaximumDepth < MinimumFillDepth ||
+            MaximumCatchment < MinimumCatchment ||
+            BasinAreaSquareKilometres >
+                MaximumAreaSquareKilometres)
         {
             continue;
         }
 
-        const TArray<FIntPoint> Boundary =
-            TraceLargestBoundary(Grid, Basin);
+        const TArray<FVector2D> Boundary =
+            TraceLargestBoundary(
+                Grid,
+                Basin,
+                SurfaceHeight
+            );
         if (Boundary.Num() < 4)
         {
             continue;
@@ -1045,10 +1128,10 @@ static void ExtractLakeBasins(
              Index < Boundary.Num();
              Index += Stride)
         {
-            const FIntPoint Corner = Boundary[Index];
+            const FVector2D ShorePoint = Boundary[Index];
             RawShoreline.Emplace(
-                Grid.Bounds.Min.X + Corner.X * Grid.CellSize,
-                Grid.Bounds.Min.Y + Corner.Y * Grid.CellSize,
+                ShorePoint.X,
+                ShorePoint.Y,
                 SurfaceHeight
             );
         }
@@ -1141,7 +1224,7 @@ public:
     static FGuid CodeVersion()
     {
         static const FGuid Version(
-            TEXT("8ed665c4-a4ac-4f7f-8148-7b996f10c75f")
+            TEXT("b6789751-c6e3-4b6d-90c9-cffed17f6d6d")
         );
         return Version;
     }
@@ -1207,6 +1290,8 @@ UAvenorTerrainRefinementModifier::GetOrBuildAnalysis() const
     Settings.HeadwaterSlopeExponent = HeadwaterSlopeExponent;
     Settings.MinimumLakeFillDepth = MinimumLakeFillDepth;
     Settings.MinimumLakeCatchment = MinimumLakeCatchmentCells;
+    Settings.MaximumLakeAreaSquareKilometres =
+        MaximumLakeAreaSquareKilometres;
     Settings.bFloodplains = bEnableFloodplains;
     Settings.FloodplainStartArea = FloodplainStartAreaCells;
     Settings.FloodplainSmoothing = FloodplainSmoothing;
@@ -1289,6 +1374,7 @@ bool UAvenorTerrainRefinementModifier::GetHydrologyFeatures(
         *Analysis,
         MinimumLakeFillDepth,
         MinimumLakeCatchmentCells,
+        MaximumLakeAreaSquareKilometres,
         MaximumLakes,
         OutLakes
     );
