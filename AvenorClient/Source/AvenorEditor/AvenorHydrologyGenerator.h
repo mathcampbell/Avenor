@@ -47,6 +47,14 @@ private:
     int32 LakeCount = 3;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
+        meta = (ClampMin = "0", ClampMax = "32"))
+    int32 RiverCount = 6;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
+        meta = (ClampMin = "2.0"))
+    double MinimumRiverCatchmentCells = 20.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
         meta = (ClampMin = "5000.0"))
     double LakeRadius = 60000.0;
 
