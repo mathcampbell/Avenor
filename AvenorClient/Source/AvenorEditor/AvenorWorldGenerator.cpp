@@ -779,7 +779,7 @@ static void AddMeanders(
     double Strength
 )
 {
-    if (Points.Num() < 4 || Strength <= 0.0)
+    if (Points.Num() < 3 || Strength <= 0.0)
     {
         return;
     }
@@ -801,8 +801,11 @@ static void AddMeanders(
         const double Slope = FMath::Abs(
             Points[Index - 1].Z - Points[Index + 1].Z
         ) / Run;
-        const double Flatness =
-            1.0 - FMath::SmoothStep(0.002, 0.02, Slope);
+        const double Flatness = FMath::Lerp(
+            0.35,
+            1.0,
+            1.0 - FMath::SmoothStep(0.002, 0.02, Slope)
+        );
         const FVector2D Normal(-Direction.Y, Direction.X);
         const double EndWeight = FMath::Sin(
             PI * static_cast<double>(Index) /
@@ -812,14 +815,48 @@ static void AddMeanders(
         // Steep headwaters remain comparatively direct; broad lowland reaches
         // receive the full lateral migration.
         const double MeanderSignal =
-            FMath::Sin(Phase + Index * 0.82) * 0.72 +
-            FMath::Sin(Phase * 1.73 + Index * 1.91) * 0.28;
+            FMath::Sin(Phase + Index * 0.55) * 0.76 +
+            FMath::Sin(Phase * 1.73 + Index * 1.27) * 0.24;
         const double Offset =
             MeanderSignal * Grid.CellSize * Strength *
             Flatness * EndWeight;
         Points[Index].X += Normal.X * Offset;
         Points[Index].Y += Normal.Y * Offset;
     }
+}
+
+static TArray<FVector> ResampleRiverCentreline(
+    const TArray<FVector>& Input,
+    double Spacing
+)
+{
+    TArray<FVector> Result;
+    if (Input.Num() < 2)
+    {
+        return Input;
+    }
+    Result.Add(Input[0]);
+    const double SafeSpacing = FMath::Max(100.0, Spacing);
+    for (int32 Index = 0; Index + 1 < Input.Num(); ++Index)
+    {
+        const FVector& A = Input[Index];
+        const FVector& B = Input[Index + 1];
+        const double SegmentLength =
+            FVector2D::Distance(FVector2D(A), FVector2D(B));
+        const int32 Steps = FMath::Max(
+            2,
+            FMath::CeilToInt(SegmentLength / SafeSpacing)
+        );
+        for (int32 Step = 1; Step <= Steps; ++Step)
+        {
+            Result.Add(FMath::Lerp(
+                A,
+                B,
+                static_cast<double>(Step) / Steps
+            ));
+        }
+    }
+    return Result;
 }
 
 static void ExtractRivers(
@@ -950,6 +987,10 @@ static void ExtractRivers(
             River.Points.Emplace(XY.X, XY.Y, Surface);
             PreviousSurface = Surface;
         }
+        River.Points = ResampleRiverCentreline(
+            River.Points,
+            Grid.CellSize * 0.25
+        );
         AddMeanders(Grid, River.Points, MeanderStrength);
         River.Points = SmoothPolyline(River.Points, false, 2);
         PreviousSurface = TNumericLimits<double>::Max();
@@ -1612,7 +1653,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("62cb4d86-35a2-47c9-9bc6-40a33ecef996"));
+        return FGuid(TEXT("9d77144f-2b0f-4ae1-bbc9-66c25d88a6da"));
     }
 
     FBox GlobalBounds;
