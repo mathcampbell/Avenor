@@ -18,8 +18,11 @@ public class AvenorEditor : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "Avenor",
+                "UnrealEd",
+                "Water",
                 "MeshPartition",
-                "MeshPartitionEditor"
+                "MeshPartitionEditor",
+                "MeshPartitionWater"
             }
         );
     }
