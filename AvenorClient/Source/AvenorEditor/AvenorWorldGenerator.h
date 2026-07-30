@@ -45,6 +45,7 @@ UCLASS(
         "Rolling Hills",
         "Mountains",
         "Mesas",
+        "Valleys",
         "Canyons",
         "Hydrology",
         "Rivers",
@@ -119,6 +120,9 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateCanyons = true;
+
+    UPROPERTY(EditAnywhere, Category = "Landforms")
+    bool bGenerateValleys = true;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateRivers = true;
@@ -201,6 +205,21 @@ private:
         meta = (ClampMin = "1", ClampMax = "12",
             EditCondition = "bGenerateMesas"))
     int32 MesaTerraceCount = 4;
+
+    // Valleys are cut along the calculated drainage network; this never
+    // creates decorative trenches which disagree with the river splines.
+    UPROPERTY(EditAnywhere, Category = "Valleys",
+        meta = (ClampMin = "1.0", EditCondition = "bGenerateValleys"))
+    double ValleyStartCatchmentCells = 35.0;
+
+    UPROPERTY(EditAnywhere, Category = "Valleys",
+        meta = (ClampMin = "0.0", EditCondition = "bGenerateValleys"))
+    double ValleyMaximumDepth = 9000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Valleys",
+        meta = (ClampMin = "1", ClampMax = "12",
+            EditCondition = "bGenerateValleys"))
+    int32 ValleyMaximumHalfWidthCells = 5;
 
     UPROPERTY(EditAnywhere, Category = "Canyons",
         meta = (ClampMin = "1.0", EditCondition = "bGenerateCanyons"))
