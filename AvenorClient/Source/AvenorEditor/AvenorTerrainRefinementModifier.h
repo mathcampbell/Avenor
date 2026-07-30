@@ -7,6 +7,19 @@
 class UAvenorTerrainModifier;
 struct FAvenorTerrainAnalysisData;
 
+struct FAvenorRiverReach
+{
+    TArray<FVector> Points;
+    double DischargeCells = 0.0;
+};
+
+struct FAvenorLakeBasin
+{
+    TArray<FVector> Shoreline;
+    double SurfaceHeight = 0.0;
+    int32 CellCount = 0;
+};
+
 /**
  * Stacked Mesh Terrain modifier for bounded, deterministic macro erosion.
  *
@@ -50,6 +63,16 @@ public:
     UFUNCTION(BlueprintPure, Category = "Avenor|Terrain Analysis")
     FBox GetAnalysisWorldBounds() const;
 
+    // Returns vector water features extracted from the exact cached drainage
+    // graph used to carve this modifier's terrain.
+    bool GetHydrologyFeatures(
+        int32 MaximumRiverReaches,
+        int32 MaximumLakes,
+        double RiverSurfaceInset,
+        TArray<FAvenorRiverReach>& OutRivers,
+        TArray<FAvenorLakeBasin>& OutLakes
+    ) const;
+
     virtual TArray<FBox> ComputeBounds() const override;
     virtual TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
         CreateBackgroundOp(
@@ -72,10 +95,10 @@ private:
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<AActor> BaseTerrainModifierActor;
 
-    // 250 m is 32,000 cells for a 20 x 100 km world.
+    // 100 m is 200,000 cells for a 20 x 100 km world.
     UPROPERTY(EditAnywhere, Category = "Analysis Grid",
         meta = (ClampMin = "5000.0", ClampMax = "100000.0"))
-    double AnalysisCellSize = 25000.0;
+    double AnalysisCellSize = 10000.0;
 
     // Safety limit, independent of physical world dimensions.
     UPROPERTY(EditAnywhere, Category = "Analysis Grid",
@@ -87,7 +110,7 @@ private:
     double DrainageEpsilon = 1.0;
 
     UPROPERTY(EditAnywhere, Category = "Erosion")
-    bool bEnableThermalErosion = true;
+    bool bEnableThermalErosion = false;
 
     UPROPERTY(EditAnywhere, Category = "Erosion",
         meta = (ClampMin = "0", ClampMax = "12",
@@ -116,6 +139,14 @@ private:
         meta = (ClampMin = "0.0",
             EditCondition = "bEnableStreamIncision"))
     double MaximumStreamIncision = 6000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Drainage",
+        meta = (ClampMin = "0.0"))
+    double MinimumLakeFillDepth = 1000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Drainage",
+        meta = (ClampMin = "0.0"))
+    double LakeBedDepth = 2500.0;
 
     UPROPERTY(EditAnywhere, Category = "Drainage")
     bool bEnableFloodplains = true;
