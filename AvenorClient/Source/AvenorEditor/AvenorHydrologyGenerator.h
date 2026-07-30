@@ -4,11 +4,10 @@
 #include "GameFramework/Actor.h"
 #include "AvenorHydrologyGenerator.generated.h"
 
-class UAvenorTerrainModifier;
 class UAvenorTerrainRefinementModifier;
 
 /**
- * Editor-only deterministic drainage solver and native UE Water generator.
+ * Editor-only adapter from refined hydrology data to native UE Water actors.
  */
 UCLASS()
 class AVENOREDITOR_API AAvenorHydrologyGenerator : public AActor
@@ -25,12 +24,8 @@ public:
     void ClearGeneratedHydrology();
 
 private:
-    UAvenorTerrainModifier* ResolveTerrainModifier() const;
     UAvenorTerrainRefinementModifier*
         ResolveRefinementModifier() const;
-
-    UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
-    TObjectPtr<AActor> TerrainModifierActor;
 
     UPROPERTY(EditInstanceOnly, Category = "Avenor|References")
     TObjectPtr<AActor> RefinementModifierActor;
@@ -39,44 +34,22 @@ private:
     TObjectPtr<AActor> MeshPartitionActor;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "2500.0", ClampMax = "50000.0"))
-    double HydrologyCellSize = 10000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "0", ClampMax = "16"))
-    int32 LakeCount = 3;
+        meta = (ClampMin = "0", ClampMax = "256"))
+    int32 MaximumRiverReaches = 64;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
         meta = (ClampMin = "0", ClampMax = "32"))
-    int32 RiverCount = 6;
+    int32 MaximumLakes = 8;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "2.0"))
-    double MinimumRiverCatchmentCells = 20.0;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "5000.0"))
-    double LakeRadius = 60000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "0.0"))
-    double MinimumLakeFillDepth = 1000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "100.0"))
-    double RiverBedDepth = 2500.0;
-
-    // Water surface is placed below the sampled valley floor so the water
-    // modifier can never lift the surrounding terrain toward its spline.
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
         meta = (ClampMin = "1.0"))
     double RiverSurfaceInset = 100.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "1", ClampMax = "16"))
-    int32 RiverSplineStride = 2;
+        meta = (ClampMin = "0.0"))
+    double LakeFalloffWidth = 30000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology",
-        meta = (ClampMin = "0.01"))
-    double DrainageEpsilon = 1.0;
+        meta = (ClampMin = "0.0"))
+    double RiverFalloffWidth = 10000.0;
 };
