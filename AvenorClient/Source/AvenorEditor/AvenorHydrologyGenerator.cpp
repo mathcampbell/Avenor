@@ -219,20 +219,6 @@ static TArray<int32> SelectLakeCells(
     double MinimumSeparation
 )
 {
-    TArray<bool> HasQualifyingUpstream;
-    HasQualifyingUpstream.Init(false, Grid.Downstream.Num());
-    for (int32 Upstream = 0;
-         Upstream < Grid.Downstream.Num();
-         ++Upstream)
-    {
-        const int32 Downstream = Grid.Downstream[Upstream];
-        if (Downstream != INDEX_NONE &&
-            Grid.Accumulation[Upstream] >= MinimumCatchmentCells)
-        {
-            HasQualifyingUpstream[Downstream] = true;
-        }
-    }
-
     TArray<int32> Candidates;
     for (int32 Index = 0; Index < Grid.TerrainHeight.Num(); ++Index)
     {
@@ -293,6 +279,20 @@ static TArray<int32> SelectRiverSources(
     double MinimumSeparation
 )
 {
+    TArray<bool> HasQualifyingUpstream;
+    HasQualifyingUpstream.Init(false, Grid.Downstream.Num());
+    for (int32 Upstream = 0;
+         Upstream < Grid.Downstream.Num();
+         ++Upstream)
+    {
+        const int32 Downstream = Grid.Downstream[Upstream];
+        if (Downstream != INDEX_NONE &&
+            Grid.Accumulation[Upstream] >= MinimumCatchmentCells)
+        {
+            HasQualifyingUpstream[Downstream] = true;
+        }
+    }
+
     TArray<int32> Candidates;
     for (int32 Cell = 0; Cell < Grid.Accumulation.Num(); ++Cell)
     {
