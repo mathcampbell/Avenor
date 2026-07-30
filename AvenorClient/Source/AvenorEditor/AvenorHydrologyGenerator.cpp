@@ -423,24 +423,52 @@ static TArray<FVector2D> BuildLakeShoreline(
         }
     }
 
-    Boundary.Sort([&Grid, Centre](int32 A, int32 B)
+    TArray<FVector2D> Points;
+    Points.Reserve(Boundary.Num());
+    for (int32 Cell : Boundary)
     {
-        const FVector2D DeltaA = Grid.Position(A) - Centre;
-        const FVector2D DeltaB = Grid.Position(B) - Centre;
-        const double AngleA = FMath::Atan2(DeltaA.Y, DeltaA.X);
-        const double AngleB = FMath::Atan2(DeltaB.Y, DeltaB.X);
-        return FMath::IsNearlyEqual(AngleA, AngleB)
-            ? A < B
-            : AngleA < AngleB;
+        Points.Add(Grid.Position(Cell));
+    }
+    Points.Sort([](const FVector2D& A, const FVector2D& B)
+    {
+        return FMath::IsNearlyEqual(A.X, B.X)
+            ? A.Y < B.Y
+            : A.X < B.X;
     });
 
-    TArray<FVector2D> Shoreline;
-    const int32 Stride = FMath::Max(1, Boundary.Num() / 48);
-    for (int32 Index = 0; Index < Boundary.Num(); Index += Stride)
+    auto Cross = [](const FVector2D& O,
+                    const FVector2D& A,
+                    const FVector2D& B)
     {
-        Shoreline.Add(Grid.Position(Boundary[Index]));
+        return FVector2D::CrossProduct(A - O, B - O);
+    };
+
+    TArray<FVector2D> Hull;
+    for (const FVector2D& Point : Points)
+    {
+        while (Hull.Num() >= 2 &&
+               Cross(Hull[Hull.Num() - 2], Hull.Last(), Point) <= 0.0)
+        {
+            Hull.Pop();
+        }
+        Hull.Add(Point);
     }
-    return Shoreline;
+    const int32 LowerCount = Hull.Num();
+    for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
+    {
+        const FVector2D& Point = Points[Index];
+        while (Hull.Num() > LowerCount &&
+               Cross(Hull[Hull.Num() - 2], Hull.Last(), Point) <= 0.0)
+        {
+            Hull.Pop();
+        }
+        Hull.Add(Point);
+    }
+    if (Hull.Num() > 1)
+    {
+        Hull.Pop();
+    }
+    return Hull;
 }
 
 static TArray<int32> TraceRiver(const FGrid& Grid, int32 Source)
@@ -478,7 +506,8 @@ static TWaterBodyActor* CreateWaterBody(
     UE::MeshPartition::AMeshPartition* MeshPartition,
     const FString& Label,
     const TCHAR* ModifierClassPath,
-    double FalloffWidth
+    double FalloffWidth,
+    UE::MeshPartition::UModifierComponent*& OutLastModifier
 )
 {
     UActorFactory* Factory =
@@ -529,16 +558,16 @@ static TWaterBodyActor* CreateWaterBody(
         ModifierClass,
         ModifierClass->GetFName()
     );
-    Modifier->SetAffectedMeshPartition(MeshPartition);
     WaterBody->AddInstanceComponent(Modifier);
     Modifier->AttachToComponent(
         WaterComponent,
         FAttachmentTransformRules::KeepWorldTransform
     );
     Modifier->RegisterComponent();
-    // The Blueprint-facing setter deliberately notifies Mesh Partition that
-    // its modifier list and affected sections must be rebuilt.
-    Modifier->BP_SetAffectedMegaMesh(MeshPartition);
+    // Assign after registration without notifying. The generator batches all
+    // generated water modifiers into one Mesh Partition notification.
+    Modifier->SetAffectedMeshPartition(MeshPartition);
+    OutLastModifier = Modifier;
     return WaterBody;
 }
 } // namespace UE::Avenor::Hydrology
@@ -686,6 +715,7 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
     );
     int32 CreatedLakes = 0;
     int32 CreatedRivers = 0;
+    UE::MeshPartition::UModifierComponent* LastCreatedModifier = nullptr;
     for (int32 LakeIndex = 0;
          LakeIndex < LakeCells.Num();
          ++LakeIndex)
@@ -709,7 +739,8 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
             MeshPartition,
             FString::Printf(TEXT("Avenor_Lake_%02d"), LakeIndex + 1),
             TEXT("/Script/MeshPartitionWater.LakeModifier"),
-            LakeRadius * 0.35
+            LakeRadius * 0.35,
+            LastCreatedModifier
         );
         if (Lake)
         {
@@ -753,7 +784,8 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
             MeshPartition,
             FString::Printf(TEXT("Avenor_River_%02d"), RiverIndex + 1),
             TEXT("/Script/MeshPartitionWater.RiverModifier"),
-            Grid.CellSize * 0.75
+            Grid.CellSize * 0.75,
+            LastCreatedModifier
         );
         if (!River)
         {
@@ -810,13 +842,21 @@ void AAvenorHydrologyGenerator::RegenerateHydrology()
         {
             RiverSpline->SetSplinePointType(
                 PointIndex,
-                ESplinePointType::CurveClamped,
+                ESplinePointType::Linear,
                 false
             );
         }
         RiverSpline->UpdateSpline();
         River->PostEditChange();
         ++CreatedRivers;
+    }
+
+    if (LastCreatedModifier)
+    {
+        // Force exactly one public registration notification. That scan picks
+        // up every generated modifier assigned above.
+        LastCreatedModifier->SetAffectedMeshPartition(nullptr);
+        LastCreatedModifier->BP_SetAffectedMegaMesh(MeshPartition);
     }
 
     bool bHasWaterZone = false;
