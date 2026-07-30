@@ -47,6 +47,7 @@ struct FAvenorGeneratedWorld
     TArray<double> Accumulation;
     TArray<int32> Downstream;
     TArray<int32> DrainParent;
+    TArray<FVector2D> DrainagePosition;
     TArray<FAvenorRiverDefinition> Rivers;
     TArray<FAvenorLakeDefinition> Lakes;
     TArray<FVector> OceanBoundary;
@@ -74,6 +75,13 @@ struct FAvenorGeneratedWorld
             Bounds.Min.X + (static_cast<double>(X) + 0.5) * CellSize,
             Bounds.Min.Y + (static_cast<double>(Y) + 0.5) * CellSize
         );
+    }
+
+    FVector2D FlowPosition(int32 Cell) const
+    {
+        return DrainagePosition.IsValidIndex(Cell)
+            ? DrainagePosition[Cell]
+            : Position(Cell);
     }
 
     double Sample(
@@ -603,10 +611,13 @@ static void BuildFlow(FAvenorGeneratedWorld& Grid)
                     X + DX[Direction],
                     Y + DY[Direction]
                 );
-                const double Distance = Grid.CellSize *
-                    ((DX[Direction] != 0 && DY[Direction] != 0)
-                        ? 1.4142135623730951
-                        : 1.0);
+                const double Distance = FMath::Max(
+                    1.0,
+                    FVector2D::Distance(
+                        Grid.FlowPosition(Cell),
+                        Grid.FlowPosition(Neighbour)
+                    )
+                );
                 const double Slope =
                     (Grid.FilledHeight[Cell] -
                         Grid.FilledHeight[Neighbour]) / Distance;
@@ -968,7 +979,7 @@ static void ExtractRivers(
         double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
-            const FVector2D XY = Grid.Position(Cell);
+            const FVector2D XY = Grid.FlowPosition(Cell);
             const double LocalDepth = FMath::Lerp(
                 80.0,
                 350.0,
@@ -1480,6 +1491,36 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
     }
 
     const int32 CellCount = static_cast<int32>(CellCount64);
+    Grid->DrainagePosition.SetNumUninitialized(CellCount);
+    const FVector2D DrainageSeedOffset(
+        static_cast<double>(Seed) * 31.73,
+        static_cast<double>(Seed) * -19.91
+    );
+    const double DrainageWarpScale = Grid->CellSize * 3.5;
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const int32 X = Cell % Grid->Columns;
+        const int32 Y = Cell / Grid->Columns;
+        const FVector2D Centre = Grid->Position(Cell);
+        if (Grid->IsBoundary(X, Y))
+        {
+            Grid->DrainagePosition[Cell] = Centre;
+            continue;
+        }
+        const FVector2D NoiseInput =
+            (Centre + DrainageSeedOffset) / DrainageWarpScale;
+        const double WarpX = FMath::PerlinNoise2D(NoiseInput);
+        const double WarpY = FMath::PerlinNoise2D(
+            FVector2D(
+                NoiseInput.Y * 0.83 + 17.1,
+                -NoiseInput.X * 1.07 - 9.7
+            )
+        );
+        Grid->DrainagePosition[Cell] = Centre + FVector2D(
+            WarpX,
+            WarpY
+        ) * Grid->CellSize * 0.48;
+    }
     Grid->BaseHeight.SetNumUninitialized(CellCount);
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -1653,7 +1694,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("9d77144f-2b0f-4ae1-bbc9-66c25d88a6da"));
+        return FGuid(TEXT("87324657-2698-420c-987b-a0a1e9252d96"));
     }
 
     FBox GlobalBounds;
