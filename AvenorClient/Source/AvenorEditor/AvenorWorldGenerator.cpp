@@ -1292,20 +1292,36 @@ static TArray<FVector> ResampleCatmullRom(
     return ResampleRiverCentreline(Dense, Spacing);
 }
 
-static void SetDownhillSurface(
-    const FAvenorGeneratedWorld& Grid,
+static void EnforceDownhillGrade(
     TArray<FVector>& Points,
-    double SurfaceInset
+    double StartHeight,
+    double EndHeight
 )
 {
-    double PreviousSurface = TNumericLimits<double>::Max();
-    for (FVector& Point : Points)
+    if (Points.Num() < 2)
     {
-        Point.Z = FMath::Min(
-            PreviousSurface - 1.0,
-            Grid.Sample(Grid.Height, FVector2D(Point)) + SurfaceInset
+        return;
+    }
+    const double MinimumStep = 0.001;
+    Points[0].Z = StartHeight;
+    Points.Last().Z = FMath::Min(
+        EndHeight,
+        StartHeight - MinimumStep * (Points.Num() - 1)
+    );
+    double PreviousHeight = Points[0].Z;
+    for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+    {
+        const int32 Remaining = Points.Num() - 1 - Index;
+        const double MinimumForEndpoint =
+            Points.Last().Z + MinimumStep * Remaining;
+        const double MaximumFromUpstream =
+            PreviousHeight - MinimumStep;
+        Points[Index].Z = FMath::Clamp(
+            Points[Index].Z,
+            MinimumForEndpoint,
+            MaximumFromUpstream
         );
-        PreviousSurface = Point.Z;
+        PreviousHeight = Points[Index].Z;
     }
 }
 
@@ -1353,10 +1369,29 @@ static void ExtractRivers(
                 LocalDrop /
                     FMath::Max(500.0, Grid.CellSize * 0.12)
             );
-            const double LocalThreshold = Threshold * FMath::Lerp(
-                1.0,
-                0.55,
-                SteepHeadwaterStrength
+            // The adaptive threshold controls the total lowland network, but
+            // must not erase the small, steep catchments which form mountain
+            // headwaters. Give strongly sloping cells a threshold based on
+            // the requested stream scale rather than the progressively
+            // raised lowland-pruning threshold.
+            const double AdaptiveThreshold =
+                Threshold * FMath::Lerp(
+                    1.0,
+                    0.25,
+                    SteepHeadwaterStrength
+                );
+            const double MountainHeadwaterThreshold =
+                FMath::Max(
+                    1.0,
+                    StreamStart * FMath::Lerp(
+                        1.0,
+                        0.15,
+                        SteepHeadwaterStrength
+                    )
+                );
+            const double LocalThreshold = FMath::Min(
+                AdaptiveThreshold,
+                MountainHeadwaterThreshold
             );
             Channel[Cell] =
                 Grid.Accumulation[Cell] >= LocalThreshold &&
@@ -1405,6 +1440,45 @@ static void ExtractRivers(
             break;
         }
         Threshold *= 1.3;
+    }
+
+    // Give every drainage cell one canonical surface elevation. All reaches
+    // which meet at a junction then share exactly the same Z instead of
+    // independently restarting their grade and leaving a raised terrain plug.
+    TArray<double> ChannelSurface;
+    ChannelSurface.Init(
+        TNumericLimits<double>::Max(),
+        Count
+    );
+    TArray<int32> FlowOrder;
+    FlowOrder.Reserve(Count);
+    for (int32 Cell = 0; Cell < Count; ++Cell)
+    {
+        if (Channel[Cell])
+        {
+            // Grid.Height still contains the temporary block-incised analysis
+            // raster at this point. That raster is discarded before render,
+            // so using it here reintroduced its shelves and discontinuities
+            // into an otherwise smooth channel. Anchor the shared grade to
+            // the untouched landform instead.
+            ChannelSurface[Cell] = Grid.BaseHeight[Cell] + 100.0;
+            FlowOrder.Add(Cell);
+        }
+    }
+    FlowOrder.Sort([&Grid](int32 A, int32 B)
+    {
+        return Grid.FilledHeight[A] > Grid.FilledHeight[B];
+    });
+    for (int32 Cell : FlowOrder)
+    {
+        const int32 Downstream = Grid.Downstream[Cell];
+        if (Downstream != INDEX_NONE && Channel[Downstream])
+        {
+            ChannelSurface[Downstream] = FMath::Min(
+                ChannelSurface[Downstream],
+                ChannelSurface[Cell] - 1.0
+            );
+        }
     }
 
     for (int32 Start = 0; Start < Count; ++Start)
@@ -1497,19 +1571,14 @@ static void ExtractRivers(
         River.ValleyDepth =
             MaximumValleyDepth * ValleyStrength +
             MaximumCanyonDepth * CanyonStrength;
-        double PreviousSurface = TNumericLimits<double>::Max();
         for (int32 Cell : Cells)
         {
             const FVector2D XY = Grid.RiverPosition(Cell);
-            const double LocalDepth = FMath::Lerp(
-                80.0,
-                350.0,
-                WidthAlpha
-            );
-            const double Surface = FMath::Min(
-                PreviousSurface - 1.0,
-                Grid.Height[Cell] + LocalDepth
-            );
+            const double Surface = ChannelSurface[Cell];
+            const double PreviousSurface =
+                River.Points.IsEmpty()
+                ? TNumericLimits<double>::Max()
+                : River.Points.Last().Z;
             if (bWaterfalls &&
                 PreviousSurface < TNumericLimits<double>::Max() &&
                 PreviousSurface - Surface >= MinimumWaterfallDrop)
@@ -1517,8 +1586,9 @@ static void ExtractRivers(
                 River.bContainsWaterfall = true;
             }
             River.Points.Emplace(XY.X, XY.Y, Surface);
-            PreviousSurface = Surface;
         }
+        const double StartSurface = River.Points[0].Z;
+        const double EndSurface = River.Points.Last().Z;
         // The raster route owns hydrological topology, but not final visual
         // bearings. Simplify its staircase, then guarantee sparse controls
         // along every long reach before adding landscape-scale curvature.
@@ -1533,13 +1603,21 @@ static void ExtractRivers(
             Grid.CellSize * 6.0
         );
         AddMeanders(Grid, River.Points, MeanderStrength);
-        SetDownhillSurface(Grid, River.Points, 100.0);
+        EnforceDownhillGrade(
+            River.Points,
+            StartSurface,
+            EndSurface
+        );
         River.SplinePoints = River.Points;
         River.Points = ResampleCatmullRom(
             River.SplinePoints,
             Grid.CellSize * 0.75
         );
-        SetDownhillSurface(Grid, River.Points, 100.0);
+        EnforceDownhillGrade(
+            River.Points,
+            StartSurface,
+            EndSurface
+        );
         FBox2D CentrelineBounds(ForceInit);
         for (const FVector& Point : River.Points)
         {
@@ -2347,7 +2425,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("7bc763b8-7964-4468-93ba-d9396f6742b1"));
+        return FGuid(TEXT("3e51f2c4-8080-47ca-96eb-b3177af29c33"));
     }
 
     FBox GlobalBounds;
@@ -2383,10 +2461,25 @@ static TWaterBodyActor* CreateWaterBody(
     WaterBody->SetActorLabel(Label);
     WaterBody->SetFolderPath(TEXT("Avenor/Generated/Water"));
     WaterBody->Tags.AddUnique(GeneratedWaterTag);
-    // The unified generator has already carved this exact shoreline/channel
-    // into its heightfield. Attaching MeshPartitionWater modifiers here would
-    // apply a second deformation and raise lake margins into platforms.
     return WaterBody;
+}
+
+static void DisableGeneratedWaterTerrainModifiers(AActor& WaterBody)
+{
+    // The generated heightfield already contains the exact river bed and lake
+    // basin represented by this actor. WaterBody factories/PostEditChange can
+    // automatically add MeshPartition water modifiers; leaving those active
+    // applies the same deformation a second time and produces raised strips,
+    // centre humps and lake platforms along otherwise-correct splines.
+    TInlineComponentArray<
+        UE::MeshPartition::UModifierComponent*
+    > Modifiers;
+    WaterBody.GetComponents(Modifiers);
+    for (UE::MeshPartition::UModifierComponent* Modifier : Modifiers)
+    {
+        Modifier->SetIsDisabledFlag(true);
+        Modifier->SetAffectedMeshPartition(nullptr);
+    }
 }
 
 static void ConfigureSpline(
@@ -2587,6 +2680,7 @@ void AAvenorWorldGenerator::ClearGeneratedWater()
         Water->GetComponents(Modifiers);
         for (UE::MeshPartition::UModifierComponent* Modifier : Modifiers)
         {
+            Modifier->SetIsDisabledFlag(true);
             Modifier->SetAffectedMeshPartition(nullptr);
         }
     }
@@ -2636,6 +2730,7 @@ void AAvenorWorldGenerator::CreateWaterBodies(
                 true
             );
             Ocean->PostEditChange();
+            DisableGeneratedWaterTerrainModifiers(*Ocean);
         }
     }
     for (int32 Index = 0; Index < WorldData->Lakes.Num(); ++Index)
@@ -2659,6 +2754,7 @@ void AAvenorWorldGenerator::CreateWaterBodies(
                 true
             );
             Lake->PostEditChange();
+            DisableGeneratedWaterTerrainModifiers(*Lake);
         }
     }
     for (int32 Index = 0; Index < WorldData->Rivers.Num(); ++Index)
@@ -2685,6 +2781,7 @@ void AAvenorWorldGenerator::CreateWaterBodies(
                 false
             );
             River->PostEditChange();
+            DisableGeneratedWaterTerrainModifiers(*River);
         }
     }
 #endif
