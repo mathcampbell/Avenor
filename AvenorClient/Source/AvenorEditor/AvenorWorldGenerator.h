@@ -120,7 +120,7 @@ private:
     bool bGenerateMesas = false;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bGenerateCanyons = false;
+    bool bGenerateCanyons = true;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateValleys = true;
@@ -217,7 +217,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Valleys",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateValleys"))
-    double ValleyMaximumDepth = 4500.0;
+    double ValleyMaximumDepth = 6500.0;
 
     UPROPERTY(EditAnywhere, Category = "Valleys",
         meta = (ClampMin = "1", ClampMax = "12",
@@ -324,7 +324,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Spine Corridor",
         meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    double CorridorRoughnessFraction = 0.18;
+    double CorridorRoughnessFraction = 0.32;
 
     UPROPERTY(EditAnywhere, Category = "Coverage",
         meta = (ClampMin = "0.0"))
