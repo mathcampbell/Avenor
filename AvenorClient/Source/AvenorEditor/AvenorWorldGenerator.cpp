@@ -207,6 +207,8 @@ struct FAvenorGeneratedWorld
             {
                 continue;
             }
+            double ClosestDistance = TNumericLimits<double>::Max();
+            double ClosestSurfaceHeight = 0.0;
             for (int32 Index = 0;
                  Index + 1 < River.Points.Num();
                  ++Index)
@@ -233,40 +235,46 @@ struct FAvenorGeneratedWorld
                     FVector2D(A) + Segment * Alpha;
                 const double Distance =
                     FVector2D::Distance(Point, Closest);
-                const double HalfBedWidth =
-                    FMath::Max(100.0, River.Width * 0.5);
-                if (Distance >= River.ValleyHalfWidth)
+                if (Distance >= ClosestDistance)
                 {
                     continue;
                 }
-                const double SurfaceHeight =
+                ClosestDistance = Distance;
+                ClosestSurfaceHeight =
                     FMath::Lerp(A.Z, B.Z, Alpha);
-                const double BedHeight =
-                    SurfaceHeight - River.Depth;
-                const double ValleyAlpha = FMath::Clamp(
-                    Distance / FMath::Max(1.0, River.ValleyHalfWidth),
-                    0.0,
-                    1.0
-                );
-                const double SmoothValleyAlpha =
-                    ValleyAlpha * ValleyAlpha *
-                    (3.0 - 2.0 * ValleyAlpha);
-                const double ValleyFloor =
-                    UnderlyingHeight -
-                    River.ValleyDepth * (1.0 - SmoothValleyAlpha);
-                const double BedAlpha = FMath::Clamp(
-                    Distance / HalfBedWidth,
-                    0.0,
-                    1.0
-                );
-                const double ChannelFloor = FMath::Lerp(
-                    BedHeight,
-                    ValleyFloor,
-                    BedAlpha * BedAlpha *
-                        (3.0 - 2.0 * BedAlpha)
-                );
-                RiverHeight = FMath::Min(RiverHeight, ChannelFloor);
             }
+            if (ClosestDistance >= River.ValleyHalfWidth)
+            {
+                continue;
+            }
+            const double HalfBedWidth =
+                FMath::Max(100.0, River.Width * 0.5);
+            const double BedHeight =
+                ClosestSurfaceHeight - River.Depth;
+            const double ValleyAlpha = FMath::Clamp(
+                ClosestDistance /
+                    FMath::Max(1.0, River.ValleyHalfWidth),
+                0.0,
+                1.0
+            );
+            const double SmoothValleyAlpha =
+                ValleyAlpha * ValleyAlpha *
+                (3.0 - 2.0 * ValleyAlpha);
+            const double ValleyFloor =
+                UnderlyingHeight -
+                River.ValleyDepth * (1.0 - SmoothValleyAlpha);
+            const double BedAlpha = FMath::Clamp(
+                ClosestDistance / HalfBedWidth,
+                0.0,
+                1.0
+            );
+            const double ChannelFloor = FMath::Lerp(
+                BedHeight,
+                ValleyFloor,
+                BedAlpha * BedAlpha *
+                    (3.0 - 2.0 * BedAlpha)
+            );
+            RiverHeight = FMath::Min(RiverHeight, ChannelFloor);
         }
         return FMath::Min(Result, RiverHeight);
     }
@@ -356,6 +364,26 @@ static double DistanceToPolyline(
                 Point,
                 Polyline[Index],
                 Polyline[Index + 1]
+            )
+        );
+    }
+    return Best;
+}
+
+static double DistanceToClosedPolyline(
+    const FVector2D& Point,
+    const TArray<FVector>& Polyline
+)
+{
+    double Best = TNumericLimits<double>::Max();
+    for (int32 Index = 0; Index < Polyline.Num(); ++Index)
+    {
+        Best = FMath::Min(
+            Best,
+            DistanceToSegment(
+                Point,
+                FVector2D(Polyline[Index]),
+                FVector2D(Polyline[(Index + 1) % Polyline.Num()])
             )
         );
     }
@@ -1255,9 +1283,49 @@ static void ExtractRivers(
         UpstreamCount.Init(0, Count);
         for (int32 Cell = 0; Cell < Count; ++Cell)
         {
+            const int32 Downstream = Grid.Downstream[Cell];
+            const double LocalDrop =
+                Downstream != INDEX_NONE
+                ? FMath::Max(
+                    0.0,
+                    Grid.BaseHeight[Cell] -
+                        Grid.BaseHeight[Downstream]
+                )
+                : 0.0;
+            const double SteepHeadwaterStrength = Smooth01(
+                LocalDrop /
+                    FMath::Max(500.0, Grid.CellSize * 0.12)
+            );
+            const double LocalThreshold = Threshold * FMath::Lerp(
+                1.0,
+                0.55,
+                SteepHeadwaterStrength
+            );
             Channel[Cell] =
-                Grid.Accumulation[Cell] >= Threshold &&
-                Grid.Downstream[Cell] != INDEX_NONE;
+                Grid.Accumulation[Cell] >= LocalThreshold &&
+                Downstream != INDEX_NONE;
+        }
+        // A steep-slope headwater must remain connected after it leaves the
+        // hillside. Carry it through any short low-gradient threshold gap
+        // until it joins the accumulated main network.
+        for (int32 Cell = 0; Cell < Count; ++Cell)
+        {
+            if (!Channel[Cell])
+            {
+                continue;
+            }
+            int32 Current = Grid.Downstream[Cell];
+            for (int32 Guard = 0;
+                 Guard < Count && Current != INDEX_NONE;
+                 ++Guard)
+            {
+                if (Channel[Current])
+                {
+                    break;
+                }
+                Channel[Current] = true;
+                Current = Grid.Downstream[Current];
+            }
         }
         for (int32 Cell = 0; Cell < Count; ++Cell)
         {
@@ -1792,17 +1860,40 @@ static void ExtractLakes(
 
         FAvenorLakeDefinition Lake;
         Lake.SurfaceHeight = Surface;
+        const double NaturalDepth = Surface - FloorHeight;
+        const double AdditionalBasinDepth = FMath::Max(
+            MinimumDepth,
+            FMath::Min(Grid.CellSize * 0.08, 1200.0)
+        );
         Lake.MaximumDepth = FMath::Clamp(
-            Surface - FloorHeight,
+            NaturalDepth + AdditionalBasinDepth,
             MinimumDepth,
             Grid.CellSize * 0.45
         );
-        Lake.FalloffWidth = LakeFalloffWidth;
         Lake.Volume = AvailableVolume;
         Lake.CellCount = Wet.Num();
         Lake.Shoreline = TraceLakeBoundary(Grid, Wet, Surface);
         if (Lake.Shoreline.Num() >= 4)
         {
+            double InteriorRadius = 0.0;
+            for (int32 Cell : Wet)
+            {
+                InteriorRadius = FMath::Max(
+                    InteriorRadius,
+                    DistanceToClosedPolyline(
+                        Grid.Position(Cell),
+                        Lake.Shoreline
+                    )
+                );
+            }
+            Lake.FalloffWidth = FMath::Clamp(
+                InteriorRadius * 0.85,
+                Grid.CellSize * 0.5,
+                FMath::Max(
+                    Grid.CellSize * 0.5,
+                    LakeFalloffWidth
+                )
+            );
             for (const FVector& Point : Lake.Shoreline)
             {
                 Lake.InfluenceBounds += FVector2D(Point);
@@ -2192,7 +2283,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("96a94bea-2c0d-4a7f-b92c-5043481d02f6"));
+        return FGuid(TEXT("dd97bfb6-933a-48a7-9b95-fb2ae7caa8f4"));
     }
 
     FBox GlobalBounds;
