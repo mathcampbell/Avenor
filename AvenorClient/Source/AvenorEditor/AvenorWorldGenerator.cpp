@@ -243,7 +243,50 @@ struct FAvenorGeneratedWorld
                 ClosestSurfaceHeight =
                     FMath::Lerp(A.Z, B.Z, Alpha);
             }
-            if (ClosestDistance >= River.ValleyHalfWidth)
+            if (ClosestDistance >= River.ValleyHalfWidth * 1.5)
+            {
+                continue;
+            }
+            // Adapt the valley to the ambient pre-carve terrain. Rivers on
+            // plains receive broad, rounded valleys; steep terrain keeps a
+            // narrower, faster-rising canyon profile.
+            const double GradientStep =
+                FMath::Max(CellSize * 0.5, 50.0);
+            const double HeightXPlus = Sample(
+                Height, Point + FVector2D(GradientStep, 0.0)
+            );
+            const double HeightXMinus = Sample(
+                Height, Point - FVector2D(GradientStep, 0.0)
+            );
+            const double HeightYPlus = Sample(
+                Height, Point + FVector2D(0.0, GradientStep)
+            );
+            const double HeightYMinus = Sample(
+                Height, Point - FVector2D(0.0, GradientStep)
+            );
+            const double GradientX =
+                (HeightXPlus - HeightXMinus) /
+                (2.0 * GradientStep);
+            const double GradientY =
+                (HeightYPlus - HeightYMinus) /
+                (2.0 * GradientStep);
+            const double AmbientSlope = FMath::Sqrt(
+                GradientX * GradientX + GradientY * GradientY
+            );
+            const double Steepness = FMath::Clamp(
+                (AmbientSlope - 0.02) / (0.30 - 0.02),
+                0.0,
+                1.0
+            );
+            const double SmoothSteepness =
+                Steepness * Steepness *
+                (3.0 - 2.0 * Steepness);
+            const double EffectiveValleyHalfWidth = FMath::Lerp(
+                River.ValleyHalfWidth * 1.5,
+                River.ValleyHalfWidth * 0.55,
+                SmoothSteepness
+            );
+            if (ClosestDistance >= EffectiveValleyHalfWidth)
             {
                 continue;
             }
@@ -253,16 +296,20 @@ struct FAvenorGeneratedWorld
                 ClosestSurfaceHeight - River.Depth;
             const double ValleyAlpha = FMath::Clamp(
                 ClosestDistance /
-                    FMath::Max(1.0, River.ValleyHalfWidth),
+                    FMath::Max(1.0, EffectiveValleyHalfWidth),
                 0.0,
                 1.0
             );
+            const double ShapeExponent =
+                FMath::Lerp(1.5, 0.65, SmoothSteepness);
+            const double ShapedAlpha =
+                FMath::Pow(ValleyAlpha, ShapeExponent);
             const double SmoothValleyAlpha =
-                ValleyAlpha * ValleyAlpha *
-                (3.0 - 2.0 * ValleyAlpha);
+                ShapedAlpha * ShapedAlpha *
+                (3.0 - 2.0 * ShapedAlpha);
             const double ValleyFloor =
-                UnderlyingHeight -
-                River.ValleyDepth * (1.0 - SmoothValleyAlpha);
+                BedHeight +
+                River.ValleyDepth * SmoothValleyAlpha;
             const double BedAlpha = FMath::Clamp(
                 ClosestDistance / HalfBedWidth,
                 0.0,
@@ -586,12 +633,22 @@ static double EvaluateBaseLandform(
         const double Y = (Across - RangeMeander) /
             FMath::Max(1.0, Mountain.HalfWidth);
         const double Ellipse = FMath::Sqrt(X * X + Y * Y);
-        if (Ellipse >= 1.0)
+        const double FoothillLimit = 1.6;
+        if (Ellipse >= FoothillLimit)
         {
             continue;
         }
-        const double Envelope =
-            FMath::Pow(Quintic01(1.0 - Ellipse), 0.72);
+        const double CoreEnvelope = Ellipse < 1.0
+            ? FMath::Pow(Quintic01(1.0 - Ellipse), 0.72)
+            : 0.0;
+        // Add a low continuous apron rather than a detached outer hump.
+        // It overlaps the core and decays monotonically to zero at 1.6x
+        // the range radius, eliminating the former hard range boundary.
+        const double FoothillEnvelope = 0.24 * FMath::Pow(
+            Quintic01(1.0 - Ellipse / FoothillLimit),
+            1.15
+        );
+        const double Envelope = CoreEnvelope + FoothillEnvelope;
         const double PeakTrain = 0.52 + 0.48 * FMath::Pow(
             0.5 + 0.5 * FMath::Cos(
                 Along / FMath::Max(1.0, Mountain.PeakSpacing) *
@@ -1489,7 +1546,7 @@ static void ExtractRivers(
             CentrelineBounds += FVector2D(Point);
         }
         River.InfluenceBounds = CentrelineBounds.ExpandBy(
-            River.ValleyHalfWidth
+            River.ValleyHalfWidth * 1.5
         );
         Grid.Rivers.Add(MoveTemp(River));
     }
@@ -1776,7 +1833,7 @@ static void ExtractLakes(
         }
         if (bBoundary || Basin.Num() < 4 ||
             Catchment < MinimumCatchment ||
-            SpillHeight - FloorHeight < MinimumDepth)
+            SpillHeight - FloorHeight < 1.0)
         {
             continue;
         }
@@ -1816,7 +1873,7 @@ static void ExtractLakes(
             }
         }
         const double Surface = (Low + High) * 0.5;
-        if (Surface - FloorHeight < MinimumDepth)
+        if (Surface - FloorHeight < 1.0)
         {
             continue;
         }
@@ -2020,7 +2077,10 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
          Index < (bMountains ? MountainCount : 0);
          ++Index)
     {
+        const double HalfWidth =
+            MountainWidth * Random.FRandRange(0.38, 0.68);
         FVector2D Centre;
+        bool bPlaced = false;
         for (int32 Attempt = 0; Attempt < 64; ++Attempt)
         {
             Centre = FVector2D(
@@ -2028,10 +2088,15 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
                 Random.FRandRange(Bounds.Min.Y, Bounds.Max.Y)
             );
             if (DistanceToPolyline(Centre, SpinePoints) >=
-                MountainSpineDistance)
+                MountainSpineDistance + HalfWidth)
             {
+                bPlaced = true;
                 break;
             }
+        }
+        if (!bPlaced)
+        {
+            continue;
         }
         const double Angle = Random.FRandRange(-PI, PI);
         FMountainRange Range;
@@ -2043,8 +2108,7 @@ static TSharedPtr<const FAvenorGeneratedWorld> GenerateWorld(
         Range.Across = FVector2D(-Range.Along.Y, Range.Along.X);
         Range.HalfLength =
             MountainLength * Random.FRandRange(0.38, 0.62);
-        Range.HalfWidth =
-            MountainWidth * Random.FRandRange(0.38, 0.68);
+        Range.HalfWidth = HalfWidth;
         Range.PeakSpacing =
             MountainSpacing * Random.FRandRange(0.8, 1.2);
         Range.Phase = Random.FRandRange(-PI, PI);
@@ -2283,7 +2347,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("dd97bfb6-933a-48a7-9b95-fb2ae7caa8f4"));
+        return FGuid(TEXT("7bc763b8-7964-4468-93ba-d9396f6742b1"));
     }
 
     FBox GlobalBounds;
