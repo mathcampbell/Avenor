@@ -250,7 +250,7 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "1.0", EditCondition = "bGenerateRivers"))
-    double StreamStartCatchmentCells = 24.0;
+    double StreamStartCatchmentCells = 18.0;
 
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateRivers",
@@ -275,7 +275,7 @@ private:
     UPROPERTY(EditAnywhere, Category = "Rivers",
         meta = (ClampMin = "1", ClampMax = "512",
             EditCondition = "bGenerateRivers"))
-    int32 MaximumRiverReaches = 45;
+    int32 MaximumRiverReaches = 64;
 
     UPROPERTY(EditAnywhere, Category = "Lakes",
         meta = (ClampMin = "1.0", EditCondition = "bGenerateLakes"))
