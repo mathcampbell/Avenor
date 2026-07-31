@@ -1389,10 +1389,13 @@ static void ExtractRivers(
                         SteepHeadwaterStrength
                     )
                 );
-            const double LocalThreshold = FMath::Min(
-                AdaptiveThreshold,
-                MountainHeadwaterThreshold
-            );
+            const double LocalThreshold =
+                SteepHeadwaterStrength >= 0.6
+                ? FMath::Min(
+                    AdaptiveThreshold,
+                    MountainHeadwaterThreshold
+                )
+                : AdaptiveThreshold;
             Channel[Cell] =
                 Grid.Accumulation[Cell] >= LocalThreshold &&
                 Downstream != INDEX_NONE;
@@ -2425,7 +2428,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("3e51f2c4-8080-47ca-96eb-b3177af29c33"));
+        return FGuid(TEXT("996b92df-16fd-47f8-81c3-43b366964d2f"));
     }
 
     FBox GlobalBounds;
