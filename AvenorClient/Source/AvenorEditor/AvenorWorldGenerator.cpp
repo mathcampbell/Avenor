@@ -2047,7 +2047,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("4dfde02f-c3f5-4bc6-b14c-59d4aa8ac74e"));
+        return FGuid(TEXT("fd3627ab-929a-4f53-ae19-7808f078b9a1"));
     }
 
     FBox GlobalBounds = FBox(ForceInit);
@@ -2103,7 +2103,8 @@ static void DetachWaterTerrainModifiers(AActor& WaterBody)
 static void ConfigureSpline(
     UWaterSplineComponent& Spline,
     const TArray<FVector>& Points,
-    bool bClosed
+    bool bClosed,
+    ESplinePointType::Type PointType
 )
 {
     Spline.SetSplinePoints(
@@ -2118,7 +2119,7 @@ static void ConfigureSpline(
     {
         Spline.SetSplinePointType(
             Index,
-            ESplinePointType::CurveClamped,
+            PointType,
             false
         );
     }
@@ -2329,7 +2330,8 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             ConfigureSpline(
                 *Ocean->GetWaterBodyComponent()->GetWaterSpline(),
                 Points,
-                true
+                true,
+                ESplinePointType::CurveClamped
             );
             Ocean->PostEditChange();
             DetachWaterTerrainModifiers(*Ocean);
@@ -2353,7 +2355,8 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             ConfigureSpline(
                 *Lake->GetWaterBodyComponent()->GetWaterSpline(),
                 Points,
-                true
+                true,
+                ESplinePointType::CurveClamped
             );
             Lake->PostEditChange();
             DetachWaterTerrainModifiers(*Lake);
@@ -2369,10 +2372,10 @@ void AAvenorWorldGenerator::CreateWaterBodies(
         );
         if (River)
         {
-            TArray<FVector> Points =
-                Definition.SplinePoints.Num() >= 2
-                ? Definition.SplinePoints
-                : Definition.Points;
+            // Use the same dense polyline that carves the terrain. Linear
+            // UE spline segments then reproduce it exactly instead of
+            // fitting a second curve through the sparse control points.
+            TArray<FVector> Points = Definition.Points;
             for (FVector& Point : Points)
             {
                 Point.Z += GetActorLocation().Z;
@@ -2380,7 +2383,8 @@ void AAvenorWorldGenerator::CreateWaterBodies(
             ConfigureSpline(
                 *River->GetWaterBodyComponent()->GetWaterSpline(),
                 Points,
-                false
+                false,
+                ESplinePointType::Linear
             );
             River->PostEditChange();
             DetachWaterTerrainModifiers(*River);
