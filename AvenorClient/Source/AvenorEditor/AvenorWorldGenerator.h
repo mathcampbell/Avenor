@@ -5,13 +5,18 @@
 #include "MeshPartitionModifierComponent.h"
 #include "AvenorWorldGenerator.generated.h"
 
-class AAvenorWorldGenerator;
-class ASpineGenerator;
 struct FAvenorGeneratedWorld;
 
+UENUM(BlueprintType)
+enum class EAvenorLongWorldAxis : uint8
+{
+    X UMETA(DisplayName = "X Axis"),
+    Y UMETA(DisplayName = "Y Axis")
+};
+
 /**
- * Thin Mesh Partition bridge. It applies the immutable heightfield produced
- * by AAvenorWorldGenerator and performs no independent terrain generation.
+ * Applies the immutable terrain dataset produced by AAvenorWorldGenerator.
+ * It contains no procedural rules of its own.
  */
 UCLASS(NotBlueprintable, meta = (BlueprintSpawnableComponent))
 class AVENOREDITOR_API UAvenorGeneratedTerrainModifier final
@@ -29,12 +34,11 @@ public:
 };
 
 /**
- * Complete deterministic terrain and water generator.
+ * Deterministic, spine-independent terrain and hydrology generator.
  *
- * One generated dataset owns the final terrain heightfield, drainage graph,
- * river reaches and lake shorelines. The attached Mesh Partition modifier
- * applies those heights, while this same actor creates the native UE Water
- * splines. No later system attempts to rediscover the drainage network.
+ * One dataset owns the eroded landform, river network, lake basins and ocean
+ * boundary. The Mesh Partition modifier and native UE Water splines consume
+ * that same dataset, so terrain carving cannot drift away from the water.
  */
 UCLASS(
     PrioritizeCategories = (
@@ -45,14 +49,11 @@ UCLASS(
         "Rolling Hills",
         "Mountains",
         "Mesas",
-        "Valleys",
-        "Canyons",
+        "Erosion",
         "Hydrology",
-        "Rivers",
+        "Rivers and Valleys",
         "Lakes",
         "Oceans",
-        "Waterfalls",
-        "Spine Corridor",
         "Performance"
     )
 )
@@ -95,17 +96,22 @@ private:
     UPROPERTY(EditInstanceOnly, Category = "Avenor World")
     TObjectPtr<AActor> MeshPartitionActor;
 
-    UPROPERTY(EditInstanceOnly, Category = "Avenor World")
-    TObjectPtr<ASpineGenerator> Spine;
+    UPROPERTY(EditAnywhere, Category = "Avenor World")
+    int32 WorldSeed = 1847;
 
+    // Defaults to 100 km long, 20 km wide and 4 km of vertical build bounds.
     UPROPERTY(EditAnywhere, Category = "Coverage",
         meta = (ClampMin = "100000.0", AllowPreserveRatio = true,
             Units = "cm"))
     FVector3d WorldCoverage =
-        FVector3d(1200000.0, 3000000.0, 2000000.0);
+        FVector3d(10000000.0, 2000000.0, 400000.0);
 
-    UPROPERTY(EditAnywhere, Category = "Avenor World")
-    int32 WorldSeed = 1847;
+    UPROPERTY(EditAnywhere, Category = "Coverage")
+    EAvenorLongWorldAxis LongWorldAxis = EAvenorLongWorldAxis::X;
+
+    UPROPERTY(EditAnywhere, Category = "Coverage",
+        meta = (ClampMin = "0.0", Units = "cm"))
+    double WorldEdgeBlendWidth = 100000.0;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGeneratePlains = true;
@@ -120,10 +126,10 @@ private:
     bool bGenerateMesas = false;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bGenerateCanyons = true;
+    bool bGenerateValleys = true;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bGenerateValleys = true;
+    bool bGenerateCanyons = true;
 
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateRivers = true;
@@ -134,209 +140,220 @@ private:
     UPROPERTY(EditAnywhere, Category = "Landforms")
     bool bGenerateOceans = false;
 
-    UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bGenerateWaterfalls = true;
-
     UPROPERTY(EditAnywhere, Category = "Plains",
         meta = (ClampMin = "0.0", ClampMax = "1.0",
             EditCondition = "bGeneratePlains"))
-    double PlainsFrequency = 0.42;
+    double PlainsCoverage = 0.52;
 
     UPROPERTY(EditAnywhere, Category = "Plains",
-        meta = (ClampMin = "0.0", EditCondition = "bGeneratePlains"))
-    double PlainsRelief = 2500.0;
+        meta = (ClampMin = "0.0", EditCondition = "bGeneratePlains",
+            Units = "cm"))
+    double PlainsRelief = 1800.0;
 
     UPROPERTY(EditAnywhere, Category = "Rolling Hills",
         meta = (ClampMin = "0.0", ClampMax = "1.0",
             EditCondition = "bGenerateRollingHills"))
-    double RollingHillsFrequency = 0.42;
+    double RollingHillsCoverage = 0.38;
 
     UPROPERTY(EditAnywhere, Category = "Rolling Hills",
         meta = (ClampMin = "10000.0",
-            EditCondition = "bGenerateRollingHills"))
-    double RollingHillsScale = 150000.0;
+            EditCondition = "bGenerateRollingHills", Units = "cm"))
+    double RollingHillsScale = 180000.0;
 
     UPROPERTY(EditAnywhere, Category = "Rolling Hills",
         meta = (ClampMin = "0.0",
-            EditCondition = "bGenerateRollingHills"))
-    double RollingHillsRelief = 18000.0;
+            EditCondition = "bGenerateRollingHills", Units = "cm"))
+    double RollingHillsRelief = 12000.0;
 
+    // Number of mountain ranges expected per 100 km of world length.
     UPROPERTY(EditAnywhere, Category = "Mountains",
-        meta = (ClampMin = "0", ClampMax = "64",
+        meta = (ClampMin = "0.0", ClampMax = "32.0",
             EditCondition = "bGenerateMountains"))
-    int32 MountainRangeCount = 3;
+    double MountainRangesPer100Km = 3.0;
 
     UPROPERTY(EditAnywhere, Category = "Mountains",
         meta = (ClampMin = "10000.0",
             EditCondition = "bGenerateMountains", Units = "cm"))
-    double MountainRangeLength = 1000000.0;
+    double MountainRangeLength = 1600000.0;
 
     UPROPERTY(EditAnywhere, Category = "Mountains",
         meta = (ClampMin = "10000.0",
             EditCondition = "bGenerateMountains", Units = "cm"))
-    double MountainRangeWidth = 350000.0;
+    double MountainRangeWidth = 450000.0;
 
     UPROPERTY(EditAnywhere, Category = "Mountains",
         meta = (ClampMin = "10000.0",
             EditCondition = "bGenerateMountains", Units = "cm"))
-    double MountainPeakSpacing = 220000.0;
+    double MountainPeakSpacing = 240000.0;
 
     UPROPERTY(EditAnywhere, Category = "Mountains",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateMountains",
             Units = "cm"))
-    double MountainRelief = 80000.0;
+    double MountainRelief = 95000.0;
 
+    // Mountain centres are kept outside this band around the selected axis.
+    // This is not a spine corridor and does not flatten other terrain.
     UPROPERTY(EditAnywhere, Category = "Mountains",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateMountains",
             Units = "cm"))
-    double MountainMinimumSpineDistance = 350000.0;
+    double CentralMountainExclusionHalfWidth = 300000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Mountains",
+        meta = (ClampMin = "0.0", ClampMax = "1.0",
+            EditCondition = "bGenerateMountains"))
+    double MountainEdgeBias = 0.72;
 
     UPROPERTY(EditAnywhere, Category = "Mesas",
         meta = (ClampMin = "0.0", ClampMax = "1.0",
             EditCondition = "bGenerateMesas"))
-    double MesaFrequency = 0.08;
+    double MesaCoverage = 0.08;
 
     UPROPERTY(EditAnywhere, Category = "Mesas",
-        meta = (ClampMin = "10000.0", EditCondition = "bGenerateMesas"))
-    double MesaScale = 350000.0;
+        meta = (ClampMin = "10000.0", EditCondition = "bGenerateMesas",
+            Units = "cm"))
+    double MesaScale = 420000.0;
 
     UPROPERTY(EditAnywhere, Category = "Mesas",
-        meta = (ClampMin = "0.0", EditCondition = "bGenerateMesas"))
-    double MesaRelief = 28000.0;
+        meta = (ClampMin = "0.0", EditCondition = "bGenerateMesas",
+            Units = "cm"))
+    double MesaRelief = 32000.0;
 
     UPROPERTY(EditAnywhere, Category = "Mesas",
         meta = (ClampMin = "1", ClampMax = "12",
             EditCondition = "bGenerateMesas"))
     int32 MesaTerraceCount = 4;
 
-    // Valleys are cut along the calculated drainage network; this never
-    // creates decorative trenches which disagree with the river splines.
-    UPROPERTY(EditAnywhere, Category = "Valleys",
-        meta = (ClampMin = "1.0", EditCondition = "bGenerateValleys"))
-    double ValleyStartCatchmentCells = 35.0;
+    UPROPERTY(EditAnywhere, Category = "Erosion",
+        meta = (ClampMin = "0", ClampMax = "32"))
+    int32 ThermalErosionIterations = 4;
 
-    UPROPERTY(EditAnywhere, Category = "Valleys",
-        meta = (ClampMin = "0.0", EditCondition = "bGenerateValleys"))
-    double ValleyMaximumDepth = 6500.0;
+    UPROPERTY(EditAnywhere, Category = "Erosion",
+        meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double ThermalErosionStrength = 0.16;
 
-    UPROPERTY(EditAnywhere, Category = "Valleys",
-        meta = (ClampMin = "1", ClampMax = "12",
-            EditCondition = "bGenerateValleys"))
-    int32 ValleyMaximumHalfWidthCells = 5;
+    UPROPERTY(EditAnywhere, Category = "Erosion",
+        meta = (ClampMin = "1.0", ClampMax = "80.0"))
+    double TalusAngleDegrees = 34.0;
 
-    UPROPERTY(EditAnywhere, Category = "Canyons",
-        meta = (ClampMin = "1.0", EditCondition = "bGenerateCanyons"))
-    double CanyonStartCatchmentCells = 600.0;
+    UPROPERTY(EditAnywhere, Category = "Erosion",
+        meta = (ClampMin = "0", ClampMax = "32"))
+    int32 HydraulicErosionIterations = 7;
 
-    UPROPERTY(EditAnywhere, Category = "Canyons",
-        meta = (ClampMin = "0.0", EditCondition = "bGenerateCanyons"))
-    double CanyonMaximumDepth = 18000.0;
+    UPROPERTY(EditAnywhere, Category = "Erosion",
+        meta = (ClampMin = "0.0", ClampMax = "5000.0",
+            Units = "cm"))
+    double HydraulicIncisionPerIteration = 120.0;
 
     UPROPERTY(EditAnywhere, Category = "Hydrology",
-        meta = (ClampMin = "5000.0", ClampMax = "100000.0"))
+        meta = (ClampMin = "5000.0", ClampMax = "100000.0",
+            Units = "cm"))
     double GenerationCellSize = 10000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Performance",
-        meta = (ClampMin = "1000", ClampMax = "2000000"))
-    int32 MaximumGenerationCells = 500000;
-
     UPROPERTY(EditAnywhere, Category = "Hydrology",
-        meta = (ClampMin = "0.01", ClampMax = "100.0"))
+        meta = (ClampMin = "0.01", ClampMax = "100.0",
+            Units = "cm"))
     double DrainageEpsilon = 1.0;
 
-    UPROPERTY(EditAnywhere, Category = "Hydrology",
-        meta = (ClampMin = "1", ClampMax = "64"))
-    int32 ErosionIterations = 10;
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "0.01", EditCondition = "bGenerateRivers"))
+    double StreamStartAreaSquareKilometres = 0.35;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
-        meta = (ClampMin = "1.0", EditCondition = "bGenerateRivers"))
-    double StreamStartCatchmentCells = 18.0;
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "0.01", EditCondition = "bGenerateRivers"))
+    double MainRiverAreaSquareKilometres = 8.0;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "100.0", EditCondition = "bGenerateRivers",
+            Units = "cm"))
+    double HeadwaterWidth = 500.0;
+
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "100.0", EditCondition = "bGenerateRivers",
+            Units = "cm"))
+    double MainRiverWidth = 9000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
         meta = (ClampMin = "0.0", EditCondition = "bGenerateRivers",
             Units = "cm"))
-    double MaximumRiverDepth = 1200.0;
+    double MaximumRiverDepth = 1000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
         meta = (ClampMin = "100.0", EditCondition = "bGenerateRivers",
             Units = "cm"))
-    double HeadwaterWidth = 600.0;
+    double HeadwaterValleyHalfWidth = 12000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
         meta = (ClampMin = "100.0", EditCondition = "bGenerateRivers",
             Units = "cm"))
-    double MainRiverWidth = 10000.0;
+    double MainValleyHalfWidth = 90000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
-        meta = (ClampMin = "0.0", ClampMax = "1.0",
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "0.0", EditCondition = "bGenerateRivers",
+            Units = "cm"))
+    double MaximumValleyDepth = 14000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "0.0", ClampMax = "1.5",
             EditCondition = "bGenerateRivers"))
-    double LowlandMeanderStrength = 0.75;
+    double LowlandMeanderStrength = 0.72;
 
-    UPROPERTY(EditAnywhere, Category = "Rivers",
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
         meta = (ClampMin = "1", ClampMax = "512",
             EditCondition = "bGenerateRivers"))
-    int32 MaximumRiverReaches = 64;
+    int32 MaximumRiverReaches = 72;
 
-    UPROPERTY(EditAnywhere, Category = "Lakes",
-        meta = (ClampMin = "1.0", EditCondition = "bGenerateLakes"))
-    double MinimumLakeCatchmentCells = 60.0;
-
-    UPROPERTY(EditAnywhere, Category = "Lakes",
-        meta = (ClampMin = "1.0", EditCondition = "bGenerateLakes"))
-    double MinimumLakeDepth = 200.0;
-
-    UPROPERTY(EditAnywhere, Category = "Lakes",
-        meta = (ClampMin = "0.1", EditCondition = "bGenerateLakes"))
-    double CatchmentRunoffDepth = 50.0;
+    UPROPERTY(EditAnywhere, Category = "Rivers and Valleys",
+        meta = (ClampMin = "0.01", EditCondition = "bGenerateCanyons"))
+    double CanyonStartAreaSquareKilometres = 30.0;
 
     UPROPERTY(EditAnywhere, Category = "Lakes",
         meta = (ClampMin = "0.01", EditCondition = "bGenerateLakes"))
-    double MaximumLakeAreaSquareKilometres = 25.0;
+    double MinimumLakeCatchmentSquareKilometres = 0.2;
+
+    UPROPERTY(EditAnywhere, Category = "Lakes",
+        meta = (ClampMin = "1.0", EditCondition = "bGenerateLakes",
+            Units = "cm"))
+    double MinimumLakeDepth = 250.0;
+
+    UPROPERTY(EditAnywhere, Category = "Lakes",
+        meta = (ClampMin = "0.01", EditCondition = "bGenerateLakes"))
+    double MaximumLakeAreaSquareKilometres = 35.0;
 
     UPROPERTY(EditAnywhere, Category = "Lakes",
         meta = (ClampMin = "0", ClampMax = "64",
             EditCondition = "bGenerateLakes"))
-    int32 MaximumLakeCount = 8;
+    int32 MaximumLakeCount = 10;
 
-    UPROPERTY(EditAnywhere, Category = "Oceans",
-        meta = (ClampMin = "10000.0", EditCondition = "bGenerateOceans"))
-    double CoastTransitionWidth = 300000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Oceans",
-        meta = (ClampMin = "0.0", EditCondition = "bGenerateOceans"))
-    double OceanDepth = 30000.0;
+    UPROPERTY(EditAnywhere, Category = "Lakes",
+        meta = (ClampMin = "100.0", EditCondition = "bGenerateLakes",
+            Units = "cm"))
+    double LakeShoreFalloffWidth = 24000.0;
 
     UPROPERTY(EditAnywhere, Category = "Oceans",
         meta = (EditCondition = "bGenerateOceans"))
     double SeaLevel = 0.0;
 
-    UPROPERTY(EditAnywhere, Category = "Waterfalls",
-        meta = (ClampMin = "0.0", EditCondition = "bGenerateWaterfalls"))
-    double MinimumWaterfallDrop = 1200.0;
+    UPROPERTY(EditAnywhere, Category = "Oceans",
+        meta = (ClampMin = "0.0", EditCondition = "bGenerateOceans",
+            Units = "cm"))
+    double OceanDepth = 30000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Spine Corridor",
-        meta = (ClampMin = "0.0"))
-    double GentleCorridorHalfWidth = 100000.0;
+    UPROPERTY(EditAnywhere, Category = "Oceans",
+        meta = (ClampMin = "10000.0", EditCondition = "bGenerateOceans",
+            Units = "cm"))
+    double CoastTransitionWidth = 300000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Spine Corridor",
-        meta = (ClampMin = "0.0"))
-    double FullRoughnessDistance = 300000.0;
+    UPROPERTY(EditAnywhere, Category = "Oceans",
+        meta = (EditCondition = "bGenerateOceans"))
+    bool bOceanAlongWidthEdges = true;
 
-    UPROPERTY(EditAnywhere, Category = "Spine Corridor",
-        meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    double CorridorRoughnessFraction = 0.32;
+    UPROPERTY(EditAnywhere, Category = "Oceans",
+        meta = (EditCondition = "bGenerateOceans"))
+    bool bOceanAtLengthEnds = false;
 
-    UPROPERTY(EditAnywhere, Category = "Coverage",
-        meta = (ClampMin = "0.0"))
-    double WorldEdgeBlendWidth = 50000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Rivers",
-        meta = (ClampMin = "0.0"))
-    double RiverFalloffWidth = 15000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Lakes",
-        meta = (ClampMin = "0.0"))
-    double LakeFalloffWidth = 30000.0;
+    UPROPERTY(EditAnywhere, Category = "Performance",
+        meta = (ClampMin = "1000", ClampMax = "4000000"))
+    int32 MaximumGenerationCells = 1500000;
 
     mutable FCriticalSection GenerationMutex;
     mutable TSharedPtr<const FAvenorGeneratedWorld> CachedWorld;
