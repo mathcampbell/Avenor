@@ -70,6 +70,7 @@ struct FLakeBasin
     double SurfaceHeight = 0.0;
     double MaximumDepth = 500.0;
     double BankBlendWidth = 24000.0;
+    double DepthRampWidth = 7500.0;
     double CatchmentArea = 0.0;
     FBox2D Bounds = FBox2D(ForceInit);
 };
@@ -940,7 +941,8 @@ static void ExtractLakes(
     double MaximumBedDepth,
     double MaximumArea,
     int32 MaximumCount,
-    double BankBlendWidth
+    double BankBlendWidth,
+    double DepthRampWidth
 )
 {
     Data.Lakes.Reset();
@@ -1046,6 +1048,7 @@ static void ExtractLakes(
             FMath::Max(MinimumBedDepth, MaximumBedDepth)
         );
         Lake.BankBlendWidth = BankBlendWidth;
+        Lake.DepthRampWidth = DepthRampWidth;
         Lake.CatchmentArea = CandidateBasin.CatchmentArea;
         Lake.Shoreline = TraceComponentBoundary(
             Data,
@@ -1449,8 +1452,8 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             &EdgeDistance
         );
         const double Radius = FMath::Max(
-            Lake.BankBlendWidth,
-            CellSize * 1.5
+            CellSize * 0.35,
+            Lake.DepthRampWidth
         );
         if (bInside)
         {
@@ -1484,6 +1487,13 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             );
         }
     }
+    // Evaluate every reach first, then apply exactly one continuous river
+    // cross-section. Selecting the strongest local influence prevents one
+    // overlapping reach from carving through another reach's bank profile at
+    // tributary junctions.
+    bool bHasRiverProfile = false;
+    double BestRiverInfluence = 0.0;
+    double BestRiverTarget = Result;
     for (const FRiverReach& River : Rivers)
     {
         if (!River.Bounds.IsInside(Position) || River.Points.Num() < 2)
@@ -1517,35 +1527,65 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             100.0,
             River.Width * 0.5
         );
-        // The terrain bed must extend beyond the visible water mesh. UE's
-        // Water mesh has vertical side geometry; an equal-width carve leaves
-        // that skirt exposed at grazing angles.
-        const double WetBedHalfWidth = FMath::Max(
-            WaterHalfWidth + CellSize * 0.35,
-            River.Width * 0.70
-        );
-        const double ValleyAlpha = FMath::Clamp(
-            (ClosestDistance - WetBedHalfWidth) /
-                FMath::Max(1.0, River.ValleyHalfWidth - WetBedHalfWidth),
-            0.0,
-            1.0
-        );
-        const double Shaped = FMath::Pow(
-            ValleyAlpha,
-            FMath::Max(0.2, River.CrossSectionExponent)
-        );
-        const double Smooth = Smooth01(Shaped);
-        // Force the bed below both the water surface and the local terrain,
-        // then blend continuously back to the untouched landform. This
-        // guarantees a depression even when the routed centreline crosses a
-        // locally lower sample between analysis cells.
-        const double BedHeight = SurfaceHeight - River.Depth;
-        const double CarveTarget = FMath::Lerp(
-            BedHeight,
-            Underlying,
-            Smooth
-        );
-        Result = FMath::Min(Result, CarveTarget);
+        double Influence = 0.0;
+        double CarveTarget = Underlying;
+        if (ClosestDistance <= WaterHalfWidth)
+        {
+            // Wet channel: deepest at the centreline and exactly equal to the
+            // water surface at the visible mesh edge. This buries the Water
+            // mesh's vertical skirt instead of exposing it above the land.
+            const double ChannelAlpha = Smooth01(FMath::Clamp(
+                ClosestDistance / WaterHalfWidth,
+                0.0,
+                1.0
+            ));
+            CarveTarget = FMath::Lerp(
+                SurfaceHeight - River.Depth,
+                SurfaceHeight,
+                ChannelAlpha
+            );
+            Influence = 2.0 - ChannelAlpha;
+        }
+        else
+        {
+            // Dry valley/bank: begin at the exact same surface elevation as
+            // the water edge, then return smoothly to the original landform.
+            // The exponent retains broad lowland valleys and tighter upland
+            // channels without introducing a discontinuity at either edge.
+            const double ValleyAlpha = FMath::Clamp(
+                (ClosestDistance - WaterHalfWidth) /
+                    FMath::Max(
+                        1.0,
+                        River.ValleyHalfWidth - WaterHalfWidth
+                    ),
+                0.0,
+                1.0
+            );
+            const double Shaped = FMath::Pow(
+                ValleyAlpha,
+                FMath::Max(0.2, River.CrossSectionExponent)
+            );
+            const double BankAlpha = Smooth01(Shaped);
+            CarveTarget = FMath::Lerp(
+                SurfaceHeight,
+                Underlying,
+                BankAlpha
+            );
+            Influence = 1.0 - BankAlpha;
+        }
+        if (!bHasRiverProfile || Influence > BestRiverInfluence)
+        {
+            bHasRiverProfile = true;
+            BestRiverInfluence = Influence;
+            BestRiverTarget = CarveTarget;
+        }
+    }
+    if (bHasRiverProfile)
+    {
+        // Assignment is required: Min(Underlying, Target) cannot make a low
+        // terrain sample rise to meet the exact water-edge elevation and was
+        // the remaining source of floating water skirts.
+        Result = BestRiverTarget;
     }
     return Result;
 }
@@ -1826,7 +1866,8 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.MaximumLakeBedDepth,
             Generator.MaximumLakeArea,
             Generator.MaximumLakeCount,
-            Generator.LakeBankBlendWidth
+            Generator.LakeBankBlendWidth,
+            Generator.LakeDepthRampWidth
         );
     }
     else
@@ -1999,7 +2040,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("9f7895a2-58f8-41c7-a54c-9085de835f84"));
+        return FGuid(TEXT("5e4bb7aa-3775-4d4a-b7e8-e28ac9f47be1"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -2070,8 +2111,12 @@ static void ConfigureRiverSpline(
     if (Metadata)
     {
         Metadata->Fixup(Spline.GetNumberOfSplinePoints(), &Spline);
-        const float HalfWidth = static_cast<float>(
-            FMath::Max(50.0, FullWidth * 0.5)
+        // RiverWidth metadata is the complete bank-to-bank width. The
+        // terrain sampler converts this same value to a half-width only for
+        // its centreline-distance calculation. Supplying half here made the
+        // rendered water narrower than the channel carved for it.
+        const float MetadataWidth = static_cast<float>(
+            FMath::Max(100.0, FullWidth)
         );
         const float WaterDepth = static_cast<float>(FMath::Max(1.0, Depth));
         for (int32 Index = 0;
@@ -2080,7 +2125,7 @@ static void ConfigureRiverSpline(
         {
             if (Metadata->RiverWidth.Points.IsValidIndex(Index))
             {
-                Metadata->RiverWidth.Points[Index].OutVal = HalfWidth;
+                Metadata->RiverWidth.Points[Index].OutVal = MetadataWidth;
             }
             if (Metadata->Depth.Points.IsValidIndex(Index))
             {
