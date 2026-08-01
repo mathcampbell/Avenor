@@ -799,6 +799,18 @@ static int32 PrimaryReceiver(
     return B;
 }
 
+static double DrainageScaleAlpha(double Area, double MainRiverArea)
+{
+    if (Area >= MainRiverArea)
+    {
+        return 1.0;
+    }
+    return Smooth01(
+        FMath::Loge(1.0 + FMath::Max(0.0, Area)) /
+        FMath::Loge(1.0 + FMath::Max(0.01, MainRiverArea))
+    );
+}
+
 struct FLakeCandidate
 {
     TArray<int32> Cells;
@@ -1079,6 +1091,8 @@ static void ExtractRivers(
     double HeadwaterWidth,
     double MainRiverWidth,
     double MaximumDepth,
+    double HeadwaterSurfaceInset,
+    double MainRiverSurfaceInset,
     double HeadwaterValleyWidth,
     double MainValleyWidth,
     double MaximumValleyDepth,
@@ -1325,22 +1339,30 @@ static void ExtractRivers(
         );
         for (FVector& Point : Points)
         {
-            // FilledHeight exists only to provide a depression-free routing
-            // surface.  Rendering/carving at that artificial elevation can
-            // put a river above the real terrain whenever the fill depth is
-            // greater than the channel depth.  Anchor the visible water and
-            // its bed to the eroded landform instead; EnforceDownhill may
-            // subsequently lower points, but never raises them.
-            Point.Z = Data.SampleGrid(Data.Height, FVector2D(Point));
+            // Route on FilledHeight, but place the visible water below the
+            // actual eroded terrain by an amount that grows smoothly with
+            // drainage area. This is a local inset, never a world datum.
+            const FVector2D Position(Point);
+            const double LocalArea = Data.SampleGrid(
+                Data.Accumulation,
+                Position
+            );
+            const double LocalAlpha = DrainageScaleAlpha(
+                LocalArea,
+                MainRiverArea
+            );
+            const double SurfaceInset = FMath::Lerp(
+                HeadwaterSurfaceInset,
+                MainRiverSurfaceInset,
+                LocalAlpha
+            );
+            Point.Z = Data.SampleGrid(Data.Height, Position) - SurfaceInset;
         }
         EnforceDownhill(Points);
 
         const int32 EndCell = CandidateReach.Cells.Last();
         const double Area = Data.Accumulation[EndCell];
-        const double RiverAlpha = Smooth01(
-            FMath::Loge(1.0 + Area) /
-            FMath::Loge(1.0 + FMath::Max(MainRiverArea, Area))
-        );
+        const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
         FRiverReach River;
         River.Points = MoveTemp(Points);
         River.DrainageArea = Area;
@@ -1463,24 +1485,19 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             FMath::Max(0.2, River.CrossSectionExponent)
         );
         const double Smooth = Smooth01(Shaped);
-        const double BedHeight = SurfaceHeight - River.Depth;
-        // Blend the channel back to the terrain that exists at this exact
-        // sample.  A fixed absolute "valley ceiling" creates shelves and
-        // raised-looking centre strips whenever the ambient landform and
-        // river profile differ.  This formulation is identical at the bank
-        // edge, reaches the bed at the centre, and can only remove material.
-        const double NaturalBank = FMath::Lerp(
+        // Force the bed below both the water surface and the local terrain,
+        // then blend continuously back to the untouched landform. This
+        // guarantees a depression even when the routed centreline crosses a
+        // locally lower sample between analysis cells.
+        const double BedHeight = FMath::Min(
+            SurfaceHeight - River.Depth,
+            Underlying - River.Depth
+        );
+        const double CarveTarget = FMath::Lerp(
             BedHeight,
             Underlying,
             Smooth
         );
-        const double MaximumCut = River.ValleyDepth * (1.0 - Smooth);
-        const double CarveTarget = ClosestDistance <= HalfBedWidth
-            ? BedHeight
-            : FMath::Max(
-                BedHeight,
-                FMath::Max(NaturalBank, Underlying - MaximumCut)
-            );
         Result = FMath::Min(Result, CarveTarget);
     }
     return Result;
@@ -1780,6 +1797,8 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.HeadwaterWidth,
             Generator.MainRiverWidth,
             Generator.MaximumRiverDepth,
+            Generator.HeadwaterSurfaceInset,
+            Generator.MainRiverSurfaceInset,
             Generator.HeadwaterValleyHalfWidth,
             Generator.MainValleyHalfWidth,
             Generator.MaximumValleyDepth,
@@ -1906,7 +1925,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("780fd3e8-bb30-493f-aa91-0e4b337fd48b"));
+        return FGuid(TEXT("a16fd779-bc17-40fb-b6d3-ac8b682ec515"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
