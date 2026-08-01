@@ -185,6 +185,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0.1"))
     double MainRiverArea = 40.0;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0.0", Units="cm"))
+    double MinimumRiverSystemLength = 200000.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0", ClampMax="8"))
+    int32 JunctionOverlapCells = 2;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(Units="cm"))
     double HeadwaterWidth = 450.0;
 
