@@ -1895,11 +1895,36 @@ public:
         TArray<FInstanceInfo>& OutInstances
     ) const override
     {
-        AddDefaultInstanceIfIntersects(
-            WorldBounds,
-            InBounds,
-            OutInstances
+        if (!WorldBounds.Intersect(InBounds))
+        {
+            return;
+        }
+
+        // AddDefaultInstanceIfIntersects declares only a vertex-position
+        // write. This modifier also writes the generated classification
+        // weights, so describe both operations before MeshPartition creates
+        // the restricted FMeshView used on the background worker.
+        FInstanceInfo& Instance = OutInstances.AddDefaulted_GetRef();
+        Instance.InstanceID = 0;
+        Instance.Bounds = WorldBounds;
+        Instance.ReadViewComponents =
+            UE::MeshPartition::EMeshViewComponents::VertexPos;
+        Instance.WriteViewComponents = static_cast<
+            UE::MeshPartition::EMeshViewComponents
+        >(
+            UE::MeshPartition::EMeshViewComponents::VertexPos |
+            UE::MeshPartition::EMeshViewComponents::VertexAttributeWeight
         );
+        Instance.UsedChannels = {
+            ElevationChannel,
+            SlopeChannel,
+            WetnessChannel,
+            RiverChannel,
+            LakeChannel,
+            MountainChannel,
+            MesaChannel,
+            PlainChannel
+        };
     }
 
     virtual void ApplyModifications(
@@ -1974,7 +1999,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("72b75cc2-f69f-459a-ad7a-dfa492eff5ba"));
+        return FGuid(TEXT("9f7895a2-58f8-41c7-a54c-9085de835f84"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
