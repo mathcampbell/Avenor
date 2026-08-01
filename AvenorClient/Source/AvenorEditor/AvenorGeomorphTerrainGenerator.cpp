@@ -936,6 +936,8 @@ static void ExtractLakes(
     FAvenorGeomorphData& Data,
     double MinimumCatchmentArea,
     double MinimumDepth,
+    double MinimumBedDepth,
+    double MaximumBedDepth,
     double MaximumArea,
     int32 MaximumCount,
     double BankBlendWidth
@@ -949,6 +951,14 @@ static void ExtractLakes(
     }
     TArray<bool> Candidate;
     Candidate.Init(false, Data.Height.Num());
+    // Trace the complete flooded footprint, not merely its deep core. The
+    // latter produces a water polygon whose nominal surface is above the
+    // terrain at its edge. A small threshold rejects Priority-Flood's
+    // drainage epsilon while retaining the real basin up to its shoreline.
+    const double ShorelineFillThreshold = FMath::Max(
+        1.0,
+        MinimumDepth * 0.05
+    );
     for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
     {
         for (int32 X = 1; X + 1 < Data.Columns; ++X)
@@ -956,7 +966,7 @@ static void ExtractLakes(
             const int32 Cell = Data.Index(X, Y);
             const double FillDepth =
                 Data.FilledHeight[Cell] - Data.Height[Cell];
-            Candidate[Cell] = FillDepth >= MinimumDepth;
+            Candidate[Cell] = FillDepth >= ShorelineFillThreshold;
         }
     }
     TArray<bool> Visited;
@@ -1030,7 +1040,11 @@ static void ExtractLakes(
         const FLakeCandidate& CandidateBasin = Basins[BasinIndex];
         FLakeBasin Lake;
         Lake.SurfaceHeight = CandidateBasin.SurfaceHeight;
-        Lake.MaximumDepth = CandidateBasin.MaximumDepth;
+        Lake.MaximumDepth = FMath::Clamp(
+            FMath::Max(CandidateBasin.MaximumDepth, MinimumBedDepth),
+            MinimumBedDepth,
+            FMath::Max(MinimumBedDepth, MaximumBedDepth)
+        );
         Lake.BankBlendWidth = BankBlendWidth;
         Lake.CatchmentArea = CandidateBasin.CatchmentArea;
         Lake.Shoreline = TraceComponentBoundary(
@@ -1429,20 +1443,46 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             continue;
         }
         double EdgeDistance = 0.0;
-        if (!IsInsidePolygon(Position, Lake.Shoreline, &EdgeDistance))
-        {
-            continue;
-        }
+        const bool bInside = IsInsidePolygon(
+            Position,
+            Lake.Shoreline,
+            &EdgeDistance
+        );
         const double Radius = FMath::Max(
             Lake.BankBlendWidth,
             CellSize * 1.5
         );
-        const double DepthAlpha = Smooth01(
-            FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0)
-        );
-        const double BasinBed =
-            Lake.SurfaceHeight - Lake.MaximumDepth * DepthAlpha;
-        Result = FMath::Min(Result, BasinBed);
+        if (bInside)
+        {
+            // The shoreline is an invariant: terrain equals the water
+            // surface at the polygon edge, then deepens smoothly inward.
+            // Assignment is intentional; Min() cannot raise an erroneously
+            // low edge to meet the lake and is what allowed floating slabs.
+            const double DepthAlpha = Smooth01(
+                FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0)
+            );
+            Result = Lake.SurfaceHeight -
+                Lake.MaximumDepth * DepthAlpha;
+        }
+        else if (EdgeDistance < Lake.BankBlendWidth)
+        {
+            // Blend the outside bank back to the untouched terrain. This
+            // makes the first terrain ring outside the polygon meet the same
+            // elevation as the water rather than exposing the Water mesh's
+            // vertical skirt.
+            const double BankAlpha = Smooth01(
+                FMath::Clamp(
+                    EdgeDistance / FMath::Max(1.0, Lake.BankBlendWidth),
+                    0.0,
+                    1.0
+                )
+            );
+            Result = FMath::Lerp(
+                Lake.SurfaceHeight,
+                Underlying,
+                BankAlpha
+            );
+        }
     }
     for (const FRiverReach& River : Rivers)
     {
@@ -1473,10 +1513,20 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
         {
             continue;
         }
-        const double HalfBedWidth = FMath::Max(100.0, River.Width * 0.5);
+        const double WaterHalfWidth = FMath::Max(
+            100.0,
+            River.Width * 0.5
+        );
+        // The terrain bed must extend beyond the visible water mesh. UE's
+        // Water mesh has vertical side geometry; an equal-width carve leaves
+        // that skirt exposed at grazing angles.
+        const double WetBedHalfWidth = FMath::Max(
+            WaterHalfWidth + CellSize * 0.35,
+            River.Width * 0.70
+        );
         const double ValleyAlpha = FMath::Clamp(
-            (ClosestDistance - HalfBedWidth) /
-                FMath::Max(1.0, River.ValleyHalfWidth - HalfBedWidth),
+            (ClosestDistance - WetBedHalfWidth) /
+                FMath::Max(1.0, River.ValleyHalfWidth - WetBedHalfWidth),
             0.0,
             1.0
         );
@@ -1489,10 +1539,7 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
         // then blend continuously back to the untouched landform. This
         // guarantees a depression even when the routed centreline crosses a
         // locally lower sample between analysis cells.
-        const double BedHeight = FMath::Min(
-            SurfaceHeight - River.Depth,
-            Underlying - River.Depth
-        );
+        const double BedHeight = SurfaceHeight - River.Depth;
         const double CarveTarget = FMath::Lerp(
             BedHeight,
             Underlying,
@@ -1775,6 +1822,8 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             *Data,
             Generator.MinimumLakeCatchmentArea,
             Generator.MinimumLakeDepth,
+            Generator.MinimumLakeBedDepth,
+            Generator.MaximumLakeBedDepth,
             Generator.MaximumLakeArea,
             Generator.MaximumLakeCount,
             Generator.LakeBankBlendWidth
@@ -1925,7 +1974,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("a16fd779-bc17-40fb-b6d3-ac8b682ec515"));
+        return FGuid(TEXT("72b75cc2-f69f-459a-ad7a-dfa492eff5ba"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -2181,6 +2230,16 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
                 true
             );
             Lake->PostEditChange();
+            // PostEditChange can recreate/synchronise the Water spline.
+            // Reapply the exact generated shoreline afterwards so rendering
+            // and terrain carving continue to consume identical geometry.
+            ConfigureExactSpline(
+                *Lake->GetWaterBodyComponent()->GetWaterSpline(),
+                ToWorldPoints(Data->Lakes[Index].Shoreline),
+                true
+            );
+            Lake->GetWaterBodyComponent()->GetWaterSpline()
+                ->K2_SynchronizeAndBroadcastDataChange();
             DisableSecondaryTerrainCarving(*Lake);
         }
     }
@@ -2199,6 +2258,15 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
                 Data->Rivers[Index].Depth
             );
             River->PostEditChange();
+            // WaterBody synchronisation may restore its default width/depth
+            // curves. Apply the generated values after that synchronisation,
+            // otherwise the visible sheet can be much wider than its carve.
+            ConfigureRiverSpline(
+                *River->GetWaterBodyComponent()->GetWaterSpline(),
+                ToWorldPoints(Data->Rivers[Index].Points),
+                Data->Rivers[Index].Width,
+                Data->Rivers[Index].Depth
+            );
             DisableSecondaryTerrainCarving(*River);
         }
     }
