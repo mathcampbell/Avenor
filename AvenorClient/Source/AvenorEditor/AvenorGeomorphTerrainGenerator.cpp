@@ -12,6 +12,7 @@
 #include "WaterBodyOceanActor.h"
 #include "WaterBodyRiverActor.h"
 #include "WaterSplineComponent.h"
+#include "WaterSplineMetadata.h"
 
 #include <queue>
 #include <vector>
@@ -1234,10 +1235,13 @@ static void ExtractRivers(
         );
         for (FVector& Point : Points)
         {
-            Point.Z = Data.SampleGrid(
-                Data.FilledHeight,
-                FVector2D(Point)
-            );
+            // FilledHeight exists only to provide a depression-free routing
+            // surface.  Rendering/carving at that artificial elevation can
+            // put a river above the real terrain whenever the fill depth is
+            // greater than the channel depth.  Anchor the visible water and
+            // its bed to the eroded landform instead; EnforceDownhill may
+            // subsequently lower points, but never raises them.
+            Point.Z = Data.SampleGrid(Data.Height, FVector2D(Point));
         }
         EnforceDownhill(Points);
 
@@ -1810,7 +1814,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("7d7de794-213b-40bd-9e26-a2982557d6c5"));
+        return FGuid(TEXT("c6aa2fce-2387-4773-a7d0-eec305219ee3"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -1865,6 +1869,41 @@ static void ConfigureExactSpline(
         );
     }
     Spline.UpdateSpline();
+}
+
+static void ConfigureRiverSpline(
+    UWaterSplineComponent& Spline,
+    const TArray<FVector>& Points,
+    double FullWidth,
+    double Depth
+)
+{
+    ConfigureExactSpline(Spline, Points, false);
+    UWaterSplineMetadata* Metadata = Cast<UWaterSplineMetadata>(
+        Spline.GetSplinePointsMetadata()
+    );
+    if (Metadata)
+    {
+        Metadata->Fixup(Spline.GetNumberOfSplinePoints(), &Spline);
+        const float HalfWidth = static_cast<float>(
+            FMath::Max(50.0, FullWidth * 0.5)
+        );
+        const float WaterDepth = static_cast<float>(FMath::Max(1.0, Depth));
+        for (int32 Index = 0;
+             Index < Spline.GetNumberOfSplinePoints();
+             ++Index)
+        {
+            if (Metadata->RiverWidth.Points.IsValidIndex(Index))
+            {
+                Metadata->RiverWidth.Points[Index].OutVal = HalfWidth;
+            }
+            if (Metadata->Depth.Points.IsValidIndex(Index))
+            {
+                Metadata->Depth.Points[Index].OutVal = WaterDepth;
+            }
+        }
+    }
+    Spline.K2_SynchronizeAndBroadcastDataChange();
 }
 
 static void DisableSecondaryTerrainCarving(AActor& WaterActor)
@@ -2042,10 +2081,11 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
         ))
         {
             DisableSecondaryTerrainCarving(*River);
-            ConfigureExactSpline(
+            ConfigureRiverSpline(
                 *River->GetWaterBodyComponent()->GetWaterSpline(),
                 ToWorldPoints(Data->Rivers[Index].Points),
-                false
+                Data->Rivers[Index].Width,
+                Data->Rivers[Index].Depth
             );
             River->PostEditChange();
             DisableSecondaryTerrainCarving(*River);
