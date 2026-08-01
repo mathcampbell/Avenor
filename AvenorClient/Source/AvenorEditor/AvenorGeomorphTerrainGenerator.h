@@ -200,6 +200,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(Units="cm"))
     double MaximumRiverDepth = 2800.0;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0.0", Units="cm"))
+    double HeadwaterSurfaceInset = 150.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0.0", Units="cm"))
+    double MainRiverSurfaceInset = 900.0;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(Units="cm"))
     double HeadwaterValleyHalfWidth = 14000.0;
 
@@ -219,10 +225,10 @@ public:
     double CanyonStartArea = 18.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="0.01"))
-    double MinimumLakeCatchmentArea = 1.0;
+    double MinimumLakeCatchmentArea = 0.25;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="1.0", Units="cm"))
-    double MinimumLakeDepth = 180.0;
+    double MinimumLakeDepth = 100.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="0.01"))
     double MaximumLakeArea = 25.0;
