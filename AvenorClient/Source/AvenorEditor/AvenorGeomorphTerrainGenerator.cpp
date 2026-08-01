@@ -67,6 +67,7 @@ struct FRiverReach
 struct FLakeBasin
 {
     TArray<FVector> Shoreline;
+    double ShorelineHeight = 0.0;
     double SurfaceHeight = 0.0;
     double MaximumDepth = 500.0;
     double BankBlendWidth = 24000.0;
@@ -942,7 +943,8 @@ static void ExtractLakes(
     double MaximumArea,
     int32 MaximumCount,
     double BankBlendWidth,
-    double DepthRampWidth
+    double DepthRampWidth,
+    double SurfaceInset
 )
 {
     Data.Lakes.Reset();
@@ -1059,6 +1061,73 @@ static void ExtractLakes(
         {
             continue;
         }
+
+        // Chaikin smoothing moves the final outline away from the original
+        // flood-cell corners. Recalculate the rim from the raw terrain beneath
+        // that finished outline instead of reusing the pre-smoothing fill
+        // height.
+        double MinimumShorelineHeight =
+            TNumericLimits<double>::Max();
+        for (const FVector& Point : Lake.Shoreline)
+        {
+            MinimumShorelineHeight = FMath::Min(
+                MinimumShorelineHeight,
+                Data.SampleGrid(Data.Height, FVector2D(Point))
+            );
+        }
+        if (MinimumShorelineHeight < TNumericLimits<double>::Max())
+        {
+            Lake.ShorelineHeight = FMath::Min(
+                Lake.SurfaceHeight,
+                MinimumShorelineHeight
+            );
+        }
+        else
+        {
+            Lake.ShorelineHeight = Lake.SurfaceHeight;
+        }
+
+        // The bowl exists in the generated terrain first. The visible lake is
+        // then a single level plane lowered just below that terrain rim.
+        Lake.SurfaceHeight = Lake.ShorelineHeight -
+            FMath::Max(0.0, SurfaceInset);
+        for (FVector& Point : Lake.Shoreline)
+        {
+            Point.Z = Lake.SurfaceHeight;
+        }
+
+        // A fixed ramp makes small lakes permanently shallow. Measure the
+        // actual basin inradius and shorten only the inward depth ramp when
+        // necessary, so every accepted lake reaches its configured bed depth
+        // while the exterior shoreline blend remains broad and gentle.
+        double BasinInradius = 0.0;
+        for (int32 Cell : CandidateBasin.Cells)
+        {
+            double EdgeDistance = 0.0;
+            if (IsInsidePolygon(
+                    Data.CellPosition(Cell),
+                    Lake.Shoreline,
+                    &EdgeDistance
+                ))
+            {
+                BasinInradius = FMath::Max(
+                    BasinInradius,
+                    EdgeDistance
+                );
+            }
+        }
+        const double MinimumRamp = FMath::Max(
+            500.0,
+            Data.CellSize * 0.15
+        );
+        const double BasinRamp = FMath::Max(
+            MinimumRamp,
+            BasinInradius * 0.65
+        );
+        Lake.DepthRampWidth = FMath::Min(
+            FMath::Max(MinimumRamp, DepthRampWidth),
+            BasinRamp
+        );
         for (const FVector& Point : Lake.Shoreline)
         {
             Lake.Bounds += FVector2D(Point);
@@ -1439,6 +1508,7 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
     using namespace UE::Avenor::Geomorph;
     const double Underlying = SampleGrid(Height, Position);
     double Result = Underlying;
+    bool bInsideLake = false;
     for (const FLakeBasin& Lake : Lakes)
     {
         if (!Lake.Bounds.IsInside(Position) || Lake.Shoreline.Num() < 3)
@@ -1457,15 +1527,20 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
         );
         if (bInside)
         {
-            // The shoreline is an invariant: terrain equals the water
-            // surface at the polygon edge, then deepens smoothly inward.
-            // Assignment is intentional; Min() cannot raise an erroneously
-            // low edge to meet the lake and is what allowed floating slabs.
+            // The selected basin is a terrain bowl, not a water-shaped
+            // puddle. Its terrain rim sits slightly above the separately
+            // positioned water plane and the bed reaches full configured
+            // depth within the adaptive inward ramp.
             const double DepthAlpha = Smooth01(
                 FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0)
             );
-            Result = Lake.SurfaceHeight -
-                Lake.MaximumDepth * DepthAlpha;
+            Result = FMath::Lerp(
+                Lake.ShorelineHeight,
+                Lake.SurfaceHeight - Lake.MaximumDepth,
+                DepthAlpha
+            );
+            bInsideLake = true;
+            break;
         }
         else if (EdgeDistance < Lake.BankBlendWidth)
         {
@@ -1481,11 +1556,18 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
                 )
             );
             Result = FMath::Lerp(
-                Lake.SurfaceHeight,
+                Lake.ShorelineHeight,
                 Underlying,
                 BankAlpha
             );
         }
+    }
+    // A lake owns its enclosed basin. River reaches may terminate at or flow
+    // into the shoreline, but must not overwrite the lake bowl after it has
+    // been carved.
+    if (bInsideLake)
+    {
+        return Result;
     }
     // Evaluate every reach first, then apply exactly one continuous river
     // cross-section. Selecting the strongest local influence prevents one
@@ -1867,7 +1949,8 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.MaximumLakeArea,
             Generator.MaximumLakeCount,
             Generator.LakeBankBlendWidth,
-            Generator.LakeDepthRampWidth
+            Generator.LakeDepthRampWidth,
+            Generator.LakeSurfaceInset
         );
     }
     else
@@ -2040,7 +2123,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("5e4bb7aa-3775-4d4a-b7e8-e28ac9f47be1"));
+        return FGuid(TEXT("3291df71-a00a-48d5-8d16-37d51d965448"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
