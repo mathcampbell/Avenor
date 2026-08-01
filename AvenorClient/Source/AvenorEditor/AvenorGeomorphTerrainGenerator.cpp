@@ -1074,6 +1074,8 @@ static void ExtractRivers(
     double MountainStartArea,
     double LowlandStartArea,
     double MainRiverArea,
+    double MinimumSystemLength,
+    int32 JunctionOverlapCells,
     double HeadwaterWidth,
     double MainRiverWidth,
     double MaximumDepth,
@@ -1114,6 +1116,77 @@ static void ExtractRivers(
         Channel[Cell] =
             Data.Accumulation[Cell] >= StartArea &&
             PrimaryReceiver(Data, Cell) != INDEX_NONE;
+    }
+
+    // Keep or reject an entire connected drainage system. Short segments
+    // between nearby confluences must not disappear merely because that
+    // individual reach is shorter than the overall river.
+    TArray<int32> SystemParent;
+    SystemParent.Init(INDEX_NONE, Data.Height.Num());
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        if (Channel[Cell])
+        {
+            SystemParent[Cell] = Cell;
+        }
+    }
+    auto FindSystemRoot = [&](int32 Cell)
+    {
+        int32 Root = Cell;
+        while (SystemParent[Root] != Root)
+        {
+            Root = SystemParent[Root];
+        }
+        while (SystemParent[Cell] != Cell)
+        {
+            const int32 Next = SystemParent[Cell];
+            SystemParent[Cell] = Root;
+            Cell = Next;
+        }
+        return Root;
+    };
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        if (!Channel[Cell])
+        {
+            continue;
+        }
+        const int32 Receiver = PrimaryReceiver(Data, Cell);
+        if (Receiver == INDEX_NONE || !Channel[Receiver])
+        {
+            continue;
+        }
+        const int32 RootA = FindSystemRoot(Cell);
+        const int32 RootB = FindSystemRoot(Receiver);
+        if (RootA != RootB)
+        {
+            SystemParent[RootB] = RootA;
+        }
+    }
+    TArray<double> SystemLength;
+    SystemLength.Init(0.0, Data.Height.Num());
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        if (!Channel[Cell])
+        {
+            continue;
+        }
+        const int32 Receiver = PrimaryReceiver(Data, Cell);
+        if (Receiver != INDEX_NONE && Channel[Receiver])
+        {
+            SystemLength[FindSystemRoot(Cell)] += FVector2D::Distance(
+                Data.CellPosition(Cell),
+                Data.CellPosition(Receiver)
+            );
+        }
+    }
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        if (Channel[Cell] &&
+            SystemLength[FindSystemRoot(Cell)] < MinimumSystemLength)
+        {
+            Channel[Cell] = false;
+        }
     }
     TArray<int32> UpstreamCount;
     UpstreamCount.Init(0, Data.Height.Num());
@@ -1176,8 +1249,25 @@ static void ExtractRivers(
                 break;
             }
         }
-        if (CandidateReach.Cells.Num() >= 3)
+        if (CandidateReach.Cells.Num() >= 2)
         {
+            // Adjacent WaterBodyRiver actors are capped independently by
+            // Unreal. Extend an upstream reach a little way into the next
+            // downstream reach so confluences cannot expose a visible gap.
+            int32 OverlapCell = CandidateReach.Cells.Last();
+            for (int32 OverlapIndex = 0;
+                 OverlapIndex < JunctionOverlapCells;
+                 ++OverlapIndex)
+            {
+                const int32 Receiver = PrimaryReceiver(Data, OverlapCell);
+                if (Receiver == INDEX_NONE || !Channel[Receiver] ||
+                    CandidateReach.Cells.Contains(Receiver))
+                {
+                    break;
+                }
+                CandidateReach.Cells.Add(Receiver);
+                OverlapCell = Receiver;
+            }
             const int32 EndCell = CandidateReach.Cells.Last();
             CandidateReach.Score =
                 CandidateReach.Cells.Num() * Data.CellSize *
@@ -1685,6 +1775,8 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.MountainStreamStartArea,
             Generator.LowlandStreamStartArea,
             Generator.MainRiverArea,
+            Generator.MinimumRiverSystemLength,
+            Generator.JunctionOverlapCells,
             Generator.HeadwaterWidth,
             Generator.MainRiverWidth,
             Generator.MaximumRiverDepth,
@@ -1814,7 +1906,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("c6aa2fce-2387-4773-a7d0-eec305219ee3"));
+        return FGuid(TEXT("780fd3e8-bb30-493f-aa91-0e4b337fd48b"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
