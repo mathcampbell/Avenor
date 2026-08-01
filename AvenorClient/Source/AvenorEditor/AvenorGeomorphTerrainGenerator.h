@@ -147,7 +147,7 @@ public:
     double MountainEdgeBias = 0.58;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Mesas")
-    double MesaCoverage = 0.08;
+    double MesaCoverage = 0.03;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Mesas", meta=(Units="cm"))
     double MesaScale = 320000.0;
@@ -229,6 +229,22 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="1.0", Units="cm"))
     double MinimumLakeDepth = 100.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Lakes",
+        meta=(ClampMin="1.0", Units="cm", ToolTip="Minimum generated bed depth below the lake water surface. This is independent of the depression depth used to detect a lake.")
+    )
+    double MinimumLakeBedDepth = 800.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Lakes",
+        meta=(ClampMin="1.0", Units="cm", ToolTip="Maximum generated bed depth below the lake water surface.")
+    )
+    double MaximumLakeBedDepth = 4000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="0.01"))
     double MaximumLakeArea = 25.0;
