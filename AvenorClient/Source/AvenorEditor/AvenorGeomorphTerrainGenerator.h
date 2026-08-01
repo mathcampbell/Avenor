@@ -236,7 +236,7 @@ public:
         Category="Lakes",
         meta=(ClampMin="1.0", Units="cm", ToolTip="Minimum generated bed depth below the lake water surface. This is independent of the depression depth used to detect a lake.")
     )
-    double MinimumLakeBedDepth = 1500.0;
+    double MinimumLakeBedDepth = 2500.0;
 
     UPROPERTY(
         EditAnywhere,
@@ -244,7 +244,7 @@ public:
         Category="Lakes",
         meta=(ClampMin="1.0", Units="cm", ToolTip="Maximum generated bed depth below the lake water surface.")
     )
-    double MaximumLakeBedDepth = 6000.0;
+    double MaximumLakeBedDepth = 8000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="0.01"))
     double MaximumLakeArea = 25.0;
@@ -262,6 +262,14 @@ public:
         meta=(ClampMin="100.0", Units="cm", ToolTip="Distance inward from the shoreline over which the lake reaches its full bed depth. Kept separate from the much wider outside bank blend so small lakes are not forced to remain shallow.")
     )
     double LakeDepthRampWidth = 7500.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Lakes",
+        meta=(ClampMin="0.0", Units="cm", ToolTip="Places the final level lake water plane slightly below the generated terrain rim so the enclosed Water mesh cannot hover above its shoreline.")
+    )
+    double LakeSurfaceInset = 50.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Ocean", meta=(Units="cm"))
     double SeaLevel = -5000.0;
