@@ -112,13 +112,27 @@ public:
     double PlainsRelief = 2200.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Hills")
-    double HillsCoverage = 0.38;
+    double HillsCoverage = 0.52;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Hills", meta=(Units="cm"))
-    double HillsScale = 350000.0;
+    double HillsScale = 260000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Hills", meta=(Units="cm"))
-    double HillsRelief = 22000.0;
+    double HillsRelief = 32000.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Valleys",
+        meta=(ClampMin="0.0", ClampMax="1.0", ToolTip="Fraction of the non-mountain world influenced by broad, pre-erosion valley systems.")
+    )
+    double RegionalValleyCoverage = 0.30;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Valleys", meta=(ClampMin="50000.0", Units="cm"))
+    double RegionalValleyScale = 520000.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Valleys", meta=(ClampMin="0.0", Units="cm"))
+    double RegionalValleyDepth = 26000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Mountains")
     double MountainRangesPer100Km = 2.0;
