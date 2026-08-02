@@ -770,7 +770,11 @@ static void ApplyStreamPowerErosion(
                 0.72
             );
             Delta[Cell] = FMath::Min(
-                Data.CellSize * 0.035,
+                // Permit drainage to cut substantial connected valleys,
+                // while retaining a hard stability limit. At the default
+                // 100 m analysis cell this is 20 m per iteration, not the
+                // unsafe 200 m permitted by a 2.0-cell cap.
+                Data.CellSize * 0.20,
                 Strength * 760.0 * AreaFactor * SlopeFactor
             );
         }
@@ -1208,8 +1212,9 @@ static void ExtractLakes(
             MinimumRamp,
             BasinInradius * 0.65
         );
-        Lake.DepthRampWidth = FMath::Min(
-            FMath::Max(MinimumRamp, DepthRampWidth),
+        Lake.DepthRampWidth = FMath::Clamp(
+            FMath::Max(DepthRampWidth, BasinInradius * 0.35),
+            MinimumRamp,
             BasinRamp
         );
         for (const FVector& Point : Lake.Shoreline)
@@ -1635,9 +1640,24 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
             const double DepthAlpha = Smooth01(
                 FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0)
             );
+            // Retain a level water surface but give the submerged terrain a
+            // broad, bounded variation. The radial depth ramp still controls
+            // the shore, so this cannot create steps or lift the bed through
+            // the water plane at the lake edge.
+            const double BedNoise = Fbm(
+                Position,
+                FMath::Max(Radius * 2.0, CellSize * 2.0),
+                FVector2D(4231.0, -8877.0),
+                3
+            );
+            const double BedDepth = Lake.MaximumDepth * FMath::Clamp(
+                0.86 + 0.14 * BedNoise,
+                0.72,
+                1.0
+            );
             Result = FMath::Lerp(
                 Lake.ShorelineHeight,
-                Lake.SurfaceHeight - Lake.MaximumDepth,
+                Lake.SurfaceHeight - BedDepth,
                 DepthAlpha
             );
             bInsideLake = true;
@@ -2233,7 +2253,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("98f53baf-96e8-4786-a892-4c3e50aeb2ec"));
+        return FGuid(TEXT("59340d49-a73d-41aa-89c8-358c76cd6e10"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -2481,30 +2501,13 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
     }
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
-        // A lake must remain level, so it cannot independently snap every
-        // spline point to an uneven rim. Instead perform the physical
-        // equivalent: sample the completed carved terrain along the final
-        // contour and put the complete water plane just below its lowest rim
-        // point. This is deliberately the last operation before actor spawn.
-        TArray<FVector> LakePoints = Data->Lakes[Index].Shoreline;
-        double LowestRimHeight = TNumericLimits<double>::Max();
-        for (const FVector& Point : LakePoints)
-        {
-            LowestRimHeight = FMath::Min(
-                LowestRimHeight,
-                Data->SampleHeight(FVector2D(Point))
-            );
-        }
-        if (LowestRimHeight < TNumericLimits<double>::Max())
-        {
-            const double SnappedSurface = LowestRimHeight -
-                FMath::Max(0.0, LakeSurfaceInset);
-            for (FVector& Point : LakePoints)
-            {
-                Point.Z = SnappedSurface;
-            }
-        }
-        LakePoints = ToWorldPoints(LakePoints);
+        // ExtractLakes establishes one level shoreline from the natural rim
+        // and SampleHeight carves the terrain against that same value. Do not
+        // derive a second actor-only height here: that permits the visible
+        // water and the generated shore to disagree after interpolation.
+        TArray<FVector> LakePoints = ToWorldPoints(
+            Data->Lakes[Index].Shoreline
+        );
         if (AWaterBodyLake* Lake = SpawnWaterActor<AWaterBodyLake>(
             *World,
             FString::Printf(TEXT("Avenor_Geomorph_Lake_%02d"), Index + 1)
