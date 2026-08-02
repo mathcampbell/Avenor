@@ -7,6 +7,21 @@
 **/Intermediate/**
 **/Saved/**
 
+# ------------------------------------------------------------
+# Generated World Partition / HLOD data
+#
+# Keep authored Unreal content in Git LFS, but ignore the disposable
+# actor shards and HLOD products created for generated terrain maps.
+# ------------------------------------------------------------
+
+**/Content/**/HLOD/**
+**/Content/**/HLODs/**
+**/Content/**/*_HLOD_*.uasset
+**/Content/**/Avenor_WorldNew/**
+**/Content/**/Avenor_WorldNew*.uasset
+**/Content/**/Avenor_WorldNew*.umap
+**/Content/**/MPD_AvenorDefinition.uasset
+
 # Generated directories inside plugins
 **/Plugins/**/Binaries/**
 **/Plugins/**/Intermediate/**
@@ -16,7 +31,11 @@
 # ------------------------------------------------------------
 
 **/.vs/
+**/.vscode/
+**/.idea/
 *.sln
+*.slnx
+*.code-workspace
 *.suo
 *.opensdf
 *.sdf
