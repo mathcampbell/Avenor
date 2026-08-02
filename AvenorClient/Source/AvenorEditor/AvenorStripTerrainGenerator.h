@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "MeshPartition.h"
+#include "MeshPartitionModifierComponent.h"
 
 #include "AvenorStripTerrainGenerator.generated.h"
 
