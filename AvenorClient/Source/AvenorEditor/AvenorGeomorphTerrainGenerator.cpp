@@ -926,13 +926,48 @@ static TArray<FVector> TraceComponentBoundary(
             SurfaceHeight
         );
     }
-    // The component boundary begins on the hydrology raster. A third
-    // area-preserving corner-cutting pass and denser resampling remove the
-    // remaining cell-sized square shoulders without inventing a new lake.
-    Boundary = ChaikinSmooth(Boundary, true, 3);
+    // The component boundary begins on the square hydrology raster. Rounding
+    // its corners alone leaves long axis-aligned sides, so perturb the already
+    // smoothed contour along its local normal with broad deterministic noise.
+    // Terrain carving and the Water spline both consume this same contour.
+    Boundary = ChaikinSmooth(Boundary, true, 2);
+    TArray<FVector> OrganicBoundary = Boundary;
+    for (int32 Index = 0; Index < Boundary.Num(); ++Index)
+    {
+        const FVector2D Previous(
+            Boundary[(Index - 1 + Boundary.Num()) % Boundary.Num()]
+        );
+        const FVector2D Next(
+            Boundary[(Index + 1) % Boundary.Num()]
+        );
+        FVector2D Tangent = Next - Previous;
+        if (!Tangent.Normalize())
+        {
+            continue;
+        }
+        const FVector2D Normal = Rotate90(Tangent);
+        const double Offset = Noise(
+            FVector2D(Boundary[Index]),
+            FMath::Max(Data.CellSize * 4.5, 1.0),
+            FVector2D(17321.0, 91453.0)
+        ) * Data.CellSize * 0.38;
+        OrganicBoundary[Index].X += Normal.X * Offset;
+        OrganicBoundary[Index].Y += Normal.Y * Offset;
+        OrganicBoundary[Index].X = FMath::Clamp(
+            OrganicBoundary[Index].X,
+            Data.Bounds.Min.X,
+            Data.Bounds.Max.X
+        );
+        OrganicBoundary[Index].Y = FMath::Clamp(
+            OrganicBoundary[Index].Y,
+            Data.Bounds.Min.Y,
+            Data.Bounds.Max.Y
+        );
+    }
+    Boundary = ChaikinSmooth(OrganicBoundary, true, 2);
     return ResamplePolyline(
         Boundary,
-        FMath::Max(Data.CellSize * 0.28, 2000.0),
+        FMath::Max(Data.CellSize * 0.25, 1800.0),
         true
     );
 }
@@ -945,6 +980,7 @@ static void ExtractLakes(
     double MaximumBedDepth,
     double MaximumArea,
     int32 MaximumCount,
+    double MaximumCoverageFraction,
     double BankBlendWidth,
     double DepthRampWidth,
     double SurfaceInset
@@ -963,8 +999,8 @@ static void ExtractLakes(
     // terrain at its edge. A small threshold rejects Priority-Flood's
     // drainage epsilon while retaining the real basin up to its shoreline.
     const double ShorelineFillThreshold = FMath::Max(
-        1.0,
-        MinimumDepth * 0.05
+        50.0,
+        MinimumDepth * 0.5
     );
     for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
     {
@@ -1041,10 +1077,26 @@ static void ExtractLakes(
         const double ScoreB = B.CatchmentArea * FMath::Sqrt(B.MaximumDepth);
         return ScoreA > ScoreB;
     });
-    const int32 Count = FMath::Min(MaximumCount, Basins.Num());
-    for (int32 BasinIndex = 0; BasinIndex < Count; ++BasinIndex)
+    const double WorldArea = Data.Height.Num() *
+        Data.CellAreaSquareKilometres();
+    const double MaximumTotalLakeArea = WorldArea * FMath::Clamp(
+        MaximumCoverageFraction,
+        0.0,
+        0.5
+    );
+    double AcceptedLakeArea = 0.0;
+    for (int32 BasinIndex = 0;
+         BasinIndex < Basins.Num() && Data.Lakes.Num() < MaximumCount;
+         ++BasinIndex)
     {
         const FLakeCandidate& CandidateBasin = Basins[BasinIndex];
+        const double BasinArea = CandidateBasin.Cells.Num() *
+            Data.CellAreaSquareKilometres();
+        if (BasinArea <= 0.0 ||
+            AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
+        {
+            continue;
+        }
         FLakeBasin Lake;
         Lake.SurfaceHeight = CandidateBasin.SurfaceHeight;
         Lake.MaximumDepth = FMath::Clamp(
@@ -1141,6 +1193,7 @@ static void ExtractLakes(
         {
             Data.LakeIndex[Cell] = NewLakeIndex;
         }
+        AcceptedLakeArea += BasinArea;
         Data.Lakes.Add(MoveTemp(Lake));
     }
 }
@@ -1445,7 +1498,23 @@ static void ExtractRivers(
                 MainRiverSurfaceInset,
                 LocalAlpha
             );
-            Point.Z = Data.SampleGrid(Data.Height, Position) - SurfaceInset;
+            // This is the actual geomorphic valley incision. Previously the
+            // computed ValleyDepth was stored later but never affected the
+            // centreline elevation, leaving a nearly level board with only a
+            // shallow water-width notch in it.
+            double ValleyInset = bValleys
+                ? FMath::Lerp(
+                    MaximumValleyDepth * 0.12,
+                    MaximumValleyDepth,
+                    LocalAlpha
+                )
+                : 0.0;
+            if (bCanyons && LocalArea >= CanyonStartArea)
+            {
+                ValleyInset *= 1.2;
+            }
+            Point.Z = Data.SampleGrid(Data.Height, Position) -
+                SurfaceInset - ValleyInset;
         }
         EnforceDownhill(Points);
 
@@ -1959,6 +2028,7 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.MaximumLakeBedDepth,
             Generator.MaximumLakeArea,
             Generator.MaximumLakeCount,
+            Generator.MaximumLakeCoverageFraction,
             Generator.LakeBankBlendWidth,
             Generator.LakeDepthRampWidth,
             Generator.LakeSurfaceInset
@@ -2134,7 +2204,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("924e33cb-b2d3-44bc-8e19-a7b8baec1b79"));
+        return FGuid(TEXT("e0f1c01d-d8c8-43ac-8a65-4498bd94bf3c"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -2382,6 +2452,30 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
     }
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
+        // A lake must remain level, so it cannot independently snap every
+        // spline point to an uneven rim. Instead perform the physical
+        // equivalent: sample the completed carved terrain along the final
+        // contour and put the complete water plane just below its lowest rim
+        // point. This is deliberately the last operation before actor spawn.
+        TArray<FVector> LakePoints = Data->Lakes[Index].Shoreline;
+        double LowestRimHeight = TNumericLimits<double>::Max();
+        for (const FVector& Point : LakePoints)
+        {
+            LowestRimHeight = FMath::Min(
+                LowestRimHeight,
+                Data->SampleHeight(FVector2D(Point))
+            );
+        }
+        if (LowestRimHeight < TNumericLimits<double>::Max())
+        {
+            const double SnappedSurface = LowestRimHeight -
+                FMath::Max(0.0, LakeSurfaceInset);
+            for (FVector& Point : LakePoints)
+            {
+                Point.Z = SnappedSurface;
+            }
+        }
+        LakePoints = ToWorldPoints(LakePoints);
         if (AWaterBodyLake* Lake = SpawnWaterActor<AWaterBodyLake>(
             *World,
             FString::Printf(TEXT("Avenor_Geomorph_Lake_%02d"), Index + 1)
@@ -2390,7 +2484,7 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
             DisableSecondaryTerrainCarving(*Lake);
             ConfigureExactSpline(
                 *Lake->GetWaterBodyComponent()->GetWaterSpline(),
-                ToWorldPoints(Data->Lakes[Index].Shoreline),
+                LakePoints,
                 true
             );
             Lake->PostEditChange();
@@ -2399,7 +2493,7 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
             // and terrain carving continue to consume identical geometry.
             ConfigureExactSpline(
                 *Lake->GetWaterBodyComponent()->GetWaterSpline(),
-                ToWorldPoints(Data->Lakes[Index].Shoreline),
+                LakePoints,
                 true
             );
             Lake->GetWaterBodyComponent()->GetWaterSpline()
@@ -2409,6 +2503,13 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
     }
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
+        TArray<FVector> RiverPoints = ToWorldPoints(
+            Data->Rivers[Index].Points
+        );
+        for (FVector& Point : RiverPoints)
+        {
+            Point.Z -= FMath::Max(0.0, RiverWaterMeshInset);
+        }
         if (AWaterBodyRiver* River = SpawnWaterActor<AWaterBodyRiver>(
             *World,
             FString::Printf(TEXT("Avenor_Geomorph_River_%03d"), Index + 1)
@@ -2417,7 +2518,7 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
             DisableSecondaryTerrainCarving(*River);
             ConfigureRiverSpline(
                 *River->GetWaterBodyComponent()->GetWaterSpline(),
-                ToWorldPoints(Data->Rivers[Index].Points),
+                RiverPoints,
                 Data->Rivers[Index].Width,
                 Data->Rivers[Index].Depth
             );
@@ -2427,7 +2528,7 @@ void AAvenorGeomorphTerrainGenerator::CreateWaterActors(
             // otherwise the visible sheet can be much wider than its carve.
             ConfigureRiverSpline(
                 *River->GetWaterBodyComponent()->GetWaterSpline(),
-                ToWorldPoints(Data->Rivers[Index].Points),
+                RiverPoints,
                 Data->Rivers[Index].Width,
                 Data->Rivers[Index].Depth
             );
@@ -2826,8 +2927,8 @@ static double EvaluateLandform(
             4
         );
         const double ValleyShape = FMath::Pow(
-            Smooth01((ValleyNetwork - 0.30) / 0.58),
-            1.45
+            Smooth01((ValleyNetwork - 0.52) / 0.36),
+            1.2
         );
         const double MountainProtection = 1.0 - OutMountain * 0.35;
         RegionalValleyHeight = -ValleyDepth * RegionMask *
