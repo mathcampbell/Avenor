@@ -1614,6 +1614,7 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
     const double Underlying = SampleGrid(Height, Position);
     double Result = Underlying;
     bool bInsideLake = false;
+    bool bNearLakeBank = false;
     for (const FLakeBasin& Lake : Lakes)
     {
         if (!Lake.Bounds.IsInside(Position) || Lake.Shoreline.Num() < 3)
@@ -1680,12 +1681,20 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
                 Underlying,
                 BankAlpha
             );
+            bNearLakeBank = true;
         }
     }
     // A lake owns its enclosed basin. River reaches may terminate at or flow
     // into the shoreline, but must not overwrite the lake bowl after it has
     // been carved.
     if (bInsideLake)
+    {
+        return Result;
+    }
+    // River reaches commonly meet lakes inside this shoreline transition.
+    // Preserve the lake-owned rim here so the independently calculated river
+    // valley cannot lower or raise the terrain away from the lake water plane.
+    if (bNearLakeBank)
     {
         return Result;
     }
@@ -2252,7 +2261,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("39d91872-8c57-4fbb-9dc0-78cc2e0a5d11"));
+        return FGuid(TEXT("94f2723b-642d-46b0-8831-e3a4dac3c452"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
