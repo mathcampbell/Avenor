@@ -770,11 +770,7 @@ static void ApplyStreamPowerErosion(
                 0.72
             );
             Delta[Cell] = FMath::Min(
-                // Permit drainage to cut substantial connected valleys,
-                // while retaining a hard stability limit. At the default
-                // 100 m analysis cell this is 20 m per iteration, not the
-                // unsafe 200 m permitted by a 2.0-cell cap.
-                Data.CellSize * 0.20,
+                Data.CellSize * 0.035,
                 Strength * 760.0 * AreaFactor * SlopeFactor
             );
         }
@@ -989,15 +985,15 @@ static TArray<FVector> TraceComponentBoundary(
 
     // Restore the original shoreline construction: the raster selects the
     // filled basin, but its contour is sampled where the continuous terrain
-    // crosses the lake surface. Keeping a bounded number of controls before
-    // smoothing prevents cell-sized stair steps from surviving as topology.
-    TArray<FVector> Reduced;
-    const int32 BoundaryStride = FMath::Max(1, Boundary.Num() / 32);
-    for (int32 Index = 0; Index < Boundary.Num(); Index += BoundaryStride)
-    {
-        Reduced.Add(Boundary[Index]);
-    }
-    Boundary = ChaikinSmooth(Reduced, true, 3);
+    // crosses the lake surface. Simplification must use world-space spacing,
+    // not an arbitrary maximum point count: fixed-count reduction displaced
+    // large shorelines much more severely than small ones.
+    TArray<FVector> Reduced = ResamplePolyline(
+        Boundary,
+        FMath::Max(Data.CellSize, 3500.0),
+        true
+    );
+    Boundary = ChaikinSmooth(Reduced, true, 2);
     return ResamplePolyline(
         Boundary,
         FMath::Max(Data.CellSize * 0.40, 2500.0),
@@ -1634,9 +1630,9 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
         if (bInside)
         {
             // The selected basin is a terrain bowl, not a water-shaped
-            // puddle. Its terrain rim sits slightly above the separately
-            // positioned water plane and the bed reaches full configured
-            // depth within the adaptive inward ramp.
+            // puddle. At zero edge distance the terrain is exactly the water
+            // surface; inward it falls to the bed and outward the bank rises
+            // back toward the untouched land.
             const double DepthAlpha = Smooth01(
                 FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0)
             );
@@ -1656,7 +1652,7 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
                 1.0
             );
             Result = FMath::Lerp(
-                Lake.ShorelineHeight,
+                Lake.SurfaceHeight,
                 Lake.SurfaceHeight - BedDepth,
                 DepthAlpha
             );
@@ -1677,7 +1673,7 @@ double FAvenorGeomorphData::SampleHeight(const FVector2D& Position) const
                 )
             );
             Result = FMath::Lerp(
-                Lake.ShorelineHeight,
+                Lake.SurfaceHeight,
                 Underlying,
                 BankAlpha
             );
@@ -2253,7 +2249,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("59340d49-a73d-41aa-89c8-358c76cd6e10"));
+        return FGuid(TEXT("dbdaf4a0-71fd-46ed-a8fd-6667cbf0fe10"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
