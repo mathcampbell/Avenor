@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "{FE6DFDF5-49C6-8531-3768-6C88E8220D1F}",
+	"EngineAssociation": "5.8",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -66,6 +66,14 @@
 		},
 		{
 			"Name": "MeshTerrainMode",
+			"Enabled": true
+		},
+		{
+			"Name": "ModelContextProtocol",
+			"Enabled": true
+		},
+		{
+			"Name": "Terminal",
 			"Enabled": true
 		}
 	],
