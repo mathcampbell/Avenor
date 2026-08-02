@@ -126,13 +126,13 @@ public:
         Category="Valleys",
         meta=(ClampMin="0.0", ClampMax="1.0", ToolTip="Fraction of the non-mountain world influenced by broad, pre-erosion valley systems.")
     )
-    double RegionalValleyCoverage = 0.30;
+    double RegionalValleyCoverage = 0.38;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Valleys", meta=(ClampMin="50000.0", Units="cm"))
-    double RegionalValleyScale = 520000.0;
+    double RegionalValleyScale = 650000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Valleys", meta=(ClampMin="0.0", Units="cm"))
-    double RegionalValleyDepth = 26000.0;
+    double RegionalValleyDepth = 42000.0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Mountains")
     double MountainRangesPer100Km = 2.0;
@@ -220,6 +220,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(ClampMin="0.0", Units="cm"))
     double MainRiverSurfaceInset = 900.0;
 
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Rivers",
+        meta=(ClampMin="0.0", Units="cm", ToolTip="Additional visual-only lowering of the Unreal Water river mesh into the already carved wet channel.")
+    )
+    double RiverWaterMeshInset = 100.0;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Rivers", meta=(Units="cm"))
     double HeadwaterValleyHalfWidth = 14000.0;
 
@@ -265,6 +273,14 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(ClampMin="0", ClampMax="64"))
     int32 MaximumLakeCount = 12;
+
+    UPROPERTY(
+        EditAnywhere,
+        BlueprintReadWrite,
+        Category="Lakes",
+        meta=(ClampMin="0.0", ClampMax="0.5", ToolTip="Hard cap on the fraction of the complete generated world that may be covered by accepted lake basins.")
+    )
+    double MaximumLakeCoverageFraction = 0.08;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Lakes", meta=(Units="cm"))
     double LakeBankBlendWidth = 24000.0;
