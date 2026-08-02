@@ -821,19 +821,13 @@ struct FLakeCandidate
     double CatchmentArea = 0.0;
 };
 
-static int64 CornerKey(int32 X, int32 Y)
+struct FLakeBoundaryEdge
 {
-    return (static_cast<int64>(X) << 32) |
-        static_cast<uint32>(Y);
-}
-
-static FIntPoint DecodeCorner(int64 Key)
-{
-    return FIntPoint(
-        static_cast<int32>(Key >> 32),
-        static_cast<int32>(static_cast<uint32>(Key))
-    );
-}
+    FIntPoint Start;
+    FIntPoint End;
+    FVector2D Position = FVector2D::ZeroVector;
+    bool bUsed = false;
+};
 
 static TArray<FVector> TraceComponentBoundary(
     const FAvenorGeomorphData& Data,
@@ -847,10 +841,44 @@ static TArray<FVector> TraceComponentBoundary(
     {
         Membership.Add(Cell);
     }
-    TMap<int64, int64> NextCorner;
-    auto AddEdge = [&](int32 AX, int32 AY, int32 BX, int32 BY)
+    TArray<FLakeBoundaryEdge> Edges;
+    auto AddEdge = [&Data, SurfaceHeight, &Edges](
+        int32 Cell,
+        int32 OutsideX,
+        int32 OutsideY,
+        const FIntPoint& Start,
+        const FIntPoint& End)
     {
-        NextCorner.Add(CornerKey(AX, AY), CornerKey(BX, BY));
+        FVector2D Position;
+        if (Data.IsValid(OutsideX, OutsideY))
+        {
+            const int32 Outside = Data.Index(OutsideX, OutsideY);
+            const double InsideHeight = Data.Height[Cell];
+            const double OutsideHeight = Data.Height[Outside];
+            const double Denominator = OutsideHeight - InsideHeight;
+            const double Alpha = FMath::Abs(Denominator) > 1.0
+                ? FMath::Clamp(
+                    (SurfaceHeight - InsideHeight) / Denominator,
+                    0.05,
+                    0.95
+                )
+                : 0.5;
+            Position = FMath::Lerp(
+                Data.CellPosition(Cell),
+                Data.CellPosition(Outside),
+                Alpha
+            );
+        }
+        else
+        {
+            Position = FVector2D(
+                Data.Bounds.Min.X +
+                    (Start.X + End.X) * 0.5 * Data.CellSize,
+                Data.Bounds.Min.Y +
+                    (Start.Y + End.Y) * 0.5 * Data.CellSize
+            );
+        }
+        Edges.Add({Start, End, Position, false});
     };
     for (int32 Cell : Cells)
     {
@@ -858,116 +886,117 @@ static TArray<FVector> TraceComponentBoundary(
         const int32 Y = Cell / Data.Columns;
         if (Y == 0 || !Membership.Contains(Data.Index(X, Y - 1)))
         {
-            AddEdge(X, Y, X + 1, Y);
+            AddEdge(
+                Cell,
+                X,
+                Y - 1,
+                FIntPoint(X, Y),
+                FIntPoint(X + 1, Y)
+            );
         }
         if (X + 1 >= Data.Columns ||
             !Membership.Contains(Data.Index(X + 1, Y)))
         {
-            AddEdge(X + 1, Y, X + 1, Y + 1);
+            AddEdge(
+                Cell,
+                X + 1,
+                Y,
+                FIntPoint(X + 1, Y),
+                FIntPoint(X + 1, Y + 1)
+            );
         }
         if (Y + 1 >= Data.Rows ||
             !Membership.Contains(Data.Index(X, Y + 1)))
         {
-            AddEdge(X + 1, Y + 1, X, Y + 1);
+            AddEdge(
+                Cell,
+                X,
+                Y + 1,
+                FIntPoint(X + 1, Y + 1),
+                FIntPoint(X, Y + 1)
+            );
         }
         if (X == 0 || !Membership.Contains(Data.Index(X - 1, Y)))
         {
-            AddEdge(X, Y + 1, X, Y);
+            AddEdge(
+                Cell,
+                X - 1,
+                Y,
+                FIntPoint(X, Y + 1),
+                FIntPoint(X, Y)
+            );
         }
     }
-    if (NextCorner.IsEmpty())
+    if (Edges.IsEmpty())
     {
         return {};
     }
 
-    TArray<TArray<int64>> Loops;
-    while (!NextCorner.IsEmpty())
-    {
-        const int64 Start = NextCorner.CreateConstIterator().Key();
-        int64 Current = Start;
-        TArray<int64> Loop;
-        for (int32 Guard = 0;
-             Guard <= Cells.Num() * 8 + 16;
-             ++Guard)
-        {
-            Loop.Add(Current);
-            int64 Next = 0;
-            if (!NextCorner.RemoveAndCopyValue(Current, Next))
-            {
-                break;
-            }
-            Current = Next;
-            if (Current == Start)
-            {
-                break;
-            }
-        }
-        if (Loop.Num() >= 4)
-        {
-            Loops.Add(MoveTemp(Loop));
-        }
-    }
-    if (Loops.IsEmpty())
-    {
-        return {};
-    }
-    Loops.Sort([](const TArray<int64>& A, const TArray<int64>& B)
-    {
-        return A.Num() > B.Num();
-    });
     TArray<FVector> Boundary;
-    Boundary.Reserve(Loops[0].Num());
-    for (int64 Key : Loops[0])
+    for (int32 StartIndex = 0; StartIndex < Edges.Num(); ++StartIndex)
     {
-        const FIntPoint Corner = DecodeCorner(Key);
-        Boundary.Emplace(
-            Data.Bounds.Min.X + Corner.X * Data.CellSize,
-            Data.Bounds.Min.Y + Corner.Y * Data.CellSize,
-            SurfaceHeight
-        );
-    }
-    // The component boundary begins on the square hydrology raster. Rounding
-    // its corners alone leaves long axis-aligned sides, so perturb the already
-    // smoothed contour along its local normal with broad deterministic noise.
-    // Terrain carving and the Water spline both consume this same contour.
-    Boundary = ChaikinSmooth(Boundary, true, 2);
-    TArray<FVector> OrganicBoundary = Boundary;
-    for (int32 Index = 0; Index < Boundary.Num(); ++Index)
-    {
-        const FVector2D Previous(
-            Boundary[(Index - 1 + Boundary.Num()) % Boundary.Num()]
-        );
-        const FVector2D Next(
-            Boundary[(Index + 1) % Boundary.Num()]
-        );
-        FVector2D Tangent = Next - Previous;
-        if (!Tangent.Normalize())
+        if (Edges[StartIndex].bUsed)
         {
             continue;
         }
-        const FVector2D Normal = Rotate90(Tangent);
-        const double Offset = Noise(
-            FVector2D(Boundary[Index]),
-            FMath::Max(Data.CellSize * 4.5, 1.0),
-            FVector2D(17321.0, 91453.0)
-        ) * Data.CellSize * 0.38;
-        OrganicBoundary[Index].X += Normal.X * Offset;
-        OrganicBoundary[Index].Y += Normal.Y * Offset;
-        OrganicBoundary[Index].X = FMath::Clamp(
-            OrganicBoundary[Index].X,
-            Data.Bounds.Min.X,
-            Data.Bounds.Max.X
-        );
-        OrganicBoundary[Index].Y = FMath::Clamp(
-            OrganicBoundary[Index].Y,
-            Data.Bounds.Min.Y,
-            Data.Bounds.Max.Y
-        );
+        TArray<FVector> Loop;
+        int32 EdgeIndex = StartIndex;
+        const FIntPoint First = Edges[StartIndex].Start;
+        for (int32 Guard = 0; Guard <= Edges.Num(); ++Guard)
+        {
+            FLakeBoundaryEdge& Edge = Edges[EdgeIndex];
+            if (Edge.bUsed)
+            {
+                break;
+            }
+            Edge.bUsed = true;
+            Loop.Emplace(Edge.Position.X, Edge.Position.Y, SurfaceHeight);
+            if (Edge.End == First)
+            {
+                break;
+            }
+            EdgeIndex = INDEX_NONE;
+            for (int32 CandidateIndex = 0;
+                 CandidateIndex < Edges.Num();
+                 ++CandidateIndex)
+            {
+                if (!Edges[CandidateIndex].bUsed &&
+                    Edges[CandidateIndex].Start == Edge.End)
+                {
+                    EdgeIndex = CandidateIndex;
+                    break;
+                }
+            }
+            if (EdgeIndex == INDEX_NONE)
+            {
+                Loop.Reset();
+                break;
+            }
+        }
+        if (Loop.Num() > Boundary.Num())
+        {
+            Boundary = MoveTemp(Loop);
+        }
     }
-    Boundary = ChaikinSmooth(OrganicBoundary, true, 2);
+    if (Boundary.Num() < 4)
+    {
+        return {};
+    }
+
+    // Restore the original shoreline construction: the raster selects the
+    // filled basin, but its contour is sampled where the continuous terrain
+    // crosses the lake surface. Keeping a bounded number of controls before
+    // smoothing prevents cell-sized stair steps from surviving as topology.
+    TArray<FVector> Reduced;
+    const int32 BoundaryStride = FMath::Max(1, Boundary.Num() / 32);
+    for (int32 Index = 0; Index < Boundary.Num(); Index += BoundaryStride)
+    {
+        Reduced.Add(Boundary[Index]);
+    }
+    Boundary = ChaikinSmooth(Reduced, true, 3);
     return ResamplePolyline(
         Boundary,
-        FMath::Max(Data.CellSize * 0.25, 1800.0),
+        FMath::Max(Data.CellSize * 0.40, 2500.0),
         true
     );
 }
@@ -999,8 +1028,8 @@ static void ExtractLakes(
     // terrain at its edge. A small threshold rejects Priority-Flood's
     // drainage epsilon while retaining the real basin up to its shoreline.
     const double ShorelineFillThreshold = FMath::Max(
-        50.0,
-        MinimumDepth * 0.5
+        1.0,
+        MinimumDepth * 0.05
     );
     for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
     {
@@ -2204,7 +2233,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("e0f1c01d-d8c8-43ac-8a65-4498bd94bf3c"));
+        return FGuid(TEXT("98f53baf-96e8-4786-a892-4c3e50aeb2ec"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
