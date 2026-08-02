@@ -926,10 +926,13 @@ static TArray<FVector> TraceComponentBoundary(
             SurfaceHeight
         );
     }
-    Boundary = ChaikinSmooth(Boundary, true, 2);
+    // The component boundary begins on the hydrology raster. A third
+    // area-preserving corner-cutting pass and denser resampling remove the
+    // remaining cell-sized square shoulders without inventing a new lake.
+    Boundary = ChaikinSmooth(Boundary, true, 3);
     return ResamplePolyline(
         Boundary,
-        FMath::Max(Data.CellSize * 0.45, 2500.0),
+        FMath::Max(Data.CellSize * 0.28, 2000.0),
         true
     );
 }
@@ -1795,12 +1798,16 @@ static double EvaluateLandform(
     bool bHills,
     bool bMountains,
     bool bMesas,
+    bool bValleys,
     bool bOcean,
     double PlainsCoverage,
     double PlainsRelief,
     double HillsCoverage,
     double HillsScale,
     double HillsRelief,
+    double ValleyCoverage,
+    double ValleyScale,
+    double ValleyDepth,
     int32 MesaTerraces,
     double SeaLevel,
     double OceanDepth,
@@ -1900,12 +1907,16 @@ static TSharedPtr<FAvenorGeomorphData> GenerateData(
             Generator.bGenerateRollingHills,
             Generator.bGenerateMountains,
             Generator.bGenerateMesas,
+            Generator.bGenerateValleys,
             Generator.bGenerateOcean,
             Generator.PlainsCoverage,
             Generator.PlainsRelief,
             Generator.HillsCoverage,
             Generator.HillsScale,
             Generator.HillsRelief,
+            Generator.RegionalValleyCoverage,
+            Generator.RegionalValleyScale,
+            Generator.RegionalValleyDepth,
             Generator.MesaTerraces,
             Generator.SeaLevel,
             Generator.OceanDepth,
@@ -2123,7 +2134,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("3291df71-a00a-48d5-8d16-37d51d965448"));
+        return FGuid(TEXT("924e33cb-b2d3-44bc-8e19-a7b8baec1b79"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
@@ -2616,12 +2627,16 @@ static double EvaluateLandform(
     bool bHills,
     bool bMountains,
     bool bMesas,
+    bool bValleys,
     bool bOcean,
     double PlainsCoverage,
     double PlainsRelief,
     double HillsCoverage,
     double HillsScale,
     double HillsRelief,
+    double ValleyCoverage,
+    double ValleyScale,
+    double ValleyDepth,
     int32 MesaTerraces,
     double SeaLevel,
     double OceanDepth,
@@ -2654,21 +2669,46 @@ static double EvaluateLandform(
     const double Base = Fbm(
         Warped, 2200000.0, SeedOffset + FVector2D(101.0, 43.0), 4
     ) * (bPlains ? PlainsRelief : 0.0);
+    // Hills need their own regional selector. Reusing Regional made a seed
+    // capable of classifying nearly the entire short test world as plains,
+    // which suppressed the requested rolling relief everywhere at once.
+    const double HillRegion = 0.5 + 0.5 * Fbm(
+        Warped,
+        FMath::Max(HillsScale * 2.8, 650000.0),
+        SeedOffset + FVector2D(811.0, 463.0),
+        3,
+        0.55,
+        2.01
+    );
+    const double HillThreshold =
+        1.0 - FMath::Clamp(HillsCoverage, 0.0, 1.0);
     const double HillMask = bHills
-        ? Smooth01(
-            (Regional - (1.0 - FMath::Clamp(HillsCoverage, 0.0, 1.0))) /
-                0.28
-        ) * (1.0 - OutPlain * 0.72)
+        ? Smooth01((HillRegion - (HillThreshold - 0.16)) / 0.32) *
+            (1.0 - OutPlain * 0.18)
         : 0.0;
+    const double HillMacro = Fbm(
+        Warped,
+        FMath::Max(HillsScale, 1.0),
+        SeedOffset + FVector2D(887.0, 157.0),
+        5,
+        0.54,
+        2.03
+    );
+    const double HillDetail = Fbm(
+        Warped,
+        FMath::Max(HillsScale * 0.43, 1.0),
+        SeedOffset + FVector2D(421.0, 997.0),
+        3,
+        0.5,
+        2.07
+    );
+    const double ShapedHillMacro = FMath::Sign(HillMacro) * FMath::Pow(
+        FMath::Abs(HillMacro),
+        0.72
+    );
     const double Hills = bHills
-        ? Fbm(
-            Warped,
-            HillsScale,
-            SeedOffset + FVector2D(887.0, 157.0),
-            5,
-            0.54,
-            2.03
-        ) * HillsRelief * HillMask
+        ? (ShapedHillMacro * 0.78 + HillDetail * 0.22) *
+            HillsRelief * HillMask
         : 0.0;
 
     double MountainHeight = 0.0;
@@ -2760,7 +2800,42 @@ static double EvaluateLandform(
         }
     }
 
-    double Height = Base + Hills + MountainHeight + MesaHeight;
+    // These broad valleys exist in the initial landform, before erosion and
+    // flow accumulation. Hydrology therefore follows them instead of valleys
+    // appearing only as a cosmetic widening around an extracted river.
+    double RegionalValleyHeight = 0.0;
+    if (bValleys && ValleyCoverage > 0.0 && ValleyDepth > 0.0)
+    {
+        const double ValleyRegion = 0.5 + 0.5 * Fbm(
+            Warped,
+            FMath::Max(ValleyScale * 2.35, 1.0),
+            SeedOffset + FVector2D(613.0, 109.0),
+            3,
+            0.56,
+            2.0
+        );
+        const double ValleyThreshold =
+            1.0 - FMath::Clamp(ValleyCoverage, 0.0, 1.0);
+        const double RegionMask = Smooth01(
+            (ValleyRegion - (ValleyThreshold - 0.18)) / 0.36
+        );
+        const double ValleyNetwork = RidgedFbm(
+            Warped,
+            FMath::Max(ValleyScale, 1.0),
+            SeedOffset + FVector2D(229.0, 853.0),
+            4
+        );
+        const double ValleyShape = FMath::Pow(
+            Smooth01((ValleyNetwork - 0.30) / 0.58),
+            1.45
+        );
+        const double MountainProtection = 1.0 - OutMountain * 0.35;
+        RegionalValleyHeight = -ValleyDepth * RegionMask *
+            ValleyShape * MountainProtection;
+    }
+
+    double Height = Base + Hills + RegionalValleyHeight +
+        MountainHeight + MesaHeight;
     if (bOcean)
     {
         const double WidthDistance = LongAxis == EAvenorWorldLongAxis::X
