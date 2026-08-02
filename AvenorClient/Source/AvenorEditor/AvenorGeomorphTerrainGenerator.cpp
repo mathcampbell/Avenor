@@ -1023,13 +1023,16 @@ static void ExtractLakes(
     }
     TArray<bool> Candidate;
     Candidate.Init(false, Data.Height.Num());
-    // Trace the complete flooded footprint, not merely its deep core. The
-    // latter produces a water polygon whose nominal surface is above the
-    // terrain at its edge. A small threshold rejects Priority-Flood's
-    // drainage epsilon while retaining the real basin up to its shoreline.
+    // Use the stable, meaningfully flooded part of a Priority-Flood
+    // depression to decide lake membership. Including its 1-5% fill fringe
+    // turns broad lowlands into lakes, removes those cells from river
+    // extraction, and lets lake carving overwrite otherwise valid valleys.
+    // TraceComponentBoundary independently interpolates the continuous
+    // water-level crossing, so an organic shoreline does not require that
+    // shallow raster fringe to be classified as lake interior.
     const double ShorelineFillThreshold = FMath::Max(
-        1.0,
-        MinimumDepth * 0.05
+        50.0,
+        MinimumDepth * 0.5
     );
     for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
     {
@@ -2249,7 +2252,7 @@ public:
 
     static FGuid Version()
     {
-        return FGuid(TEXT("dbdaf4a0-71fd-46ed-a8fd-6667cbf0fe10"));
+        return FGuid(TEXT("39d91872-8c57-4fbb-9dc0-78cc2e0a5d11"));
     }
 
     FBox WorldBounds = FBox(ForceInit);
