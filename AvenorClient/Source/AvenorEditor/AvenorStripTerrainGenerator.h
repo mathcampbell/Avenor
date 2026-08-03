@@ -60,15 +60,34 @@ public:
     void GenerateTerrain();
 
     /**
-     * Stage 2: create Water actors from the exact cached river/lake plan used
-     * to carve the terrain. This refuses to run until stage 1 has succeeded.
+     * Stage 2: place USplineRemeshModifier components along the cached
+     * river reaches and lake shorelines so Mesh Partition creates dense
+     * vertices exactly where crisp banks/shores/canyon rims are needed.
+     * Wait for stage 1's Mesh Partition build to finish first. After this
+     * stage's own build completes, your terrain height modifier must be
+     * assigned an EARLIER Mesh Partition Definition priority layer than
+     * these refinement modifiers, so it evaluates height fresh on the
+     * newly-created vertices rather than the remesh just interpolating
+     * whatever coarse values already existed.
      */
     UFUNCTION(CallInEditor, Category = "Avenor|Generation",
-        meta = (DisplayName = "2. Generate Water (After Rebuild)"))
+        meta = (DisplayName = "2. Generate Refinement Splines (After Rebuild)"))
+    void GenerateRefinementSplines();
+
+    /**
+     * Stage 3: create Water actors from the exact cached river/lake plan
+     * used to carve the terrain. Refuses to run until stage 1 has
+     * succeeded; run this after stage 2's Mesh Partition build finishes.
+     */
+    UFUNCTION(CallInEditor, Category = "Avenor|Generation",
+        meta = (DisplayName = "3. Generate Water (After Rebuild)"))
     void GenerateWater();
 
     UFUNCTION(CallInEditor, Category = "Avenor|Generation")
     void ClearGeneratedWater();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Generation")
+    void ClearGeneratedRefinementSplines();
 
     FBox GetGenerationBounds() const;
     TSharedPtr<const FAvenorStripData> GetOrCreateData() const;
@@ -250,6 +269,32 @@ public:
             ToolTip = "Shape of just the wetted channel, separate from the wider valley. 1.0 is a smooth rounded bowl. Higher values keep the bed near full depth across most of the width and rise sharply only right at the true waterline, giving a flatter deeper bed with defined banks.")
     )
     double RiverChannelSteepness = 2.2;
+
+    // --- Refinement splines (Mesh Partition spline remesh, driven by the
+    // same river/lake data already extracted above) ---
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (Units = "cm", ClampMin = "10.0"))
+    double RefinementEdgeLengthHeadwater = 150.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (Units = "cm", ClampMin = "10.0"))
+    double RefinementEdgeLengthMainRiver = 200.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (Units = "cm", ClampMin = "10.0"))
+    double RefinementEdgeLengthCanyon = 100.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (Units = "cm", ClampMin = "10.0"))
+    double RefinementEdgeLengthLakeShore = 150.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Refinement",
+        meta = (Units = "cm", ClampMin = "0.0",
+            ToolTip = "Extra coverage beyond the feature's own half-width/bank-blend, so the remesh band comfortably includes the bank transition, not just the exact wetted edge.")
+    )
+    double RefinementCoverageMargin = 500.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (ClampMin = "0", ClampMax = "10"))
+    int32 RefinementMaxTessellationLevel = 6;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "100.0"))
     double HeadwaterValleyHalfWidth = 10000.0;

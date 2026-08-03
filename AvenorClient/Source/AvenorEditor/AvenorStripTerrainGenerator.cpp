@@ -15,6 +15,10 @@
 #include "WaterBodyRiverActor.h"
 #include "WaterSplineComponent.h"
 #include "WaterSplineMetadata.h"
+#include "Components/SplineComponent.h"
+#include "Modifiers/MeshPartitionSplineRemeshModifier.h"
+#include "Modifiers/MeshPartitionRemeshModifier.h"
+#include "UObject/UnrealType.h"
 
 #include <queue>
 #include <vector>
@@ -22,6 +26,7 @@
 namespace UE::Avenor::Strip
 {
 static const FName GeneratedWaterTag(TEXT("AvenorStripWater"));
+static const FName GeneratedRefinementTag(TEXT("AvenorStripRefinement"));
 static const FName ElevationChannel(TEXT("Elevation"));
 static const FName SlopeChannel(TEXT("Slope"));
 static const FName WetnessChannel(TEXT("Wetness"));
@@ -43,6 +48,21 @@ static FName MakeWaterOwnerTag(const AAvenorStripTerrainGenerator& Generator)
 static bool IsWaterOwnerTag(const FName& Tag)
 {
     return Tag.ToString().StartsWith(TEXT("AvenorStripOwner_"));
+}
+
+// SplineRadius has no public C++ setter on USplineRemeshModifier - it's a
+// private UPROPERTY, editable only via the Details panel in the header we
+// were given. UPROPERTY reflection legitimately bypasses C++ access
+// control for exactly this situation; this is standard practice, not a
+// workaround for something broken.
+static void SetSplineRemeshRadius(UE::MeshPartition::USplineRemeshModifier& Modifier, float Radius)
+{
+    if (FFloatProperty* Property = FindFProperty<FFloatProperty>(
+        UE::MeshPartition::USplineRemeshModifier::StaticClass(), TEXT("SplineRadius")
+    ))
+    {
+        Property->SetPropertyValue_InContainer(&Modifier, Radius);
+    }
 }
 
 static double Smooth01(double Value)
@@ -329,6 +349,7 @@ struct FRiverReach
     double CrossSectionExponent = 1.0;
     double ChannelSteepness = 2.2;
     double DrainageArea = 0.0;
+    bool bIsCanyon = false;
     FBox2D Bounds = FBox2D(ForceInit);
 };
 
@@ -1473,6 +1494,7 @@ static void ExtractRivers(
             River.ValleyHalfWidth *= FMath::Lerp(0.75, 0.42, MeanResistance);
             River.ValleyDepth = FMath::Max(River.ValleyDepth, MaximumValleyDepth * FMath::Lerp(1.1, 1.5, MeanResistance));
             River.CrossSectionExponent = FMath::Lerp(0.9, 0.55, MeanResistance);
+            River.bIsCanyon = true;
         }
         else
         {
@@ -2083,7 +2105,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("5b2f8d94-4c17-4a83-9e6f-1d7a3c8b5f20")); }
+    static FGuid Version() { return FGuid(TEXT("8c3e7a12-4f96-4b58-9d21-6a7c3e8f1b95")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2430,7 +2452,178 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
 #endif
 }
 
-void AAvenorStripTerrainGenerator::GenerateWater()
+void AAvenorStripTerrainGenerator::ClearGeneratedRefinementSplines()
+{
+#if WITH_EDITOR
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+    const FName OwnerTag = MakeWaterOwnerTag(*this);
+    TArray<AActor*> ToDelete;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (!It->Tags.Contains(GeneratedRefinementTag))
+        {
+            continue;
+        }
+        bool bHasAnyOwnerTag = false;
+        for (const FName& Tag : It->Tags)
+        {
+            bHasAnyOwnerTag |= IsWaterOwnerTag(Tag);
+        }
+        if (It->Tags.Contains(OwnerTag) || !bHasAnyOwnerTag)
+        {
+            ToDelete.Add(*It);
+        }
+    }
+    for (AActor* RefinementActor : ToDelete)
+    {
+        World->EditorDestroyActor(RefinementActor, true);
+    }
+#endif
+}
+
+#if WITH_EDITOR
+static void SpawnRefinementSpline(
+    UWorld& World,
+    UE::MeshPartition::AMeshPartition& TargetMeshPartition,
+    const FString& Label,
+    FName OwnerTag,
+    FName RefinementTag,
+    const TArray<FVector>& WorldPoints,
+    bool bClosed,
+    double TargetEdgeLength,
+    double CoverageRadius,
+    int32 MaxTessellationLevel
+)
+{
+    if (WorldPoints.Num() < 2)
+    {
+        return;
+    }
+    AActor* RefinementActor = World.SpawnActor<AActor>(AActor::StaticClass(), FTransform::Identity);
+    if (!RefinementActor)
+    {
+        return;
+    }
+    RefinementActor->SetActorLabel(Label);
+    RefinementActor->SetFolderPath(TEXT("Avenor/Generated/StripRefinement"));
+    RefinementActor->Tags.AddUnique(RefinementTag);
+    RefinementActor->Tags.AddUnique(OwnerTag);
+
+    USplineComponent* SplineComp = NewObject<USplineComponent>(
+        RefinementActor, USplineComponent::StaticClass(), NAME_None, RF_Transactional
+    );
+    RefinementActor->SetRootComponent(SplineComp);
+    SplineComp->RegisterComponent();
+    RefinementActor->AddInstanceComponent(SplineComp);
+    SplineComp->ClearSplinePoints(false);
+    SplineComp->SetSplinePoints(WorldPoints, ESplineCoordinateSpace::World, false);
+    SplineComp->SetClosedLoop(bClosed, false);
+    SplineComp->UpdateSpline();
+
+    UE::MeshPartition::USplineRemeshModifier* Modifier = NewObject<UE::MeshPartition::USplineRemeshModifier>(
+        RefinementActor, UE::MeshPartition::USplineRemeshModifier::StaticClass(), NAME_None, RF_Transactional
+    );
+    Modifier->SetupAttachment(SplineComp);
+    Modifier->RegisterComponent();
+    RefinementActor->AddInstanceComponent(Modifier);
+
+    Modifier->SetCurrentOperation(UE::MeshPartition::ERemeshModifierOperation::Tessellate);
+    Modifier->SetUseTargetEdgeLength(true);
+    Modifier->SetTessellationTargetEdgeLength(static_cast<float>(TargetEdgeLength));
+    Modifier->SetMaxTessellationLevel(MaxTessellationLevel);
+    Modifier->SetSplineComponent(SplineComp, true);
+    SetSplineRemeshRadius(*Modifier, static_cast<float>(CoverageRadius));
+    Modifier->SetAffectedMeshPartition(nullptr);
+    Modifier->BP_SetAffectedMegaMesh(&TargetMeshPartition);
+}
+#endif
+
+void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
+{
+#if WITH_EDITOR
+    if (!bTerrainPlanReadyForWater || !CachedData)
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "Generate Terrain must succeed first, and the Mesh Partition "
+                "build should have visibly completed, before generating "
+                "refinement splines."
+            ))
+        );
+        return;
+    }
+    UWorld* World = GetWorld();
+    UE::MeshPartition::AMeshPartition* TargetMeshPartition =
+        Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
+    if (!World || !TargetMeshPartition)
+    {
+        return;
+    }
+
+    FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating refinement splines...")));
+    Progress.MakeDialog();
+    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Replacing this generator's refinement splines")));
+    ClearGeneratedRefinementSplines();
+    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Placing spline remesh modifiers")));
+
+    const FName OwnerTag = MakeWaterOwnerTag(*this);
+    auto ToWorldPoints = [&](const TArray<FVector>& Source)
+    {
+        TArray<FVector> Result = Source;
+        for (FVector& Point : Result)
+        {
+            Point.Z += GetActorLocation().Z;
+        }
+        return Result;
+    };
+
+    for (int32 Index = 0; Index < CachedData->Rivers.Num(); ++Index)
+    {
+        const FRiverReach& River = CachedData->Rivers[Index];
+        const double EdgeLength = River.bIsCanyon
+            ? RefinementEdgeLengthCanyon
+            : FMath::Lerp(
+                RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
+                FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
+            );
+        SpawnRefinementSpline(
+            *World, *TargetMeshPartition,
+            FString::Printf(TEXT("Avenor_Strip_Refine_River_%03d"), Index + 1),
+            OwnerTag, GeneratedRefinementTag,
+            ToWorldPoints(River.Points), false,
+            EdgeLength, River.ValleyHalfWidth + RefinementCoverageMargin,
+            RefinementMaxTessellationLevel
+        );
+    }
+    for (int32 Index = 0; Index < CachedData->Lakes.Num(); ++Index)
+    {
+        const FLakeBasin& Lake = CachedData->Lakes[Index];
+        SpawnRefinementSpline(
+            *World, *TargetMeshPartition,
+            FString::Printf(TEXT("Avenor_Strip_Refine_Lake_%02d"), Index + 1),
+            OwnerTag, GeneratedRefinementTag,
+            ToWorldPoints(Lake.Shoreline), true,
+            RefinementEdgeLengthLakeShore, RefinementCoverageMargin,
+            RefinementMaxTessellationLevel
+        );
+    }
+
+    LastBuildStamp = FString::Printf(
+        TEXT("Refinement splines placed %s | code %s | %d river reaches | %d lake shores"),
+        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
+        CachedData->Rivers.Num(), CachedData->Lakes.Num()
+    );
+    UE_LOG(LogTemp, Display, TEXT("Avenor strip refinement splines placed: %s"), *LastBuildStamp);
+#endif
+}
+
+
 {
 #if WITH_EDITOR
     if (!bTerrainPlanReadyForWater || !CachedData)
