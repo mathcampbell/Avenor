@@ -1688,9 +1688,9 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
     double Result = Underlying;
     int32 AffectedLakeIndex = INDEX_NONE;
     double BestBankAlpha = TNumericLimits<double>::Max();
-    for (int32 LakeIndex = 0; LakeIndex < Lakes.Num(); ++LakeIndex)
+    for (int32 BasinIndex = 0; BasinIndex < Lakes.Num(); ++BasinIndex)
     {
-        const FLakeBasin& Lake = Lakes[LakeIndex];
+        const FLakeBasin& Lake = Lakes[BasinIndex];
         if (!Lake.Bounds.IsInside(Position) || Lake.Shoreline.Num() < 3)
         {
             continue;
@@ -1726,7 +1726,7 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
             const double BedNoise = Fbm(Position, FMath::Max(Radius * 2.0, CellSize * 2.0), FVector2D(4231.0, -8877.0), 3);
             const double BedDepth = Lake.MaximumDepth * FMath::Clamp(0.86 + 0.14 * BedNoise, 0.72, 1.0);
             Result = FMath::Lerp(NearShoreHeight, Lake.SurfaceHeight - BedDepth, DepthAlpha);
-            AffectedLakeIndex = LakeIndex;
+            AffectedLakeIndex = BasinIndex;
             break;
         }
         else if (EdgeDistance < Lake.BankBlendWidth)
@@ -1736,7 +1736,7 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
             {
                 BestBankAlpha = BankAlpha;
                 Result = FMath::Lerp(Lake.ShorelineHeight, Underlying, BankAlpha);
-                AffectedLakeIndex = LakeIndex;
+                AffectedLakeIndex = BasinIndex;
             }
         }
     }
