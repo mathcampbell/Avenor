@@ -27,6 +27,10 @@ static const FName SlopeChannel(TEXT("Slope"));
 static const FName WetnessChannel(TEXT("Wetness"));
 static const FName RiverChannel(TEXT("River"));
 static const FName LakeChannel(TEXT("Lake"));
+static const FName MountainChannel(TEXT("Mountain"));
+static const FName HillChannel(TEXT("Hill"));
+static const FName DesertChannel(TEXT("Desert"));
+static const FName PlainsChannel(TEXT("Plains"));
 
 static FName MakeWaterOwnerTag(const AAvenorStripTerrainGenerator& Generator)
 {
@@ -40,11 +44,6 @@ static bool IsWaterOwnerTag(const FName& Tag)
 {
     return Tag.ToString().StartsWith(TEXT("AvenorStripOwner_"));
 }
-
-// ---------------------------------------------------------------------
-// Numeric primitives. Deliberately small, deliberately boring - every one
-// of these is easy to reason about in isolation, which is the point.
-// ---------------------------------------------------------------------
 
 static double Smooth01(double Value)
 {
@@ -320,10 +319,6 @@ static void AddBroadMeanders(
     }
 }
 
-// ---------------------------------------------------------------------
-// Data structures
-// ---------------------------------------------------------------------
-
 struct FRiverReach
 {
     TArray<FVector> Points;
@@ -332,8 +327,21 @@ struct FRiverReach
     double ValleyHalfWidth = 15000.0;
     double ValleyDepth = 1500.0;
     double CrossSectionExponent = 1.0;
+    double ChannelSteepness = 2.2;
     double DrainageArea = 0.0;
     FBox2D Bounds = FBox2D(ForceInit);
+};
+
+struct FMountainRange
+{
+    FVector2D Centre = FVector2D::ZeroVector;
+    FVector2D Along = FVector2D(1.0, 0.0);
+    FVector2D Across = FVector2D(0.0, 1.0);
+    double HalfLength = 1.0;
+    double HalfWidth = 1.0;
+    double PeakSpacing = 1.0;
+    double Relief = 0.0;
+    double Phase = 0.0;
 };
 
 struct FLakeBasin
@@ -363,6 +371,11 @@ struct FAvenorStripData
     int32 Rows = 0;
     double CellSize = 10000.0;
     TArray<double> Height;
+    TArray<double> Resistance;
+    TArray<double> MountainMask;
+    TArray<double> HillMask;
+    TArray<double> DesertMask;
+    TArray<double> PlainsMask;
     TArray<double> FilledHeight;
     TArray<double> Accumulation;
     TArray<double> Slope;
@@ -421,25 +434,20 @@ namespace UE::Avenor::Strip
 static constexpr int32 NeighborX[8] = {1, 1, 0, -1, -1, -1, 0, 1};
 static constexpr int32 NeighborY[8] = {0, 1, 1, 1, 0, -1, -1, -1};
 
-// ---------------------------------------------------------------------
-// Erosion. Thermal relaxation for scree/talus slopes, then stream-power
-// incision that actually carves valleys following the real drainage
-// network - this is what makes valleys, canyons and the river tree
-// geomorphologically consistent with each other, rather than three
-// independent, disconnected systems.
-// ---------------------------------------------------------------------
-
 static void ApplyThermalErosion(
     FAvenorStripData& Data,
     int32 Iterations,
     double Strength,
-    double TalusAngleDegrees
+    double TalusAngleDegrees,
+    double ResistanceStrength
 )
 {
     if (Iterations <= 0 || Strength <= 0.0)
     {
         return;
     }
+    const bool bUseResistance = ResistanceStrength > 0.0 &&
+        Data.Resistance.Num() == Data.Height.Num();
     const double TalusDrop = FMath::Tan(FMath::DegreesToRadians(TalusAngleDegrees)) * Data.CellSize;
     TArray<double> Delta;
     Delta.SetNumZeroed(Data.Height.Num());
@@ -466,7 +474,11 @@ static void ApplyThermalErosion(
                 {
                     continue;
                 }
-                const double Transfer = FMath::Min(TotalExcess * Strength * 0.18, Data.CellSize * 0.25);
+                const double LocalResistance = bUseResistance
+                    ? FMath::Clamp(Data.Resistance[Cell] * ResistanceStrength, 0.0, 0.95)
+                    : 0.0;
+                const double Transfer = FMath::Min(TotalExcess * Strength * 0.18, Data.CellSize * 0.25) *
+                    (1.0 - LocalResistance);
                 Delta[Cell] -= Transfer;
                 for (int32 Direction = 0; Direction < 8; ++Direction)
                 {
@@ -653,10 +665,14 @@ static void ApplyStreamPowerErosion(
     FAvenorStripData& Data,
     int32 Iterations,
     double Strength,
-    double StreamStartArea,
-    double Epsilon
+    double MountainStartArea,
+    double LowlandStartArea,
+    double Epsilon,
+    double ResistanceStrength
 )
 {
+    const bool bUseResistance = ResistanceStrength > 0.0 &&
+        Data.Resistance.Num() == Data.Height.Num();
     for (int32 Iteration = 0; Iteration < Iterations; ++Iteration)
     {
         PriorityFlood(Data, Epsilon);
@@ -665,17 +681,24 @@ static void ApplyStreamPowerErosion(
         Delta.Init(0.0, Data.Height.Num());
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
+            // Identical per-cell threshold to Channel[] in ExtractRivers
+            // and FindDrainageTerminusSeeds. Using a single flat minimum
+            // here let erosion carve visible grooves in gentle terrain
+            // that the stricter, slope-adaptive extraction pass would
+            // then reject - a groove with no river to match it.
+            const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
+            const double StreamStartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
             if (Data.Accumulation[Cell] < StreamStartArea || Data.ReceiverA[Cell] == INDEX_NONE)
             {
                 continue;
             }
             const double AreaFactor = FMath::Pow(Data.Accumulation[Cell] / FMath::Max(0.01, StreamStartArea), 0.42);
             const double SlopeFactor = FMath::Pow(FMath::Max(0.00001, Data.Slope[Cell]), 0.72);
-            // Cap is generous (200m/iteration at default cell size) so it
-            // rarely binds - the strength/area/slope formula itself, not
-            // an artificial ceiling, is what should decide how much a
-            // given stream actually carves.
-            Delta[Cell] = FMath::Min(Data.CellSize * 2.0, Strength * 760.0 * AreaFactor * SlopeFactor);
+            const double LocalResistance = bUseResistance
+                ? FMath::Clamp(Data.Resistance[Cell] * ResistanceStrength, 0.0, 0.92)
+                : 0.0;
+            Delta[Cell] = FMath::Min(Data.CellSize * 6.0, Strength * 760.0 * AreaFactor * SlopeFactor) *
+                (1.0 - LocalResistance);
         }
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
@@ -713,14 +736,6 @@ static double DrainageScaleAlpha(double Area, double MainRiverArea)
 
 namespace UE::Avenor::Strip
 {
-// ---------------------------------------------------------------------
-// Lake boundary tracing: raster depression -> marching-squares contour
-// placed at the true height-crossing point -> simplify by arc length ->
-// Chaikin smooth -> resample. Every stage after the first works in
-// world-space distance, never a fixed point count, so it behaves the
-// same way on a tiny pond and a kilometre-scale lake.
-// ---------------------------------------------------------------------
-
 struct FLakeBoundaryEdge
 {
     FIntPoint Start;
@@ -859,9 +874,6 @@ struct FLakeCandidate
     double RimSpillHeight = TNumericLimits<double>::Max();
 };
 
-// A real, surviving drainage system dead-ending in the interior (not at
-// the map boundary, which is a legitimate "flows off the world" case).
-// Runs before any lake exists, so Data.LakeIndex is still empty here.
 static TArray<int32> FindDrainageTerminusSeeds(
     const FAvenorStripData& Data,
     double MountainStartArea,
@@ -1049,8 +1061,6 @@ static void ExtractLakes(
                 }
                 else if (Data.Height[Neighbor] < Basin.RimSpillHeight)
                 {
-                    // The lowest non-basin neighbour is the natural rim:
-                    // where water overtops once the lake fills.
                     Basin.RimSpillHeight = Data.Height[Neighbor];
                     Basin.RimSpillCell = Neighbor;
                 }
@@ -1065,7 +1075,17 @@ static void ExtractLakes(
                 break;
             }
         }
-        if (Area >= Data.CellAreaSquareKilometres() * 2.0 && Area <= WorldArea * 0.2)
+        // A mandatory basin still gets real headroom over MaximumArea (a
+        // river must not be orphaned just because its natural low point is
+        // a bit larger than the configured "normal" lake size), but a flat
+        // 20% of the *entire world* was large enough to let one continuous
+        // valley depression swallow enormous fractions of the map. Both
+        // classes are now bounded relative to what the user actually
+        // defined as "too big for a lake".
+        const double SanityCap = Basin.bMandatory
+            ? FMath::Max(MaximumArea * 1.75, WorldArea * 0.02)
+            : FMath::Max(MaximumArea * 1.5, WorldArea * 0.01);
+        if (Area >= Data.CellAreaSquareKilometres() * 2.0 && Area <= SanityCap)
         {
             Basins.Add(MoveTemp(Basin));
         }
@@ -1105,6 +1125,15 @@ static void ExtractLakes(
             {
                 continue;
             }
+        }
+        {
+            // Shape check applies to every basin, mandatory or not. A long,
+            // thin, winding depression - most obviously, an entire spine
+            // valley trough that a river runs the length of - is not a
+            // lake no matter how many rivers terminate along it. Skipping
+            // lake creation here does not orphan the river: it simply
+            // keeps flowing across that stretch of terrain unencumbered,
+            // which is the geomorphologically correct outcome anyway.
             const double BoundingWidth = FMath::Max(1.0, CandidateBasin.MaxX - CandidateBasin.MinX);
             const double BoundingHeight = FMath::Max(1.0, CandidateBasin.MaxY - CandidateBasin.MinY);
             const double FillRatio = BasinArea / FMath::Max(0.0001, (BoundingWidth * BoundingHeight) / 10000000000.0);
@@ -1165,9 +1194,6 @@ static void ExtractLakes(
         {
             ++AcceptedOptionalCount;
         }
-        // Fills from its inflow(s) and, once at the rim, overflows here.
-        // The downstream neighbour of the rim's lowest point is where a
-        // real outflow river would begin.
         if (bWantOutflows && CandidateBasin.RimSpillCell != INDEX_NONE)
         {
             const int32 OutflowStart = PrimaryReceiver(Data, CandidateBasin.RimSpillCell);
@@ -1203,10 +1229,6 @@ struct FRiverCandidate
     double Score = 0.0;
 };
 
-// Rivers form as a tree: every cell has exactly one downstream neighbour
-// (already known from flow accumulation), so the whole network is one
-// directed structure. Shared trunk segments are only ever traced once -
-// tributaries stop cleanly at confluences, never overlapping.
 static void ExtractRivers(
     FAvenorStripData& Data,
     const TArray<int32>& ForcedOutflowSeeds,
@@ -1224,7 +1246,8 @@ static void ExtractRivers(
     double MeanderStrength,
     int32 MaximumReaches,
     bool bCanyons,
-    double CanyonStartArea
+    double CanyonStartArea,
+    double ChannelSteepness
 )
 {
     Data.Rivers.Reset();
@@ -1244,9 +1267,6 @@ static void ExtractRivers(
         const double StartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
         Channel[Cell] = Data.Accumulation[Cell] >= StartArea && PrimaryReceiver(Data, Cell) != INDEX_NONE;
     }
-    // Outflow seeds are a lake's spillway - they get to count as channel
-    // regardless of local accumulation, since the water arriving there is
-    // whatever filled the lake upstream, not what this one cell drains.
     for (int32 Seed2 : ForcedOutflowSeeds)
     {
         if (Data.Height.IsValidIndex(Seed2) &&
@@ -1316,8 +1336,6 @@ static void ExtractRivers(
     }
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
-        // A forced outflow seed's system must survive even if short - it
-        // is, by construction, a real lake spillway, not incidental noise.
         if (Channel[Cell] && SystemLength[FindSystemRoot(Cell)] < MinimumSystemLength &&
             !ForcedSeedSet.Contains(FindSystemRoot(Cell)))
         {
@@ -1408,13 +1426,16 @@ static void ExtractRivers(
         TArray<FVector> Points;
         Points.Reserve(CandidateReach.Cells.Num());
         double MeanSlope = 0.0;
+        double MeanResistance = 0.0;
         for (int32 Cell : CandidateReach.Cells)
         {
             const FVector2D Position = Data.CellPosition(Cell);
             Points.Emplace(Position.X, Position.Y, Data.FilledHeight[Cell]);
             MeanSlope += Data.Slope[Cell];
+            MeanResistance += Data.Resistance.IsValidIndex(Cell) ? Data.Resistance[Cell] : 0.0;
         }
         MeanSlope /= CandidateReach.Cells.Num();
+        MeanResistance /= CandidateReach.Cells.Num();
         Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
@@ -1427,9 +1448,10 @@ static void ExtractRivers(
             const double LocalArea = Data.SampleGrid(Data.Accumulation, Position);
             const double LocalAlpha = DrainageScaleAlpha(LocalArea, MainRiverArea);
             double ValleyInset = FMath::Lerp(MaximumValleyDepth * 0.12, MaximumValleyDepth, LocalAlpha);
+            const double LocalResistance = Data.SampleGrid(Data.Resistance, Position);
             if (bCanyons && LocalArea >= CanyonStartArea)
             {
-                ValleyInset *= 1.2;
+                ValleyInset *= FMath::Lerp(1.05, 1.5, LocalResistance);
             }
             Point.Z = Data.SampleGrid(Data.Height, Position) - FMath::Lerp(150.0, 900.0, LocalAlpha) - ValleyInset;
         }
@@ -1445,11 +1467,12 @@ static void ExtractRivers(
         River.Depth = FMath::Lerp(FMath::Max(120.0, MaximumDepth * 0.12), MaximumDepth, RiverAlpha);
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
         River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
-        if (bCanyons && Area >= CanyonStartArea && MeanSlope > 0.055)
+        River.ChannelSteepness = ChannelSteepness;
+        if (bCanyons && Area >= CanyonStartArea && MeanSlope > 0.055 && MeanResistance > 0.25)
         {
-            River.ValleyHalfWidth *= 0.48;
-            River.ValleyDepth = FMath::Max(River.ValleyDepth, MaximumValleyDepth * 1.35);
-            River.CrossSectionExponent = 0.62;
+            River.ValleyHalfWidth *= FMath::Lerp(0.75, 0.42, MeanResistance);
+            River.ValleyDepth = FMath::Max(River.ValleyDepth, MaximumValleyDepth * FMath::Lerp(1.1, 1.5, MeanResistance));
+            River.CrossSectionExponent = FMath::Lerp(0.9, 0.55, MeanResistance);
         }
         else
         {
@@ -1538,7 +1561,11 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
         double CarveTarget = Underlying;
         if (ClosestDistance <= WaterHalfWidth)
         {
-            const double ChannelAlpha = Smooth01(FMath::Clamp(ClosestDistance / WaterHalfWidth, 0.0, 1.0));
+            const double ChannelShape = FMath::Pow(
+                FMath::Clamp(ClosestDistance / WaterHalfWidth, 0.0, 1.0),
+                FMath::Max(0.1, River.ChannelSteepness)
+            );
+            const double ChannelAlpha = Smooth01(ChannelShape);
             CarveTarget = FMath::Lerp(SurfaceHeight - River.Depth, SurfaceHeight, ChannelAlpha);
             Influence = 2.0 - ChannelAlpha;
         }
@@ -1583,6 +1610,22 @@ float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) 
     {
         return static_cast<float>(FMath::Clamp(FMath::Loge(1.0 + SampleGrid(Accumulation, Position)) / 6.0, 0.0, 1.0));
     }
+    if (Channel == MountainChannel)
+    {
+        return static_cast<float>(FMath::Clamp(SampleGrid(MountainMask, Position), 0.0, 1.0));
+    }
+    if (Channel == HillChannel)
+    {
+        return static_cast<float>(FMath::Clamp(SampleGrid(HillMask, Position), 0.0, 1.0));
+    }
+    if (Channel == DesertChannel)
+    {
+        return static_cast<float>(FMath::Clamp(SampleGrid(DesertMask, Position), 0.0, 1.0));
+    }
+    if (Channel == PlainsChannel)
+    {
+        return static_cast<float>(FMath::Clamp(SampleGrid(PlainsMask, Position), 0.0, 1.0));
+    }
     if (Channel == LakeChannel)
     {
         for (const FLakeBasin& Lake : Lakes)
@@ -1618,16 +1661,77 @@ float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) 
 
 namespace UE::Avenor::Strip
 {
-// ---------------------------------------------------------------------
-// Landform: a shallow spine valley runs the world's length. Four biome
-// affinities (mountainous / hilly / desert-canyon / plains) blend
-// smoothly along that same length via low-frequency noise, each weighted
-// by its configured prevalence. Mountain and desert relief additionally
-// scale up toward the two long edges, so the strip reads as "valley in
-// the middle, big features on the sides" without ever hard-cutting
-// between zones or hard-cutting between spine and edge.
-// ---------------------------------------------------------------------
+static TArray<FMountainRange> BuildMountainRanges(
+    const FBox& Bounds,
+    EAvenorStripLongAxis LongAxis,
+    int32 Seed,
+    double RangesPer100Km,
+    double RangeLength,
+    double RangeWidth,
+    double PeakSpacing,
+    double Relief,
+    double ExclusionHalfWidth
+)
+{
+    const FVector Size = Bounds.GetSize();
+    const double LongLength = LongAxis == EAvenorStripLongAxis::X ? Size.X : Size.Y;
+    const double AcrossExtent = LongAxis == EAvenorStripLongAxis::X
+        ? Size.Y * 0.5 : Size.X * 0.5;
+    const int32 Count = FMath::Clamp(
+        FMath::RoundToInt(FMath::Max(0.0, RangesPer100Km) * LongLength / 10000000.0),
+        RangesPer100Km > 0.0 ? 1 : 0,
+        128
+    );
+    const FVector2D Centre(Bounds.GetCenter());
+    FRandomStream Random(Seed ^ 0x51A7F00D);
+    TArray<FMountainRange> Ranges;
+    Ranges.Reserve(Count);
+    FVector2D LongDirection = LongAxis == EAvenorStripLongAxis::X
+        ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
+    FVector2D AcrossDirection = Rotate90(LongDirection);
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        const double HalfWidth = RangeWidth * Random.FRandRange(0.7, 1.35) * 0.5;
+        // The near edge of the range - not just its centre - must clear
+        // the exclusion width, otherwise a wide range placed close to the
+        // minimum distance can still poke well into the excluded band.
+        const double MinimumAcrossDistance = ExclusionHalfWidth + HalfWidth;
+        if (MinimumAcrossDistance >= AcrossExtent * 0.96)
+        {
+            // World isn't wide enough for a range of this size to fit
+            // outside the exclusion band at all - skip rather than force
+            // an encroaching placement.
+            continue;
+        }
+        const double Side = Random.FRand() < 0.5 ? -1.0 : 1.0;
+        const double AcrossDistance = Random.FRandRange(
+            MinimumAcrossDistance, AcrossExtent * 0.96
+        );
+        const double AlongValue = Random.FRandRange(
+            -LongLength * 0.48, LongLength * 0.48
+        );
+        const double Angle = Random.FRandRange(-0.3, 0.3);
+        FVector2D Along =
+            LongDirection * FMath::Cos(Angle) + AcrossDirection * FMath::Sin(Angle);
+        Along.Normalize();
+        FMountainRange Range;
+        Range.Centre = Centre + LongDirection * AlongValue +
+            AcrossDirection * (AcrossDistance * Side);
+        Range.Along = Along;
+        Range.Across = Rotate90(Along);
+        Range.HalfLength = RangeLength * Random.FRandRange(0.75, 1.3) * 0.5;
+        Range.HalfWidth = HalfWidth;
+        Range.PeakSpacing = PeakSpacing * Random.FRandRange(0.78, 1.22);
+        Range.Relief = Relief * Random.FRandRange(0.78, 1.2);
+        Range.Phase = Random.FRandRange(-PI, PI);
+        Ranges.Add(Range);
+    }
+    return Ranges;
+}
+} // namespace UE::Avenor::Strip
 
+namespace UE::Avenor::Strip
+{
 static double EvaluateLandform(
     const FVector2D& Position,
     const FBox& Bounds,
@@ -1636,20 +1740,20 @@ static double EvaluateLandform(
     bool bMountains,
     bool bHills,
     bool bDesert,
-    double SpineValleyDepth,
-    double SpineWidthFraction,
+    const TArray<FMountainRange>& Mountains,
     double ZoneLength,
     double MountainWeight,
     double HillWeight,
     double DesertWeight,
     double PlainsWeight,
-    double MountainRelief,
-    double MountainFeatureScale,
     double HillsRelief,
     double HillsScale,
-    double MesaRelief,
     double MesaScale,
-    int32 MesaTerraces,
+    double& OutResistance,
+    double& OutMountainMask,
+    double& OutHillMask,
+    double& OutDesertMask,
+    double& OutPlainsMask,
     bool bOcean,
     double SeaLevel,
     double MinimumOceanDepth,
@@ -1659,67 +1763,128 @@ static double EvaluateLandform(
     bool bOceanLengthEnds
 )
 {
+    (void)bOcean; (void)SeaLevel; (void)MinimumOceanDepth; (void)MaximumOceanDepth;
+    (void)CoastWidth; (void)bOceanWidthEdges; (void)bOceanLengthEnds;
     const FVector2D SeedOffset(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
+    // Primary domain warp. Amplitude is now on the same order as the
+    // mountain feature scale (rather than a small fixed 180000cm), which
+    // is the standard rule of thumb for hiding Perlin's inherent
+    // directional periodicity - too small a warp relative to a noise
+    // field's own wavelength lets that periodicity show through as
+    // regular, parallel, "corrugated sheet metal" banding.
     const FVector2D Warp(
-        Fbm(Position, 950000.0, SeedOffset + FVector2D(137.0, 911.0), 3),
-        Fbm(Position, 950000.0, SeedOffset + FVector2D(733.0, 271.0), 3)
+        Fbm(Position, 950000.0, SeedOffset + FVector2D(137.0, 911.0), 4),
+        Fbm(Position, 950000.0, SeedOffset + FVector2D(733.0, 271.0), 4)
     );
-    const FVector2D Warped = Position + Warp * 180000.0;
-
-    const FVector2D Centre(Bounds.GetCenter());
-    const double AcrossExtent = LongAxis == EAvenorStripLongAxis::X
-        ? Bounds.GetSize().Y * 0.5 : Bounds.GetSize().X * 0.5;
-    const double AcrossOffset = LongAxis == EAvenorStripLongAxis::X
-        ? (Position.Y - Centre.Y) : (Position.X - Centre.X);
-    const double AcrossFraction = FMath::Clamp(FMath::Abs(AcrossOffset) / FMath::Max(1.0, AcrossExtent), 0.0, 1.0);
-    const double SpineWidth = FMath::Clamp(SpineWidthFraction, 0.01, 1.0);
-    const double SpineBlend = Smooth01(AcrossFraction / SpineWidth);
-    const double BaseValley = FMath::Lerp(-SpineValleyDepth, 0.0, SpineBlend);
-    const double EdgeEmphasis = FMath::Lerp(0.3, 1.0, AcrossFraction);
+    const FVector2D Warped = Position + Warp * 650000.0;
 
     const double ZoneCoordinate = LongAxis == EAvenorStripLongAxis::X ? Position.X : Position.Y;
     const double ZoneT = ZoneCoordinate / FMath::Max(1.0, ZoneLength);
     auto ZoneAffinity = [&](double PhaseOffset)
     {
-        return 0.5 + 0.5 * Fbm(FVector2D(ZoneT, PhaseOffset), 1.0, SeedOffset, 3, 0.55, 2.0);
+        const double Raw = 0.5 + 0.5 * Fbm(FVector2D(ZoneT, PhaseOffset), 1.0, SeedOffset, 3, 0.55, 2.0);
+        // Sharpen toward 0/1: without this, independent noise fields hover
+        // near 0.5 almost everywhere, so after normalizing by weight every
+        // biome contributes a near-constant share everywhere instead of
+        // actually dominating a region.
+        return FMath::Pow(FMath::Clamp(Raw, 0.0, 1.0), 3.2);
     };
-    double MountainWeighted = ZoneAffinity(0.0) * FMath::Max(0.0, MountainWeight);
+    // Mountains are no longer part of this blend at all - they are placed
+    // as discrete range objects (below), each guaranteed to reach its full
+    // configured relief at its own core rather than being diluted by
+    // whatever three other independent noise fields happen to be doing at
+    // the same point.
     double HillWeighted = ZoneAffinity(131.0) * FMath::Max(0.0, HillWeight);
     double DesertWeighted = ZoneAffinity(277.0) * FMath::Max(0.0, DesertWeight);
     double PlainsWeighted = ZoneAffinity(419.0) * FMath::Max(0.0, PlainsWeight);
     const double WeightSum = FMath::Max(
-        0.0001, MountainWeighted + HillWeighted + DesertWeighted + PlainsWeighted
+        0.0001, HillWeighted + DesertWeighted + PlainsWeighted
     );
-    const double MountainAffinity = MountainWeighted / WeightSum;
     const double HillAffinity = HillWeighted / WeightSum;
     const double DesertAffinity = DesertWeighted / WeightSum;
     const double PlainsAffinity = PlainsWeighted / WeightSum;
+    OutHillMask = HillAffinity;
+    OutDesertMask = DesertAffinity;
+    OutPlainsMask = PlainsAffinity;
 
-    double Height = BaseValley;
+    double Height = 0.0;
+    OutMountainMask = 0.0;
 
     if (bMountains)
     {
-        const double MountainNoise = RidgedFbm(Warped, MountainFeatureScale, SeedOffset + FVector2D(811.0, 157.0), 5);
-        Height += MountainNoise * MountainRelief * MountainAffinity * EdgeEmphasis;
+        for (const FMountainRange& Range : Mountains)
+        {
+            // Warp the range's own silhouette, not just its ridge texture -
+            // without this the outline is a perfect ellipse regardless of
+            // how jagged the surface detail is, which reads as artificial
+            // no matter how much ridge noise sits on top of it.
+            const FVector2D SilhouetteWarp(
+                Fbm(Warped, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
+                Fbm(Warped, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
+            );
+            const FVector2D Delta = (Warped + SilhouetteWarp * Range.HalfWidth * 0.6) - Range.Centre;
+            const double Along = FVector2D::DotProduct(Delta, Range.Along);
+            const double Across = FVector2D::DotProduct(Delta, Range.Across);
+            const double AlongNorm = FMath::Abs(Along) / FMath::Max(1.0, Range.HalfLength);
+            const double AcrossNorm = FMath::Abs(Across) / FMath::Max(1.0, Range.HalfWidth);
+            // Core body plus a wider, much lower foothill skirt so ranges
+            // taper into surrounding terrain instead of cutting off sharply.
+            const double CoreEnvelope = Smooth01(1.0 - AlongNorm) * Smooth01(1.0 - AcrossNorm);
+            const double SkirtEnvelope = Smooth01(1.0 - AlongNorm / 1.4) * Smooth01(1.0 - AcrossNorm / 1.8);
+            if (SkirtEnvelope <= 0.0)
+            {
+                continue;
+            }
+            // A perfect cosine gives perfectly even peak spacing and
+            // height - a row of identical cones. Blend it with genuine
+            // noise perturbation so both spacing and height vary the way
+            // a real ridgeline's summits do, while keeping enough of the
+            // cosine tendency that peaks still read as a ridge, not chaos.
+            const double PeakCoordinate = Along / FMath::Max(1.0, Range.PeakSpacing);
+            const double PeakNoise = Fbm(
+                FVector2D(PeakCoordinate, Range.Phase * 13.0), 1.0,
+                SeedOffset + FVector2D(211.0, 883.0), 3, 0.55, 2.0
+            );
+            const double CosineBase = FMath::Max(
+                0.0, 0.5 + 0.5 * FMath::Cos(PeakCoordinate * 2.0 * PI + Range.Phase)
+            );
+            const double Peaks = FMath::Clamp(
+                0.28 + 0.5 * FMath::Pow(CosineBase, 1.6) + 0.4 * PeakNoise,
+                0.0, 1.15
+            );
+            const double Ridge = RidgedFbm(
+                Warped, Range.PeakSpacing * 1.1,
+                SeedOffset + FVector2D(Range.Phase * 997.0, 313.0), 5
+            );
+            const double Core = Range.Relief * CoreEnvelope * Peaks * FMath::Lerp(0.5, 1.0, Ridge);
+            const double Foothills = Range.Relief * 0.2 *
+                FMath::Max(0.0, SkirtEnvelope - CoreEnvelope * 0.6) * (0.4 + 0.6 * Ridge);
+            Height = FMath::Max(Height, Core + Foothills);
+            OutMountainMask = FMath::Max(OutMountainMask, SkirtEnvelope);
+        }
     }
     if (bHills)
     {
         const double HillNoise = Fbm(Warped, HillsScale, SeedOffset + FVector2D(887.0, 157.0), 5, 0.54, 2.03);
-        Height += HillNoise * HillsRelief * HillAffinity * FMath::Lerp(0.6, 1.0, AcrossFraction);
+        Height += HillNoise * HillsRelief * HillAffinity;
     }
     if (bDesert)
     {
+        // No mesa/canyon shape is painted here at all. This only sets down
+        // a gentle base (soft rolling ground, nothing dramatic) plus a
+        // resistance value; erosion is what actually carves canyons where
+        // a river cuts through and leaves mesa remnants where resistant
+        // rock nearby didn't erode at the same rate.
         const double DesertNoise = 0.5 + 0.5 * Fbm(Warped, MesaScale, SeedOffset + FVector2D(555.0, 222.0), 4);
-        double Terraced = DesertNoise;
-        if (MesaTerraces > 1)
-        {
-            const double Stepped = FMath::Floor(DesertNoise * MesaTerraces + 0.35) / MesaTerraces;
-            Terraced = FMath::Lerp(DesertNoise, Stepped, 0.72);
-        }
-        Height += Terraced * MesaRelief * DesertAffinity * EdgeEmphasis;
+        Height += (DesertNoise - 0.5) * HillsRelief * 0.35 * DesertAffinity;
+        OutResistance = DesertAffinity * FMath::Clamp(0.55 + 0.45 * DesertNoise, 0.0, 1.0);
+    }
+    else
+    {
+        OutResistance = 0.0;
     }
     {
         const double PlainsNoise = Fbm(Warped, HillsScale * 3.0, SeedOffset + FVector2D(101.0, 43.0), 4);
@@ -1758,28 +1923,56 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     Data->CellSize = CellSize;
     const int32 CellCount = Data->Columns * Data->Rows;
     Data->Height.SetNumUninitialized(CellCount);
+    Data->Resistance.SetNumUninitialized(CellCount);
+    Data->MountainMask.SetNumUninitialized(CellCount);
+    Data->HillMask.SetNumUninitialized(CellCount);
+    Data->DesertMask.SetNumUninitialized(CellCount);
+    Data->PlainsMask.SetNumUninitialized(CellCount);
+
+    const TArray<FMountainRange> Mountains = Generator.bGenerateMountains
+        ? BuildMountainRanges(
+            Bounds, Generator.LongAxis, Generator.Seed,
+            Generator.MountainRangesPer100Km, Generator.MountainRangeLength,
+            Generator.MountainRangeWidth, Generator.MountainPeakSpacing,
+            Generator.MountainRelief, Generator.MountainExclusionHalfWidth
+        )
+        : TArray<FMountainRange>();
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
+        double CellResistance = 0.0;
+        double CellMountainMask = 0.0;
+        double CellHillMask = 0.0;
+        double CellDesertMask = 0.0;
+        double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
             Data->CellPosition(Cell), Bounds, Generator.Seed, Generator.LongAxis,
             Generator.bGenerateMountains, Generator.bGenerateHills, Generator.bGenerateMesasAndCanyons,
-            Generator.SpineValleyDepth, Generator.SpineWidthFraction, Generator.ZoneLength,
+            Mountains, Generator.ZoneLength,
             Generator.MountainZoneWeight, Generator.HillZoneWeight, Generator.DesertZoneWeight, Generator.PlainsZoneWeight,
-            Generator.MountainRelief, Generator.MountainFeatureScale,
             Generator.HillsRelief, Generator.HillsScale,
-            Generator.MesaRelief, Generator.MesaScale, Generator.MesaTerraces,
+            Generator.MesaScale, CellResistance,
+            CellMountainMask, CellHillMask, CellDesertMask, CellPlainsMask,
             Generator.bGenerateOcean, Generator.SeaLevel,
             Generator.MinimumOceanDepth, Generator.MaximumOceanDepth,
             Generator.CoastTransitionWidth, Generator.bOceanWidthEdges,
             Generator.bOceanLengthEnds
         );
+        Data->Resistance[Cell] = CellResistance;
+        Data->MountainMask[Cell] = CellMountainMask;
+        Data->HillMask[Cell] = CellHillMask;
+        Data->DesertMask[Cell] = CellDesertMask;
+        Data->PlainsMask[Cell] = CellPlainsMask;
     }
 
-    ApplyThermalErosion(*Data, Generator.ThermalErosionIterations, Generator.ThermalErosionStrength, Generator.TalusAngleDegrees);
+    ApplyThermalErosion(
+        *Data, Generator.ThermalErosionIterations, Generator.ThermalErosionStrength,
+        Generator.TalusAngleDegrees, Generator.ErosionResistanceStrength
+    );
     ApplyStreamPowerErosion(
         *Data, Generator.StreamPowerIterations, Generator.StreamPowerStrength,
-        FMath::Min(Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea), Generator.DrainageEpsilon
+        Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea, Generator.DrainageEpsilon,
+        Generator.ErosionResistanceStrength
     );
 
     TArray<int32> OutflowSeeds;
@@ -1806,7 +1999,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Generator.MainRiverArea, Generator.MinimumRiverSystemLength, Generator.HeadwaterWidth, Generator.MainRiverWidth,
             Generator.MaximumRiverDepth, Generator.HeadwaterValleyHalfWidth, Generator.MainValleyHalfWidth,
             Generator.MaximumValleyDepth, Generator.LowlandMeanderStrength, Generator.MaximumRiverReaches,
-            Generator.bGenerateMesasAndCanyons, Generator.CanyonStartArea
+            Generator.bGenerateMesasAndCanyons, Generator.CanyonStartArea,
+            Generator.RiverChannelSteepness
         );
     }
     if (Generator.bGenerateOcean)
@@ -1843,7 +2037,10 @@ public:
             UE::MeshPartition::EMeshViewComponents::VertexPos |
             UE::MeshPartition::EMeshViewComponents::VertexAttributeWeight
         );
-        Instance.UsedChannels = { ElevationChannel, SlopeChannel, WetnessChannel, RiverChannel, LakeChannel };
+        Instance.UsedChannels = {
+            ElevationChannel, SlopeChannel, WetnessChannel, RiverChannel, LakeChannel,
+            MountainChannel, HillChannel, DesertChannel, PlainsChannel
+        };
     }
 
     virtual void ApplyModifications(
@@ -1878,11 +2075,15 @@ public:
             MeshView.SetVertexAttributeWeight(WetnessChannel, Vertex, Data->SampleChannel(WetnessChannel, XY));
             MeshView.SetVertexAttributeWeight(RiverChannel, Vertex, Data->SampleChannel(RiverChannel, XY));
             MeshView.SetVertexAttributeWeight(LakeChannel, Vertex, Data->SampleChannel(LakeChannel, XY));
+            MeshView.SetVertexAttributeWeight(MountainChannel, Vertex, Data->SampleChannel(MountainChannel, XY));
+            MeshView.SetVertexAttributeWeight(HillChannel, Vertex, Data->SampleChannel(HillChannel, XY));
+            MeshView.SetVertexAttributeWeight(DesertChannel, Vertex, Data->SampleChannel(DesertChannel, XY));
+            MeshView.SetVertexAttributeWeight(PlainsChannel, Vertex, Data->SampleChannel(PlainsChannel, XY));
         }
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("5f3b61a2-8d44-4f73-a92d-81b6c2e7d409")); }
+    static FGuid Version() { return FGuid(TEXT("5b2f8d94-4c17-4a83-9e6f-1d7a3c8b5f20")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -1910,6 +2111,50 @@ static TWaterActor* SpawnWaterActor(
         Actor->Tags.AddUnique(OwnerTag);
     }
     return Actor;
+}
+
+static double ComputeGuaranteedLakeSurfaceZ(
+    const FAvenorStripData& Data,
+    const TArray<FVector>& Shoreline
+)
+{
+    // Last, unconditional safety net. Whatever upstream computation
+    // produced the current surface height, sample the real bank terrain
+    // immediately outside the shoreline - using the exact SampleHeight
+    // function the rendered ground mesh consumes - and never allow the
+    // water to sit above the single lowest point of it, even if that means
+    // lowering the entire lake to satisfy just one point on the rim.
+    if (Shoreline.Num() < 3)
+    {
+        return Shoreline.Num() > 0 ? Shoreline[0].Z : 0.0;
+    }
+    double MinimumBankHeight = TNumericLimits<double>::Max();
+    const int32 Count = Shoreline.Num();
+    const double Offset = FMath::Max(Data.CellSize * 0.5, 1000.0);
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        const FVector2D Previous(Shoreline[(Index - 1 + Count) % Count]);
+        const FVector2D Current(Shoreline[Index]);
+        const FVector2D Next(Shoreline[(Index + 1) % Count]);
+        FVector2D Tangent = Next - Previous;
+        if (!Tangent.Normalize())
+        {
+            continue;
+        }
+        const FVector2D Normal(-Tangent.Y, Tangent.X);
+        const FVector2D CandidateA = Current + Normal * Offset;
+        const FVector2D CandidateB = Current - Normal * Offset;
+        const FVector2D Outward = IsInsidePolygon(CandidateA, Shoreline)
+            ? CandidateB
+            : CandidateA;
+        MinimumBankHeight = FMath::Min(MinimumBankHeight, Data.SampleGrid(Data.Height, Outward));
+    }
+    if (MinimumBankHeight >= TNumericLimits<double>::Max())
+    {
+        return Shoreline[0].Z;
+    }
+    const double SafetyMargin = 20.0;
+    return FMath::Min(Shoreline[0].Z, MinimumBankHeight - SafetyMargin);
 }
 
 static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, bool bClosed)
@@ -2042,10 +2287,6 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
         {
             continue;
         }
-
-        // Owner-less actors were produced by the original generator. Delete
-        // them once as a migration path; thereafter each generator only
-        // replaces its own water.
         bool bHasAnyOwnerTag = false;
         for (const FName& Tag : It->Tags)
         {
@@ -2095,7 +2336,17 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     }
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
-        TArray<FVector> LakePoints = ToWorldPoints(Data->Lakes[Index].Shoreline);
+        TArray<FVector> LocalShoreline = Data->Lakes[Index].Shoreline;
+        const double GuaranteedZ = ComputeGuaranteedLakeSurfaceZ(*Data, LocalShoreline);
+        if (LocalShoreline.Num() > 0 &&
+            GuaranteedZ < LocalShoreline[0].Z - UE_DOUBLE_KINDA_SMALL_NUMBER)
+        {
+            for (FVector& Point : LocalShoreline)
+            {
+                Point.Z = GuaranteedZ;
+            }
+        }
+        TArray<FVector> LakePoints = ToWorldPoints(LocalShoreline);
         if (AWaterBodyLake* Lake = SpawnWaterActor<AWaterBodyLake>(
             *World,
             FString::Printf(TEXT("Avenor_Strip_Lake_%02d"), Index + 1),
@@ -2170,8 +2421,9 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     bTerrainPlanReadyForWater = true;
 
     LastBuildStamp = FString::Printf(
-        TEXT("Terrain submitted %s | seed %d | %d cells @ %.0fcm | %d rivers | %d lakes | WAIT FOR MESH BUILD, THEN GENERATE WATER"),
+        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | %d rivers | %d lakes | WAIT FOR MESH BUILD, THEN GENERATE WATER"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, Data->Height.Num(), Data->CellSize, Data->Rivers.Num(), Data->Lakes.Num()
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip terrain submitted: %s"), *LastBuildStamp);
@@ -2215,8 +2467,9 @@ void AAvenorStripTerrainGenerator::GenerateWater()
     CreateWaterActors(CachedData);
 
     LastBuildStamp = FString::Printf(
-        TEXT("Water created %s | seed %d | %d rivers | %d lakes"),
+        TEXT("Water created %s | code %s | seed %d | %d rivers | %d lakes"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, CachedData->Rivers.Num(), CachedData->Lakes.Num()
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip water generated: %s"), *LastBuildStamp);

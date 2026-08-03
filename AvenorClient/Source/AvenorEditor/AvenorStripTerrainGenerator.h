@@ -105,14 +105,11 @@ public:
     bool bTerrainPlanReadyForWater = false;
 
     // ------------------------------------------------------------------
-    // Central spine and blended landform zones
+    // Blended landform zones. The spine is deliberately NOT a height bias
+    // of any kind here - only mountains are excluded near it (see
+    // MountainExclusionHalfWidth below). A separate terrain modifier is
+    // intended to shape the spine land itself later.
     // ------------------------------------------------------------------
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Spine", meta = (ClampMin = "0.0"))
-    double SpineValleyDepth = 15000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Spine", meta = (ClampMin = "0.01", ClampMax = "1.0"))
-    double SpineWidthFraction = 0.22;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Zones", meta = (ClampMin = "10000.0"))
     double ZoneLength = 2500000.0;
@@ -132,11 +129,38 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains")
     bool bGenerateMountains = true;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains", meta = (EditCondition = "bGenerateMountains", ClampMin = "0.0"))
-    double MountainRelief = 220000.0;
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Mountains",
+        meta = (EditCondition = "bGenerateMountains", ClampMin = "0.0", Units = "cm",
+            ToolTip = "Peak relief at a range's own core - guaranteed, not diluted by any blend.")
+    )
+    double MountainRelief = 300000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains", meta = (EditCondition = "bGenerateMountains", ClampMin = "1000.0"))
-    double MountainFeatureScale = 650000.0;
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Mountains",
+        meta = (EditCondition = "bGenerateMountains", ClampMin = "0.0",
+            ToolTip = "How many discrete mountain ranges to place per 100km of world length.")
+    )
+    double MountainRangesPer100Km = 3.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains", meta = (EditCondition = "bGenerateMountains", ClampMin = "10000.0", Units = "cm"))
+    double MountainRangeLength = 1800000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains", meta = (EditCondition = "bGenerateMountains", ClampMin = "10000.0", Units = "cm"))
+    double MountainRangeWidth = 550000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mountains", meta = (EditCondition = "bGenerateMountains", ClampMin = "10000.0", Units = "cm"))
+    double MountainPeakSpacing = 260000.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Mountains",
+        meta = (EditCondition = "bGenerateMountains", ClampMin = "0.0", Units = "cm",
+            ToolTip = "A range's near edge (not just its centre) is kept at least this far from the spine centreline. Nothing else (hills, desert, plains) is affected by distance from the spine at all.")
+    )
+    double MountainExclusionHalfWidth = 150000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Hills")
     bool bGenerateHills = true;
@@ -147,17 +171,24 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Hills", meta = (EditCondition = "bGenerateHills", ClampMin = "1000.0"))
     double HillsScale = 220000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mesas and Canyons")
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Mesas and Canyons",
+        meta = (EditCondition = "bGenerateMesasAndCanyons",
+            ToolTip = "Mesa and canyon shape is never painted directly - it emerges from erosion. This only enables the desert zone (gentle base terrain + resistant rock) and lets rivers there cut real canyons and leave real mesa remnants.")
+    )
     bool bGenerateMesasAndCanyons = false;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mesas and Canyons", meta = (EditCondition = "bGenerateMesasAndCanyons", ClampMin = "0.0"))
-    double MesaRelief = 120000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mesas and Canyons", meta = (EditCondition = "bGenerateMesasAndCanyons", ClampMin = "1000.0"))
     double MesaScale = 400000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mesas and Canyons", meta = (EditCondition = "bGenerateMesasAndCanyons", ClampMin = "1", ClampMax = "32"))
-    int32 MesaTerraces = 7;
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Mesas and Canyons",
+        meta = (EditCondition = "bGenerateMesasAndCanyons", ClampMin = "0.0", ClampMax = "1.0",
+            ToolTip = "How strongly resistant rock resists erosion. This is what actually produces mesas: terrain a river erodes past but doesn't cut through is left standing.")
+    )
+    double ErosionResistanceStrength = 0.55;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Mesas and Canyons", meta = (EditCondition = "bGenerateMesasAndCanyons", ClampMin = "0.0"))
     double CanyonStartArea = 60.0;
@@ -211,6 +242,14 @@ public:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "1.0"))
     double MaximumRiverDepth = 1800.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Hydrology|Rivers",
+        meta = (EditCondition = "bGenerateRivers", ClampMin = "0.5", ClampMax = "6.0",
+            ToolTip = "Shape of just the wetted channel, separate from the wider valley. 1.0 is a smooth rounded bowl. Higher values keep the bed near full depth across most of the width and rise sharply only right at the true waterline, giving a flatter deeper bed with defined banks.")
+    )
+    double RiverChannelSteepness = 2.2;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "100.0"))
     double HeadwaterValleyHalfWidth = 10000.0;
