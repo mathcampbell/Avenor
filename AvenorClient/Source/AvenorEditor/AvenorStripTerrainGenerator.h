@@ -53,7 +53,8 @@ public:
     /**
      * Stage 1: calculate landforms and hydrology, then register the single
      * Mesh Partition modifier. This deliberately creates no Water actors.
-     * Wait for the Mesh Partition build to finish before running stage 2.
+     * Stage 2 can follow immediately because it consumes the cached feature
+     * plan rather than the built mesh.
      */
     UFUNCTION(CallInEditor, Category = "Avenor|Generation",
         meta = (DisplayName = "1. Generate Terrain (No Water)"))
@@ -63,15 +64,15 @@ public:
      * Stage 2: place USplineRemeshModifier components along the cached
      * river reaches and lake shorelines so Mesh Partition creates dense
      * vertices exactly where crisp banks/shores/canyon rims are needed.
-     * Wait for stage 1's Mesh Partition build to finish first. After this
-     * stage's own build completes, your terrain height modifier must be
-     * assigned an EARLIER Mesh Partition Definition priority layer than
-     * these refinement modifiers, so it evaluates height fresh on the
-     * newly-created vertices rather than the remesh just interpolating
-     * whatever coarse values already existed.
+     * This uses the feature plan produced by stage 1, so it can be run as
+     * soon as Generate Terrain has completed; an intermediate Mesh Partition
+     * rebuild is not required. Avenor assigns spline remesh to the first
+     * priority layer declared by the Mesh Partition Definition and terrain
+     * carving to the last layer. The later terrain pass then evaluates its
+     * analytic height function on every vertex created by remeshing.
      */
     UFUNCTION(CallInEditor, Category = "Avenor|Generation",
-        meta = (DisplayName = "2. Generate Refinement Splines (After Rebuild)"))
+        meta = (DisplayName = "2. Generate/Update Refinement Splines"))
     void GenerateRefinementSplines();
 
     /**
@@ -122,6 +123,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Generation")
     bool bTerrainPlanReadyForWater = false;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Generation")
+    bool bRefinementPlanReadyForWater = false;
 
     // ------------------------------------------------------------------
     // Blended landform zones. The spine is deliberately NOT a height bias
@@ -289,9 +293,17 @@ public:
         EditAnywhere,
         Category = "Avenor|Refinement",
         meta = (Units = "cm", ClampMin = "0.0",
-            ToolTip = "Extra coverage beyond the feature's own half-width/bank-blend, so the remesh band comfortably includes the bank transition, not just the exact wetted edge.")
+            ToolTip = "Extra remesh width outside a river bank or lake shoreline. This is deliberately added to the channel width, not the much wider broad valley width.")
     )
-    double RefinementCoverageMargin = 500.0;
+    double RefinementCoverageMargin = 2500.0;
+
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Refinement",
+        meta = (Units = "cm", ClampMin = "1000.0",
+            ToolTip = "Maximum half-width refined around a canyon centreline. This prevents a very wide valley from being tessellated at 1-2 metre resolution across its full width.")
+    )
+    double RefinementMaximumCanyonRadius = 30000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (ClampMin = "0", ClampMax = "10"))
     int32 RefinementMaxTessellationLevel = 6;
