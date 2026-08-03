@@ -320,6 +320,13 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0.0", ClampMax = "3.0"))
     double LowlandMeanderStrength = 0.75;
 
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Hydrology",
+        meta = (Units = "cm", ClampMin = "100.0", ClampMax = "2500.0",
+            ToolTip = "World-space spacing of the final shared river and lake polylines. This is independent of the hydrology analysis-cell size and is used by terrain carving, spline remeshing and Water Bodies alike. 500 cm gives 5 m feature geometry without increasing the global analysis grid."))
+    double FeatureSplinePointSpacing = 500.0;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0", ClampMax = "4096"))
     int32 MaximumRiverReaches = 256;
 

@@ -355,6 +355,8 @@ struct FRiverReach
     double CrossSectionExponent = 1.0;
     double ChannelSteepness = 2.2;
     double DrainageArea = 0.0;
+    int32 StartLakeIndex = INDEX_NONE;
+    int32 EndLakeIndex = INDEX_NONE;
     bool bIsCanyon = false;
     FBox2D Bounds = FBox2D(ForceInit);
 };
@@ -774,7 +776,8 @@ struct FLakeBoundaryEdge
 static TArray<FVector> TraceComponentBoundary(
     const FAvenorStripData& Data,
     const TArray<int32>& Cells,
-    double SurfaceHeight
+    double SurfaceHeight,
+    double FinalPointSpacing
 )
 {
     TSet<int32> Membership;
@@ -883,7 +886,14 @@ static TArray<FVector> TraceComponentBoundary(
     }
     TArray<FVector> Reduced = ResamplePolyline(Boundary, FMath::Max(Data.CellSize, 3500.0), true);
     Boundary = ChaikinSmooth(Reduced, true, 2);
-    return ResamplePolyline(Boundary, FMath::Max(Data.CellSize * 0.40, 2500.0), true);
+    // Preserve the smooth contour generated above instead of throwing it
+    // away by resampling back to the 25 m (or coarser) analysis resolution.
+    // This final polygon is shared by carving, remeshing and water.
+    return ResamplePolyline(
+        Boundary,
+        FMath::Clamp(FinalPointSpacing, 100.0, Data.CellSize),
+        true
+    );
 }
 
 struct FLakeCandidate
@@ -1015,6 +1025,7 @@ static void ExtractLakes(
     double MaximumCoverageFraction,
     double BankBlendWidth,
     double DepthRampWidth,
+    double FeaturePointSpacing,
     double SurfaceInset,
     bool bWantOutflows,
     TArray<int32>& OutOutflowSeeds
@@ -1177,7 +1188,9 @@ static void ExtractLakes(
         );
         Lake.BankBlendWidth = BankBlendWidth;
         Lake.DepthRampWidth = DepthRampWidth;
-        Lake.Shoreline = TraceComponentBoundary(Data, CandidateBasin.Cells, Lake.SurfaceHeight);
+        Lake.Shoreline = TraceComponentBoundary(
+            Data, CandidateBasin.Cells, Lake.SurfaceHeight, FeaturePointSpacing
+        );
         if (Lake.Shoreline.Num() < 4)
         {
             continue;
@@ -1254,7 +1267,107 @@ struct FRiverCandidate
 {
     TArray<int32> Cells;
     double Score = 0.0;
+    int32 StartLakeIndex = INDEX_NONE;
+    int32 EndLakeIndex = INDEX_NONE;
 };
+
+static bool FindClosestLakeShorePoint(
+    const FAvenorStripData& Data,
+    const FVector2D& Position,
+    double MaximumDistance,
+    int32& OutLakeIndex,
+    FVector2D& OutPoint)
+{
+    double BestDistance = MaximumDistance;
+    OutLakeIndex = INDEX_NONE;
+    for (int32 LakeIndex = 0; LakeIndex < Data.Lakes.Num(); ++LakeIndex)
+    {
+        const FLakeBasin& Lake = Data.Lakes[LakeIndex];
+        if (Lake.Shoreline.Num() < 3 ||
+            !Lake.Bounds.ExpandBy(MaximumDistance).IsInside(Position))
+        {
+            continue;
+        }
+        for (int32 PointIndex = 0; PointIndex < Lake.Shoreline.Num(); ++PointIndex)
+        {
+            const FVector2D A(Lake.Shoreline[PointIndex]);
+            const FVector2D B(Lake.Shoreline[(PointIndex + 1) % Lake.Shoreline.Num()]);
+            const FVector2D Segment = B - A;
+            const double SegmentLengthSquared = Segment.SizeSquared();
+            const double Alpha = SegmentLengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(Position - A, Segment) / SegmentLengthSquared, 0.0, 1.0)
+                : 0.0;
+            const FVector2D Candidate = A + Segment * Alpha;
+            const double Distance = FVector2D::Distance(Position, Candidate);
+            if (Distance < BestDistance)
+            {
+                BestDistance = Distance;
+                OutLakeIndex = LakeIndex;
+                OutPoint = Candidate;
+            }
+        }
+    }
+    return OutLakeIndex != INDEX_NONE;
+}
+
+static void AnchorRiverToLakes(
+    const FAvenorStripData& Data,
+    TArray<FVector>& Points,
+    int32 StartLakeIndex,
+    int32 EndLakeIndex)
+{
+    if (Points.Num() < 2)
+    {
+        return;
+    }
+    constexpr double MinimumGradient = 0.0006;
+    if (Data.Lakes.IsValidIndex(StartLakeIndex))
+    {
+        Points[0].Z = Data.Lakes[StartLakeIndex].SurfaceHeight;
+    }
+    if (Data.Lakes.IsValidIndex(EndLakeIndex))
+    {
+        Points.Last().Z = Data.Lakes[EndLakeIndex].SurfaceHeight;
+    }
+
+    if (Data.Lakes.IsValidIndex(StartLakeIndex) && Data.Lakes.IsValidIndex(EndLakeIndex))
+    {
+        double TotalLength = 0.0;
+        for (int32 Index = 1; Index < Points.Num(); ++Index)
+        {
+            TotalLength += FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
+        }
+        const double StartHeight = Data.Lakes[StartLakeIndex].SurfaceHeight;
+        const double EndHeight = Data.Lakes[EndLakeIndex].SurfaceHeight;
+        if (StartHeight >= EndHeight + TotalLength * MinimumGradient)
+        {
+            double Distance = 0.0;
+            for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+            {
+                Distance += FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
+                const double Alpha = TotalLength > UE_DOUBLE_SMALL_NUMBER ? Distance / TotalLength : 0.0;
+                const double AnchoredHeight = FMath::Lerp(StartHeight, EndHeight, Alpha);
+                Points[Index].Z = FMath::Min(Points[Index - 1].Z -
+                    FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index])) * MinimumGradient,
+                    FMath::Max(Points[Index].Z, AnchoredHeight));
+            }
+            return;
+        }
+    }
+
+    if (Data.Lakes.IsValidIndex(StartLakeIndex))
+    {
+        EnforceDownhill(Points);
+    }
+    if (Data.Lakes.IsValidIndex(EndLakeIndex))
+    {
+        for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
+        {
+            const double HorizontalDistance = FVector2D::Distance(FVector2D(Points[Index]), FVector2D(Points[Index + 1]));
+            Points[Index].Z = FMath::Max(Points[Index].Z, Points[Index + 1].Z + HorizontalDistance * MinimumGradient);
+        }
+    }
+}
 
 static void ExtractRivers(
     FAvenorStripData& Data,
@@ -1271,6 +1384,7 @@ static void ExtractRivers(
     double MainValleyWidth,
     double MaximumValleyDepth,
     double MeanderStrength,
+    double FeaturePointSpacing,
     int32 MaximumReaches,
     bool bCanyons,
     double CanyonStartArea,
@@ -1410,11 +1524,24 @@ static void ExtractRivers(
     for (int32 Start : Starts)
     {
         FRiverCandidate CandidateReach;
+        if (ForcedSeedSet.Contains(Start))
+        {
+            FVector2D ShorePoint;
+            FindClosestLakeShorePoint(
+                Data, Data.CellPosition(Start), Data.CellSize * 2.5,
+                CandidateReach.StartLakeIndex, ShorePoint
+            );
+        }
         int32 Cell = Start;
         for (int32 Guard = 0; Guard < Data.Height.Num(); ++Guard)
         {
             CandidateReach.Cells.Add(Cell);
             const int32 Receiver = PrimaryReceiver(Data, Cell);
+            if (Receiver != INDEX_NONE && Data.LakeIndex.IsValidIndex(Receiver) &&
+                Data.LakeIndex[Receiver] != INDEX_NONE)
+            {
+                CandidateReach.EndLakeIndex = Data.LakeIndex[Receiver];
+            }
             if (Receiver == INDEX_NONE || !Channel[Receiver])
             {
                 break;
@@ -1468,7 +1595,15 @@ static void ExtractRivers(
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
         AddBroadMeanders(Points, Data.CellSize, MeanderStrength, LowlandFraction, Seed ^ (ReachIndex * 0x45D9F3B), Data.Bounds);
         Points = ChaikinSmooth(Points, false, 2);
-        Points = ResamplePolyline(Points, FMath::Max(2500.0, Data.CellSize * 0.42), false);
+        // Hydrology still chooses the drainage topology on the analysis
+        // grid, but the visible/vector feature is sampled independently.
+        // All downstream consumers use this same dense polyline, so water,
+        // remeshing and analytic carving cannot take different shortcuts.
+        Points = ResamplePolyline(
+            Points,
+            FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
+            false
+        );
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
@@ -1484,12 +1619,42 @@ static void ExtractRivers(
         }
         EnforceDownhill(Points);
 
+        if (Data.Lakes.IsValidIndex(CandidateReach.StartLakeIndex))
+        {
+            int32 IgnoredLakeIndex = INDEX_NONE;
+            FVector2D ShorePoint;
+            if (FindClosestLakeShorePoint(
+                Data, FVector2D(Points[0]), Data.CellSize * 2.5,
+                IgnoredLakeIndex, ShorePoint) && IgnoredLakeIndex == CandidateReach.StartLakeIndex)
+            {
+                Points[0].X = ShorePoint.X;
+                Points[0].Y = ShorePoint.Y;
+            }
+        }
+        if (Data.Lakes.IsValidIndex(CandidateReach.EndLakeIndex))
+        {
+            int32 IgnoredLakeIndex = INDEX_NONE;
+            FVector2D ShorePoint;
+            if (FindClosestLakeShorePoint(
+                Data, FVector2D(Points.Last()), Data.CellSize * 2.5,
+                IgnoredLakeIndex, ShorePoint) && IgnoredLakeIndex == CandidateReach.EndLakeIndex)
+            {
+                Points.Last().X = ShorePoint.X;
+                Points.Last().Y = ShorePoint.Y;
+            }
+        }
+        AnchorRiverToLakes(
+            Data, Points, CandidateReach.StartLakeIndex, CandidateReach.EndLakeIndex
+        );
+
         const int32 EndCell = CandidateReach.Cells.Last();
         const double Area = Data.Accumulation[EndCell];
         const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
         FRiverReach River;
         River.Points = MoveTemp(Points);
         River.DrainageArea = Area;
+        River.StartLakeIndex = CandidateReach.StartLakeIndex;
+        River.EndLakeIndex = CandidateReach.EndLakeIndex;
         River.Width = FMath::Lerp(HeadwaterWidth, MainRiverWidth, RiverAlpha);
         River.Depth = FMath::Lerp(FMath::Max(120.0, MaximumDepth * 0.12), MaximumDepth, RiverAlpha);
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
@@ -1521,11 +1686,11 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
     using namespace UE::Avenor::Strip;
     const double Underlying = SampleGrid(Height, Position);
     double Result = Underlying;
-    bool bInsideLake = false;
-    bool bNearLakeBank = false;
+    int32 AffectedLakeIndex = INDEX_NONE;
     double BestBankAlpha = TNumericLimits<double>::Max();
-    for (const FLakeBasin& Lake : Lakes)
+    for (int32 LakeIndex = 0; LakeIndex < Lakes.Num(); ++LakeIndex)
     {
+        const FLakeBasin& Lake = Lakes[LakeIndex];
         if (!Lake.Bounds.IsInside(Position) || Lake.Shoreline.Num() < 3)
         {
             continue;
@@ -1535,11 +1700,33 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
         const double Radius = FMath::Max(CellSize * 0.35, Lake.DepthRampWidth);
         if (bInside)
         {
-            const double DepthAlpha = Smooth01(FMath::Clamp(EdgeDistance / Radius, 0.0, 1.0));
+            // The shoreline is the dry rim, while SurfaceHeight is the
+            // actual water plane (normally inset below it). Meet the rim at
+            // the polygon edge, descend through the waterline just inside
+            // it, then deepen the bed. Previously the terrain was forced to
+            // SurfaceHeight at the exact edge, leaving no containing bank
+            // and allowing small Water Mesh rasterisation errors to appear
+            // as visibly floating water.
+            const double SurfaceInset = FMath::Max(0.0, Lake.ShorelineHeight - Lake.SurfaceHeight);
+            const double ShoreRampWidth = FMath::Clamp(
+                FMath::Max(SurfaceInset * 4.0, CellSize * 0.12),
+                200.0,
+                FMath::Max(200.0, Radius * 0.35)
+            );
+            const double ShoreAlpha = Smooth01(FMath::Clamp(
+                EdgeDistance / FMath::Max(1.0, ShoreRampWidth), 0.0, 1.0
+            ));
+            const double NearShoreHeight = FMath::Lerp(
+                Lake.ShorelineHeight, Lake.SurfaceHeight, ShoreAlpha
+            );
+            const double BedDistance = FMath::Max(0.0, EdgeDistance - ShoreRampWidth);
+            const double DepthAlpha = Smooth01(FMath::Clamp(
+                BedDistance / FMath::Max(1.0, Radius - ShoreRampWidth), 0.0, 1.0
+            ));
             const double BedNoise = Fbm(Position, FMath::Max(Radius * 2.0, CellSize * 2.0), FVector2D(4231.0, -8877.0), 3);
             const double BedDepth = Lake.MaximumDepth * FMath::Clamp(0.86 + 0.14 * BedNoise, 0.72, 1.0);
-            Result = FMath::Lerp(Lake.SurfaceHeight, Lake.SurfaceHeight - BedDepth, DepthAlpha);
-            bInsideLake = true;
+            Result = FMath::Lerp(NearShoreHeight, Lake.SurfaceHeight - BedDepth, DepthAlpha);
+            AffectedLakeIndex = LakeIndex;
             break;
         }
         else if (EdgeDistance < Lake.BankBlendWidth)
@@ -1548,20 +1735,22 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
             if (BankAlpha < BestBankAlpha)
             {
                 BestBankAlpha = BankAlpha;
-                Result = FMath::Lerp(Lake.SurfaceHeight, Underlying, BankAlpha);
-                bNearLakeBank = true;
+                Result = FMath::Lerp(Lake.ShorelineHeight, Underlying, BankAlpha);
+                AffectedLakeIndex = LakeIndex;
             }
         }
-    }
-    if (bInsideLake || bNearLakeBank)
-    {
-        return Result;
     }
     bool bHasRiverProfile = false;
     double BestRiverInfluence = 0.0;
     double BestRiverTarget = Result;
     for (const FRiverReach& River : Rivers)
     {
+        if (AffectedLakeIndex != INDEX_NONE &&
+            River.StartLakeIndex != AffectedLakeIndex &&
+            River.EndLakeIndex != AffectedLakeIndex)
+        {
+            continue;
+        }
         if (!River.Bounds.IsInside(Position) || River.Points.Num() < 2)
         {
             continue;
@@ -1604,7 +1793,7 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
             );
             const double Shaped = FMath::Pow(ValleyAlpha, FMath::Max(0.2, River.CrossSectionExponent));
             const double BankAlpha = Smooth01(Shaped);
-            CarveTarget = FMath::Lerp(SurfaceHeight, Underlying, BankAlpha);
+            CarveTarget = FMath::Lerp(SurfaceHeight, Result, BankAlpha);
             Influence = 1.0 - BankAlpha;
         }
         if (!bHasRiverProfile || Influence > BestRiverInfluence)
@@ -1616,7 +1805,11 @@ double FAvenorStripData::SampleHeight(const FVector2D& Position) const
     }
     if (bHasRiverProfile)
     {
-        Result = BestRiverTarget;
+        // Rivers are erosional features. In particular, a lake bank must be
+        // allowed to open at a connected inlet/outlet, but a river profile
+        // must never raise either the broad terrain or the lake blend into a
+        // mesa when its computed water datum is higher.
+        Result = FMath::Min(Result, BestRiverTarget);
     }
     return Result;
 }
@@ -2013,7 +2206,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             *Data, MandatoryTerminusSeeds, Generator.MinimumLakeDepth, Generator.MinimumLakeBedDepth,
             Generator.MaximumLakeBedDepth, Generator.MaximumLakeArea, Generator.MaximumLakeCount,
             Generator.MaximumLakeCoverageFraction, Generator.LakeBankBlendWidth, Generator.LakeDepthRampWidth,
-            Generator.LakeSurfaceInset, Generator.bGenerateLakeOutflows, OutflowSeeds
+            Generator.FeatureSplinePointSpacing, Generator.LakeSurfaceInset,
+            Generator.bGenerateLakeOutflows, OutflowSeeds
         );
     }
     else
@@ -2026,7 +2220,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             *Data, OutflowSeeds, Generator.Seed, Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea,
             Generator.MainRiverArea, Generator.MinimumRiverSystemLength, Generator.HeadwaterWidth, Generator.MainRiverWidth,
             Generator.MaximumRiverDepth, Generator.HeadwaterValleyHalfWidth, Generator.MainValleyHalfWidth,
-            Generator.MaximumValleyDepth, Generator.LowlandMeanderStrength, Generator.MaximumRiverReaches,
+            Generator.MaximumValleyDepth, Generator.LowlandMeanderStrength,
+            Generator.FeatureSplinePointSpacing, Generator.MaximumRiverReaches,
             Generator.bGenerateMesasAndCanyons, Generator.CanyonStartArea,
             Generator.RiverChannelSteepness
         );
@@ -2111,7 +2306,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("8c3e7a12-4f96-4b58-9d21-6a7c3e8f1b95")); }
+    static FGuid Version() { return FGuid(TEXT("4f859c4a-2316-4d0a-8c72-a95e1fb634de")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2139,50 +2334,6 @@ static TWaterActor* SpawnWaterActor(
         Actor->Tags.AddUnique(OwnerTag);
     }
     return Actor;
-}
-
-static double ComputeGuaranteedLakeSurfaceZ(
-    const FAvenorStripData& Data,
-    const TArray<FVector>& Shoreline
-)
-{
-    // Last, unconditional safety net. Whatever upstream computation
-    // produced the current surface height, sample the real bank terrain
-    // immediately outside the shoreline - using the exact SampleHeight
-    // function the rendered ground mesh consumes - and never allow the
-    // water to sit above the single lowest point of it, even if that means
-    // lowering the entire lake to satisfy just one point on the rim.
-    if (Shoreline.Num() < 3)
-    {
-        return Shoreline.Num() > 0 ? Shoreline[0].Z : 0.0;
-    }
-    double MinimumBankHeight = TNumericLimits<double>::Max();
-    const int32 Count = Shoreline.Num();
-    const double Offset = FMath::Max(Data.CellSize * 0.5, 1000.0);
-    for (int32 Index = 0; Index < Count; ++Index)
-    {
-        const FVector2D Previous(Shoreline[(Index - 1 + Count) % Count]);
-        const FVector2D Current(Shoreline[Index]);
-        const FVector2D Next(Shoreline[(Index + 1) % Count]);
-        FVector2D Tangent = Next - Previous;
-        if (!Tangent.Normalize())
-        {
-            continue;
-        }
-        const FVector2D Normal(-Tangent.Y, Tangent.X);
-        const FVector2D CandidateA = Current + Normal * Offset;
-        const FVector2D CandidateB = Current - Normal * Offset;
-        const FVector2D Outward = IsInsidePolygon(CandidateA, Shoreline)
-            ? CandidateB
-            : CandidateA;
-        MinimumBankHeight = FMath::Min(MinimumBankHeight, Data.SampleGrid(Data.Height, Outward));
-    }
-    if (MinimumBankHeight >= TNumericLimits<double>::Max())
-    {
-        return Shoreline[0].Z;
-    }
-    const double SafetyMargin = 20.0;
-    return FMath::Min(Shoreline[0].Z, MinimumBankHeight - SafetyMargin);
 }
 
 static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, bool bClosed)
@@ -2366,14 +2517,12 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
         TArray<FVector> LocalShoreline = Data->Lakes[Index].Shoreline;
-        const double GuaranteedZ = ComputeGuaranteedLakeSurfaceZ(*Data, LocalShoreline);
-        if (LocalShoreline.Num() > 0 &&
-            GuaranteedZ < LocalShoreline[0].Z - UE_DOUBLE_KINDA_SMALL_NUMBER)
+        // SurfaceHeight was fixed while the matching analytic shore profile
+        // was built. Do not independently re-sample/re-lower the Water Body
+        // here: that created two competing versions of the same lake.
+        for (FVector& Point : LocalShoreline)
         {
-            for (FVector& Point : LocalShoreline)
-            {
-                Point.Z = GuaranteedZ;
-            }
+            Point.Z = Data->Lakes[Index].SurfaceHeight;
         }
         TArray<FVector> LakePoints = ToWorldPoints(LocalShoreline);
         if (AWaterBodyLake* Lake = SpawnWaterActor<AWaterBodyLake>(
@@ -2392,10 +2541,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
         TArray<FVector> RiverPoints = ToWorldPoints(Data->Rivers[Index].Points);
-        for (FVector& Point : RiverPoints)
-        {
-            Point.Z -= 100.0;
-        }
         if (AWaterBodyRiver* River = SpawnWaterActor<AWaterBodyRiver>(
             *World,
             FString::Printf(TEXT("Avenor_Strip_River_%03d"), Index + 1),
