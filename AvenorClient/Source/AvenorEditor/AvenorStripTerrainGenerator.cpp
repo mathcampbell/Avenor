@@ -417,6 +417,13 @@ struct FAvenorStripData
     TArray<UE::Avenor::Strip::FRiverReach> Rivers;
     TArray<UE::Avenor::Strip::FLakeBasin> Lakes;
     TArray<FVector> OceanBoundary;
+    int32 RequestedMountainRanges = 0;
+    int32 PlacedMountainRanges = 0;
+    int32 AuthoritativeRiverCells = 0;
+    int32 RejectedShortRiverSystems = 0;
+    int32 RiverTerminusLakeCandidates = 0;
+    int32 AcceptedRiverTerminusLakes = 0;
+    int32 AcceptedOptionalLakes = 0;
 
     int32 Index(int32 X, int32 Y) const { return Y * Columns + X; }
     bool IsValid(int32 X, int32 Y) const { return X >= 0 && X < Columns && Y >= 0 && Y < Rows; }
@@ -907,18 +914,20 @@ struct FLakeCandidate
     double MaxX = -TNumericLimits<double>::Max();
     double MinY = TNumericLimits<double>::Max();
     double MaxY = -TNumericLimits<double>::Max();
-    bool bMandatory = false;
+    bool bRiverTerminus = false;
     int32 RimSpillCell = INDEX_NONE;
     double RimSpillHeight = TNumericLimits<double>::Max();
 };
 
-static TArray<int32> FindDrainageTerminusSeeds(
+static TArray<bool> BuildAuthoritativeRiverNetwork(
     const FAvenorStripData& Data,
     double MountainStartArea,
     double LowlandStartArea,
-    double MinimumSystemLength
+    double MinimumSystemLength,
+    int32& OutRejectedSystemCount
 )
 {
+    OutRejectedSystemCount = 0;
     TArray<bool> Channel;
     Channel.Init(false, Data.Height.Num());
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
@@ -983,13 +992,28 @@ static TArray<int32> FindDrainageTerminusSeeds(
             SystemLength[FindSystemRoot(Cell)] += FVector2D::Distance(Data.CellPosition(Cell), Data.CellPosition(Receiver));
         }
     }
+    TSet<int32> RejectedRoots;
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
-        if (Channel[Cell] && SystemLength[FindSystemRoot(Cell)] < MinimumSystemLength)
+        if (Channel[Cell])
         {
-            Channel[Cell] = false;
+            const int32 Root = FindSystemRoot(Cell);
+            if (SystemLength[Root] < MinimumSystemLength)
+            {
+                RejectedRoots.Add(Root);
+                Channel[Cell] = false;
+            }
         }
     }
+    OutRejectedSystemCount = RejectedRoots.Num();
+    return Channel;
+}
+
+static TArray<int32> FindDrainageTerminusSeeds(
+    const FAvenorStripData& Data,
+    const TArray<bool>& Channel
+)
+{
     TArray<int32> Termini;
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
@@ -1035,7 +1059,7 @@ static void ExtractLakes(
     Data.Lakes.Reset();
     Data.LakeIndex.Init(INDEX_NONE, Data.Height.Num());
     OutOutflowSeeds.Reset();
-    if (MaximumCount <= 0 && MandatoryTerminusSeeds.IsEmpty())
+    if (MaximumCount <= 0)
     {
         return;
     }
@@ -1110,20 +1134,11 @@ static void ExtractLakes(
         {
             if (MandatorySeedSet.Contains(Cell))
             {
-                Basin.bMandatory = true;
+                Basin.bRiverTerminus = true;
                 break;
             }
         }
-        // A mandatory basin still gets real headroom over MaximumArea (a
-        // river must not be orphaned just because its natural low point is
-        // a bit larger than the configured "normal" lake size), but a flat
-        // 20% of the *entire world* was large enough to let one continuous
-        // valley depression swallow enormous fractions of the map. Both
-        // classes are now bounded relative to what the user actually
-        // defined as "too big for a lake".
-        const double SanityCap = Basin.bMandatory
-            ? FMath::Max(MaximumArea * 1.75, WorldArea * 0.02)
-            : FMath::Max(MaximumArea * 1.5, WorldArea * 0.01);
+        const double SanityCap = FMath::Max(MaximumArea * 1.5, WorldArea * 0.01);
         if (Area >= Data.CellAreaSquareKilometres() * 2.0 && Area <= SanityCap)
         {
             Basins.Add(MoveTemp(Basin));
@@ -1133,7 +1148,7 @@ static void ExtractLakes(
     TArray<FLakeCandidate> OptionalBasins;
     for (FLakeCandidate& Basin : Basins)
     {
-        (Basin.bMandatory ? MandatoryBasins : OptionalBasins).Add(MoveTemp(Basin));
+        (Basin.bRiverTerminus ? MandatoryBasins : OptionalBasins).Add(MoveTemp(Basin));
     }
     MandatoryBasins.Sort([](const FLakeCandidate& A, const FLakeCandidate& B) { return A.CatchmentArea > B.CatchmentArea; });
     OptionalBasins.Sort([](const FLakeCandidate& A, const FLakeCandidate& B)
@@ -1147,7 +1162,8 @@ static void ExtractLakes(
 
     const double MaximumTotalLakeArea = WorldArea * FMath::Clamp(MaximumCoverageFraction, 0.0, 0.5);
     double AcceptedLakeArea = 0.0;
-    int32 AcceptedOptionalCount = 0;
+    int32 AcceptedCount = 0;
+    Data.RiverTerminusLakeCandidates = MandatoryBasins.Num();
     for (const FLakeCandidate& CandidateBasin : OrderedBasins)
     {
         const double BasinArea = CandidateBasin.Cells.Num() * Data.CellAreaSquareKilometres();
@@ -1155,15 +1171,15 @@ static void ExtractLakes(
         {
             continue;
         }
-        if (!CandidateBasin.bMandatory)
+        // A river terminus makes a basin higher priority, not automatically
+        // valid. Every lake must satisfy the same depth, area, total coverage
+        // and count limits; rejected basins remain ordinary river terrain.
+        if (AcceptedCount >= MaximumCount ||
+            CandidateBasin.MaximumDepth < MinimumDepth ||
+            BasinArea > MaximumArea ||
+            AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
-            if (AcceptedOptionalCount >= MaximumCount ||
-                CandidateBasin.MaximumDepth < MinimumDepth ||
-                BasinArea > MaximumArea ||
-                AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
-            {
-                continue;
-            }
+            continue;
         }
         {
             // Shape check applies to every basin, mandatory or not. A long,
@@ -1231,9 +1247,14 @@ static void ExtractLakes(
             Data.LakeIndex[Cell] = NewLakeIndex;
         }
         AcceptedLakeArea += BasinArea;
-        if (!CandidateBasin.bMandatory)
+        ++AcceptedCount;
+        if (CandidateBasin.bRiverTerminus)
         {
-            ++AcceptedOptionalCount;
+            ++Data.AcceptedRiverTerminusLakes;
+        }
+        else
+        {
+            ++Data.AcceptedOptionalLakes;
         }
         if (bWantOutflows && CandidateBasin.RimSpillCell != INDEX_NONE)
         {
@@ -1372,12 +1393,10 @@ static void AnchorRiverToLakes(
 
 static void ExtractRivers(
     FAvenorStripData& Data,
+    const TArray<bool>& AuthoritativeChannel,
     const TArray<int32>& ForcedOutflowSeeds,
     int32 Seed,
-    double MountainStartArea,
-    double LowlandStartArea,
     double MainRiverArea,
-    double MinimumSystemLength,
     double HeadwaterWidth,
     double MainRiverWidth,
     double MaximumDepth,
@@ -1397,17 +1416,10 @@ static void ExtractRivers(
     {
         return;
     }
-    TArray<bool> Channel;
-    Channel.Init(false, Data.Height.Num());
-    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    TArray<bool> Channel = AuthoritativeChannel;
+    if (Channel.Num() != Data.Height.Num())
     {
-        if (Data.LakeIndex.IsValidIndex(Cell) && Data.LakeIndex[Cell] != INDEX_NONE)
-        {
-            continue;
-        }
-        const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
-        const double StartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
-        Channel[Cell] = Data.Accumulation[Cell] >= StartArea && PrimaryReceiver(Data, Cell) != INDEX_NONE;
+        Channel.Init(false, Data.Height.Num());
     }
     for (int32 Seed2 : ForcedOutflowSeeds)
     {
@@ -1415,87 +1427,23 @@ static void ExtractRivers(
             (!Data.LakeIndex.IsValidIndex(Seed2) || Data.LakeIndex[Seed2] == INDEX_NONE) &&
             PrimaryReceiver(Data, Seed2) != INDEX_NONE)
         {
-            Channel[Seed2] = true;
-        }
-    }
-
-    TArray<int32> SystemParent;
-    SystemParent.Init(INDEX_NONE, Data.Height.Num());
-    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
-    {
-        if (Channel[Cell])
-        {
-            SystemParent[Cell] = Cell;
-        }
-    }
-    auto FindSystemRoot = [&](int32 Cell)
-    {
-        int32 Root = Cell;
-        while (SystemParent[Root] != Root)
-        {
-            Root = SystemParent[Root];
-        }
-        while (SystemParent[Cell] != Cell)
-        {
-            const int32 Next = SystemParent[Cell];
-            SystemParent[Cell] = Root;
-            Cell = Next;
-        }
-        return Root;
-    };
-    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
-    {
-        if (!Channel[Cell])
-        {
-            continue;
-        }
-        const int32 Receiver = PrimaryReceiver(Data, Cell);
-        if (Receiver == INDEX_NONE || !Channel[Receiver])
-        {
-            continue;
-        }
-        const int32 RootA = FindSystemRoot(Cell);
-        const int32 RootB = FindSystemRoot(Receiver);
-        if (RootA != RootB)
-        {
-            SystemParent[RootB] = RootA;
+            // Continue the lake's spill route until it rejoins the already
+            // accepted drainage network. This keeps an outflow connected
+            // without allowing the lake to redefine system-length validity.
+            int32 Cell = Seed2;
+            for (int32 Guard = 0; Guard < Data.Height.Num() && Data.Height.IsValidIndex(Cell); ++Guard)
+            {
+                Channel[Cell] = true;
+                const int32 Receiver = PrimaryReceiver(Data, Cell);
+                if (Receiver == INDEX_NONE || (Channel.IsValidIndex(Receiver) && Channel[Receiver]))
+                {
+                    break;
+                }
+                Cell = Receiver;
+            }
         }
     }
     TSet<int32> ForcedSeedSet(ForcedOutflowSeeds);
-    TArray<double> SystemLength;
-    SystemLength.Init(0.0, Data.Height.Num());
-    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
-    {
-        if (!Channel[Cell])
-        {
-            continue;
-        }
-        const int32 Receiver = PrimaryReceiver(Data, Cell);
-        if (Receiver != INDEX_NONE && Channel[Receiver])
-        {
-            SystemLength[FindSystemRoot(Cell)] += FVector2D::Distance(Data.CellPosition(Cell), Data.CellPosition(Receiver));
-        }
-    }
-    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
-    {
-        if (Channel[Cell] && SystemLength[FindSystemRoot(Cell)] < MinimumSystemLength &&
-            !ForcedSeedSet.Contains(FindSystemRoot(Cell)))
-        {
-            bool bContainsForcedSeed = false;
-            for (int32 ForcedSeedCell : ForcedOutflowSeeds)
-            {
-                if (Channel[ForcedSeedCell] && FindSystemRoot(ForcedSeedCell) == FindSystemRoot(Cell))
-                {
-                    bContainsForcedSeed = true;
-                    break;
-                }
-            }
-            if (!bContainsForcedSeed)
-            {
-                Channel[Cell] = false;
-            }
-        }
-    }
     TArray<int32> UpstreamCount;
     UpstreamCount.Init(0, Data.Height.Num());
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
@@ -1513,9 +1461,17 @@ static void ExtractRivers(
     TArray<int32> Starts;
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
-        if (Channel[Cell] && UpstreamCount[Cell] != 1)
+        const bool bInsideLake = Data.LakeIndex.IsValidIndex(Cell) && Data.LakeIndex[Cell] != INDEX_NONE;
+        if (Channel[Cell] && !bInsideLake && UpstreamCount[Cell] != 1)
         {
             Starts.Add(Cell);
+        }
+    }
+    for (int32 ForcedSeed : ForcedOutflowSeeds)
+    {
+        if (Channel.IsValidIndex(ForcedSeed) && Channel[ForcedSeed])
+        {
+            Starts.AddUnique(ForcedSeed);
         }
     }
     Starts.Sort([&](int32 A, int32 B) { return Data.FilledHeight[A] > Data.FilledHeight[B]; });
@@ -1892,7 +1848,8 @@ static TArray<FMountainRange> BuildMountainRanges(
     double RangeWidth,
     double PeakSpacing,
     double Relief,
-    double ExclusionHalfWidth
+    double ExclusionHalfWidth,
+    int32& OutRequestedCount
 )
 {
     const FVector Size = Bounds.GetSize();
@@ -1904,6 +1861,7 @@ static TArray<FMountainRange> BuildMountainRanges(
         RangesPer100Km > 0.0 ? 1 : 0,
         128
     );
+    OutRequestedCount = Count;
     const FVector2D Centre(Bounds.GetCenter());
     FRandomStream Random(Seed ^ 0x51A7F00D);
     TArray<FMountainRange> Ranges;
@@ -1913,16 +1871,19 @@ static TArray<FMountainRange> BuildMountainRanges(
     FVector2D AcrossDirection = Rotate90(LongDirection);
     for (int32 Index = 0; Index < Count; ++Index)
     {
-        const double HalfWidth = RangeWidth * Random.FRandRange(0.7, 1.35) * 0.5;
+        const double RequestedHalfWidth = RangeWidth * Random.FRandRange(0.7, 1.35) * 0.5;
+        const double AvailableHalfWidth = FMath::Max(0.0, AcrossExtent * 0.96 - ExclusionHalfWidth);
+        // Fit ranges to the available side of the strip instead of silently
+        // dropping them. Narrow proof-of-concept worlds still get a real
+        // ridge, just a narrower one that respects the Spine exclusion.
+        const double HalfWidth = FMath::Min(RequestedHalfWidth, AvailableHalfWidth * 0.92);
         // The near edge of the range - not just its centre - must clear
         // the exclusion width, otherwise a wide range placed close to the
         // minimum distance can still poke well into the excluded band.
         const double MinimumAcrossDistance = ExclusionHalfWidth + HalfWidth;
-        if (MinimumAcrossDistance >= AcrossExtent * 0.96)
+        if (HalfWidth < 10000.0 || MinimumAcrossDistance >= AcrossExtent * 0.96)
         {
-            // World isn't wide enough for a range of this size to fit
-            // outside the exclusion band at all - skip rather than force
-            // an encroaching placement.
+            // There is genuinely no useful land outside the exclusion band.
             continue;
         }
         const double Side = Random.FRand() < 0.5 ? -1.0 : 1.0;
@@ -2039,15 +2000,19 @@ static double EvaluateLandform(
     {
         for (const FMountainRange& Range : Mountains)
         {
-            // Warp the range's own silhouette, not just its ridge texture -
-            // without this the outline is a perfect ellipse regardless of
-            // how jagged the surface detail is, which reads as artificial
-            // no matter how much ridge noise sits on top of it.
+            // Distort the silhouette locally while keeping its nominated
+            // centre fixed. The previous global 6.5 km warp moved the whole
+            // range away from its guaranteed in-bounds placement.
             const FVector2D SilhouetteWarp(
-                Fbm(Warped, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
-                Fbm(Warped, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
+                Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
+                Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
             );
-            const FVector2D Delta = (Warped + SilhouetteWarp * Range.HalfWidth * 0.6) - Range.Centre;
+            const FVector2D CentreWarp(
+                Fbm(Range.Centre, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
+                Fbm(Range.Centre, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
+            );
+            const FVector2D Delta = Position - Range.Centre +
+                (SilhouetteWarp - CentreWarp) * Range.HalfWidth * 0.35;
             const double Along = FVector2D::DotProduct(Delta, Range.Along);
             const double Across = FVector2D::DotProduct(Delta, Range.Across);
             const double AlongNorm = FMath::Abs(Along) / FMath::Max(1.0, Range.HalfLength);
@@ -2081,8 +2046,9 @@ static double EvaluateLandform(
                 Warped, Range.PeakSpacing * 1.1,
                 SeedOffset + FVector2D(Range.Phase * 997.0, 313.0), 5
             );
-            const double Core = Range.Relief * CoreEnvelope * Peaks * FMath::Lerp(0.5, 1.0, Ridge);
-            const double Foothills = Range.Relief * 0.2 *
+            const double MountainStrength = FMath::Max(0.0, MountainWeight);
+            const double Core = Range.Relief * MountainStrength * CoreEnvelope * Peaks * FMath::Lerp(0.5, 1.0, Ridge);
+            const double Foothills = Range.Relief * MountainStrength * 0.2 *
                 FMath::Max(0.0, SkirtEnvelope - CoreEnvelope * 0.6) * (0.4 + 0.6 * Ridge);
             Height = FMath::Max(Height, Core + Foothills);
             OutMountainMask = FMath::Max(OutMountainMask, SkirtEnvelope);
@@ -2151,14 +2117,18 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     Data->DesertMask.SetNumUninitialized(CellCount);
     Data->PlainsMask.SetNumUninitialized(CellCount);
 
-    const TArray<FMountainRange> Mountains = Generator.bGenerateMountains
-        ? BuildMountainRanges(
+    TArray<FMountainRange> Mountains;
+    if (Generator.bGenerateMountains)
+    {
+        Mountains = BuildMountainRanges(
             Bounds, Generator.LongAxis, Generator.Seed,
             Generator.MountainRangesPer100Km, Generator.MountainRangeLength,
             Generator.MountainRangeWidth, Generator.MountainPeakSpacing,
-            Generator.MountainRelief, Generator.MountainExclusionHalfWidth
-        )
-        : TArray<FMountainRange>();
+            Generator.MountainRelief, Generator.MountainExclusionHalfWidth,
+            Data->RequestedMountainRanges
+        );
+    }
+    Data->PlacedMountainRanges = Mountains.Num();
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -2197,11 +2167,24 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Generator.ErosionResistanceStrength
     );
 
+    TArray<bool> AuthoritativeRiverNetwork;
+    if (Generator.bGenerateRivers)
+    {
+        AuthoritativeRiverNetwork = BuildAuthoritativeRiverNetwork(
+            *Data, Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea,
+            Generator.MinimumRiverSystemLength, Data->RejectedShortRiverSystems
+        );
+        for (bool bChannelCell : AuthoritativeRiverNetwork)
+        {
+            Data->AuthoritativeRiverCells += bChannelCell ? 1 : 0;
+        }
+    }
+
     TArray<int32> OutflowSeeds;
     if (Generator.bGenerateLakes)
     {
         const TArray<int32> MandatoryTerminusSeeds = Generator.bGenerateRivers
-            ? FindDrainageTerminusSeeds(*Data, Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea, Generator.MinimumRiverSystemLength)
+            ? FindDrainageTerminusSeeds(*Data, AuthoritativeRiverNetwork)
             : TArray<int32>();
         ExtractLakes(
             *Data, MandatoryTerminusSeeds, Generator.MinimumLakeDepth, Generator.MinimumLakeBedDepth,
@@ -2218,8 +2201,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     if (Generator.bGenerateRivers)
     {
         ExtractRivers(
-            *Data, OutflowSeeds, Generator.Seed, Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea,
-            Generator.MainRiverArea, Generator.MinimumRiverSystemLength, Generator.HeadwaterWidth, Generator.MainRiverWidth,
+            *Data, AuthoritativeRiverNetwork, OutflowSeeds, Generator.Seed,
+            Generator.MainRiverArea, Generator.HeadwaterWidth, Generator.MainRiverWidth,
             Generator.MaximumRiverDepth, Generator.HeadwaterValleyHalfWidth, Generator.MainValleyHalfWidth,
             Generator.MaximumValleyDepth, Generator.LowlandMeanderStrength,
             Generator.FeatureSplinePointSpacing, Generator.MaximumRiverReaches,
@@ -2307,7 +2290,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("4f859c4a-2316-4d0a-8c72-a95e1fb634de")); }
+    static FGuid Version() { return FGuid(TEXT("84a6351d-857c-45d5-a0f0-cc5660f08b1e")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2422,6 +2405,7 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
     SetRootComponent(TerrainModifier);
     FastPreviewMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("FastTerrainPreview"));
     FastPreviewMesh->SetupAttachment(TerrainModifier);
+    FastPreviewMesh->bIsEditorOnly = true;
     FastPreviewMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     FastPreviewMesh->SetGenerateOverlapEvents(false);
     FastPreviewMesh->SetCastShadow(false);
@@ -2716,10 +2700,15 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     }
 
     LastBuildStamp = FString::Printf(
-        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | %d rivers | %d lakes | NEXT: GENERATE REFINEMENT SPLINES"),
+        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | mountains %d/%d | channel cells %d | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
-        Seed, Data->Height.Num(), Data->CellSize, Data->Rivers.Num(), Data->Lakes.Num()
+        Seed, Data->Height.Num(), Data->CellSize,
+        Data->PlacedMountainRanges, Data->RequestedMountainRanges,
+        Data->AuthoritativeRiverCells, Data->RejectedShortRiverSystems,
+        Data->Rivers.Num(), Data->Lakes.Num(),
+        Data->AcceptedRiverTerminusLakes, Data->AcceptedOptionalLakes,
+        Data->RiverTerminusLakeCandidates
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip terrain submitted: %s"), *LastBuildStamp);
 #endif

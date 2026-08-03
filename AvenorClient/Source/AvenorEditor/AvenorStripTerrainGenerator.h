@@ -186,7 +186,11 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Zones", meta = (ClampMin = "10000.0"))
     double ZoneLength = 2500000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Zones", meta = (ClampMin = "0.0"))
+    UPROPERTY(
+        EditAnywhere,
+        Category = "Avenor|Landforms|Zones",
+        meta = (ClampMin = "0.0",
+            ToolTip = "Multiplier applied to placed mountain-range relief. 0 removes mountain relief; 1 uses the configured Mountain Relief."))
     double MountainZoneWeight = 1.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Landforms|Zones", meta = (ClampMin = "0.0"))
