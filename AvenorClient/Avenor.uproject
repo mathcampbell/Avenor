@@ -69,6 +69,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "ProceduralMeshComponent",
+			"Enabled": true
+		},
+		{
 			"Name": "ModelContextProtocol",
 			"Enabled": true
 		},

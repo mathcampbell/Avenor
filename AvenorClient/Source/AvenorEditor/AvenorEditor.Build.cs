@@ -22,7 +22,8 @@ public class AvenorEditor : ModuleRules
                 "Water",
                 "MeshPartition",
                 "MeshPartitionEditor",
-                "MeshPartitionWater"
+                "MeshPartitionWater",
+                "ProceduralMeshComponent"
             }
         );
     }

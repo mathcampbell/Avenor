@@ -16,6 +16,7 @@
 #include "WaterSplineComponent.h"
 #include "WaterSplineMetadata.h"
 #include "Components/SplineComponent.h"
+#include "ProceduralMeshComponent.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
@@ -50,7 +51,7 @@ static bool IsWaterOwnerTag(const FName& Tag)
     return Tag.ToString().StartsWith(TEXT("AvenorStripOwner_"));
 }
 
-// SplineRadius has no public C++ setter in UE 5.8. Reflection is therefore
+// SplineRadius has no public C++ setter in UE 5.8.1. Reflection is therefore
 // the only available editor-code route, but it is deliberately validated so
 // an engine rename produces a visible failure instead of a silent no-op.
 static bool SetSplineRemeshRadius(UE::MeshPartition::USplineRemeshModifier& Modifier, float Radius)
@@ -66,7 +67,7 @@ static bool SetSplineRemeshRadius(UE::MeshPartition::USplineRemeshModifier& Modi
     UE_LOG(
         LogTemp,
         Error,
-        TEXT("Avenor refinement: UE 5.8 USplineRemeshModifier no longer exposes the reflected SplineRadius property; refinement spline was not created.")
+        TEXT("Avenor refinement: UE 5.8.1 USplineRemeshModifier no longer exposes the reflected SplineRadius property; refinement spline was not created.")
     );
     return false;
 }
@@ -2419,6 +2420,13 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
     SetIsSpatiallyLoaded(false);
     TerrainModifier = CreateDefaultSubobject<UAvenorStripTerrainModifier>(TEXT("StripTerrain"));
     SetRootComponent(TerrainModifier);
+    FastPreviewMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("FastTerrainPreview"));
+    FastPreviewMesh->SetupAttachment(TerrainModifier);
+    FastPreviewMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    FastPreviewMesh->SetGenerateOverlapEvents(false);
+    FastPreviewMesh->SetCastShadow(false);
+    FastPreviewMesh->SetHiddenInGame(true);
+    FastPreviewMesh->SetVisibility(false);
     LastBuildStamp = TEXT("Never generated");
 }
 
@@ -2449,6 +2457,95 @@ void AAvenorStripTerrainGenerator::InvalidateData()
     CachedData.Reset();
     bTerrainPlanReadyForWater = false;
     bRefinementPlanReadyForWater = false;
+}
+
+bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDialog)
+{
+#if WITH_EDITOR
+    UE::MeshPartition::AMeshPartition* TargetMeshPartition =
+        Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
+    if (!TargetMeshPartition || !TerrainModifier)
+    {
+        if (bShowFailureDialog)
+        {
+            FMessageDialog::Open(
+                EAppMsgType::Ok,
+                FText::FromString(TEXT("Assign a valid Mesh Partition actor before refreshing terrain."))
+            );
+        }
+        return false;
+    }
+
+    // Binding is intentionally performed after CachedData has been replaced.
+    // Previously this happened before InvalidateData()/GetOrCreateData(), so
+    // Mesh Partition could retain a background operation containing old data
+    // until the level was reloaded.
+    TerrainModifier->Modify();
+    TerrainModifier->SetAffectedMeshPartition(nullptr);
+    TerrainModifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
+    const TArray<FName> PriorityLayers = TerrainModifier->GetDefinitionPriorityLayers();
+    if (PriorityLayers.Num() < 2)
+    {
+        if (bShowFailureDialog)
+        {
+            FMessageDialog::Open(
+                EAppMsgType::Ok,
+                FText::FromString(TEXT(
+                    "The Mesh Partition Definition needs at least two Modifier Priority Layers. "
+                    "Avenor uses the first for remeshing and the last for terrain carving."
+                ))
+            );
+        }
+        return false;
+    }
+    TerrainModifier->SetPriorityLayer(PriorityLayers.Last());
+    TerrainModifier->SetPriority(0.0);
+    TerrainModifier->PostEditChange();
+
+    const FName OwnerTag = MakeWaterOwnerTag(*this);
+    int32 BoundRefinementModifiers = 0;
+    if (UWorld* World = GetWorld())
+    {
+        for (TActorIterator<AActor> It(World); It; ++It)
+        {
+            if (!It->Tags.Contains(GeneratedRefinementTag) || !It->Tags.Contains(OwnerTag))
+            {
+                continue;
+            }
+            TInlineComponentArray<UE::MeshPartition::USplineRemeshModifier*> Modifiers;
+            It->GetComponents(Modifiers);
+            for (UE::MeshPartition::USplineRemeshModifier* Modifier : Modifiers)
+            {
+                Modifier->Modify();
+                Modifier->UpdateSplineData();
+                Modifier->SetAffectedMeshPartition(nullptr);
+                Modifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
+                Modifier->SetPriorityLayer(PriorityLayers[0]);
+                Modifier->SetPriority(0.0);
+                ++BoundRefinementModifiers;
+            }
+        }
+    }
+
+    TargetMeshPartition->Modify();
+    TargetMeshPartition->PostEditChange();
+    TargetMeshPartition->ReregisterAllComponents();
+    TargetMeshPartition->MarkPackageDirty();
+    MarkPackageDirty();
+    if (GEditor)
+    {
+        GEditor->RedrawLevelEditingViewports(true);
+    }
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor refreshed Mesh Partition in-place with terrain plus %d refinement modifiers."),
+        BoundRefinementModifiers
+    );
+    return true;
+#else
+    return false;
+#endif
 }
 
 void AAvenorStripTerrainGenerator::ClearGeneratedWater()
@@ -2613,6 +2710,11 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
 
     bTerrainPlanReadyForWater = true;
 
+    if (!bDeferMeshRefresh)
+    {
+        bTerrainPlanReadyForWater = BindModifiersAndRefresh(true);
+    }
+
     LastBuildStamp = FString::Printf(
         TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | %d rivers | %d lakes | NEXT: GENERATE REFINEMENT SPLINES"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
@@ -2660,8 +2762,6 @@ void AAvenorStripTerrainGenerator::ClearGeneratedRefinementSplines()
 #if WITH_EDITOR
 static bool SpawnRefinementSpline(
     UWorld& World,
-    UE::MeshPartition::AMeshPartition& TargetMeshPartition,
-    FName PriorityLayer,
     const FString& Label,
     FName OwnerTag,
     FName RefinementTag,
@@ -2722,10 +2822,6 @@ static bool SpawnRefinementSpline(
     }
     Modifier->RegisterComponent();
     Modifier->UpdateSplineData();
-    Modifier->SetAffectedMeshPartition(nullptr);
-    Modifier->BP_SetAffectedMegaMesh(&TargetMeshPartition);
-    Modifier->SetPriorityLayer(PriorityLayer);
-    Modifier->SetPriority(0.0);
     return true;
 }
 #endif
@@ -2757,7 +2853,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         FMessageDialog::Open(
             EAppMsgType::Ok,
             FText::FromString(TEXT(
-                "UE 5.8 Spline Remesh has a coordinate-space defect when the "
+                "UE 5.8.1 Spline Remesh has a coordinate-space defect when the "
                 "Mesh Partition actor has a non-identity transform. Keep the "
                 "Mesh Partition actor at world origin with zero rotation and "
                 "unit scale before generating refinement splines."
@@ -2781,7 +2877,6 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         );
         return;
     }
-    const FName RefinementPriorityLayer = PriorityLayers[0];
     TerrainModifier->SetPriorityLayer(PriorityLayers.Last());
 
     FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating refinement splines...")));
@@ -2829,7 +2924,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
             )
             : River.Width * 0.5 + RefinementCoverageMargin;
         if (SpawnRefinementSpline(
-            *World, *TargetMeshPartition, RefinementPriorityLayer,
+            *World,
             FString::Printf(TEXT("Avenor_Strip_Refine_River_%03d"), Index + 1),
             OwnerTag, GeneratedRefinementTag,
             ToRemeshPoints(River.Points), false,
@@ -2848,7 +2943,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
             CachedData->CellSize * 0.6
         );
         if (SpawnRefinementSpline(
-            *World, *TargetMeshPartition, RefinementPriorityLayer,
+            *World,
             FString::Printf(TEXT("Avenor_Strip_Refine_Lake_%02d"), Index + 1),
             OwnerTag, GeneratedRefinementTag,
             ToRemeshPoints(Lake.Shoreline), true,
@@ -2864,8 +2959,13 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         CreatedRiverSplines == CachedData->Rivers.Num() &&
         CreatedLakeSplines == CachedData->Lakes.Num();
 
+    if (bRefinementPlanReadyForWater && !bDeferMeshRefresh)
+    {
+        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+    }
+
     LastBuildStamp = FString::Printf(
-        TEXT("Refinement splines placed %s | code %s | %d/%d river reaches | %d/%d lake shores | REBUILD MESH TERRAIN, THEN GENERATE WATER"),
+        TEXT("Refinement splines placed %s | code %s | %d/%d river reaches | %d/%d lake shores | IN-PLACE MESH REFRESH REQUESTED; WAIT, THEN GENERATE WATER"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         CreatedRiverSplines, CachedData->Rivers.Num(),
@@ -2883,6 +2983,181 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
             ))
         );
     }
+#endif
+}
+
+void AAvenorStripTerrainGenerator::RegenerateAndRefreshTerrain()
+{
+#if WITH_EDITOR
+    bDeferMeshRefresh = true;
+    GenerateTerrain();
+    if (bTerrainPlanReadyForWater)
+    {
+        GenerateRefinementSplines();
+    }
+    bDeferMeshRefresh = false;
+
+    if (bTerrainPlanReadyForWater && bRefinementPlanReadyForWater)
+    {
+        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+        LastBuildStamp += TEXT(" | in-place refresh requested");
+    }
+#endif
+}
+
+void AAvenorStripTerrainGenerator::RefreshMeshTerrainInPlace()
+{
+#if WITH_EDITOR
+    BindModifiersAndRefresh(true);
+#endif
+}
+
+void AAvenorStripTerrainGenerator::ClearFastPreview()
+{
+#if WITH_EDITOR
+    if (FastPreviewMesh)
+    {
+        FastPreviewMesh->ClearAllMeshSections();
+        FastPreviewMesh->SetVisibility(false);
+    }
+#endif
+}
+
+void AAvenorStripTerrainGenerator::GenerateFastPreview()
+{
+#if WITH_EDITOR
+    if (!FastPreviewMesh)
+    {
+        return;
+    }
+
+    const double RequestedSpacing = FMath::Max(500.0, PreviewVertexSpacing);
+    const double SizeX = FMath::Max(10000.0, PreviewSize.X);
+    const double SizeY = FMath::Max(10000.0, PreviewSize.Y);
+    const int32 Columns = FMath::CeilToInt(SizeX / RequestedSpacing) + 1;
+    const int32 Rows = FMath::CeilToInt(SizeY / RequestedSpacing) + 1;
+    constexpr int32 MaximumPreviewVertices = 250000;
+    if (Columns < 2 || Rows < 2 || static_cast<int64>(Columns) * Rows > MaximumPreviewVertices)
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(FString::Printf(
+                TEXT("Fast preview would create %lld vertices. Increase Preview Vertex Spacing or reduce Preview Size (limit: %d vertices)."),
+                static_cast<int64>(Columns) * Rows,
+                MaximumPreviewVertices
+            ))
+        );
+        return;
+    }
+
+    FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating fast local terrain preview...")));
+    Progress.MakeDialog();
+    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Calculating terrain and hydrology")));
+    const TSharedPtr<const FAvenorStripData> Data = GetOrCreateData();
+    if (!Data)
+    {
+        return;
+    }
+
+    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Building lightweight preview mesh")));
+    const double StepX = SizeX / static_cast<double>(Columns - 1);
+    const double StepY = SizeY / static_cast<double>(Rows - 1);
+    const FVector ActorLocation = GetActorLocation();
+    TArray<FVector> Vertices;
+    TArray<int32> Triangles;
+    TArray<FVector> Normals;
+    TArray<FVector2D> UVs;
+    TArray<FLinearColor> VertexColors;
+    TArray<FProcMeshTangent> Tangents;
+    Vertices.SetNumUninitialized(Columns * Rows);
+    Normals.SetNumUninitialized(Columns * Rows);
+    UVs.SetNumUninitialized(Columns * Rows);
+    VertexColors.SetNumUninitialized(Columns * Rows);
+    Triangles.Reserve((Columns - 1) * (Rows - 1) * 6);
+
+    TArray<double> Heights;
+    Heights.SetNumUninitialized(Columns * Rows);
+    double MinimumHeight = TNumericLimits<double>::Max();
+    double MaximumHeight = -TNumericLimits<double>::Max();
+    auto GridIndex = [Columns](int32 X, int32 Y) { return Y * Columns + X; };
+    for (int32 Y = 0; Y < Rows; ++Y)
+    {
+        for (int32 X = 0; X < Columns; ++X)
+        {
+            const int32 Index = GridIndex(X, Y);
+            const double LocalX = PreviewCentreOffset.X - SizeX * 0.5 + X * StepX;
+            const double LocalY = PreviewCentreOffset.Y - SizeY * 0.5 + Y * StepY;
+            const double Height = Data->SampleHeight(FVector2D(
+                ActorLocation.X + LocalX,
+                ActorLocation.Y + LocalY
+            ));
+            Heights[Index] = Height;
+            MinimumHeight = FMath::Min(MinimumHeight, Height);
+            MaximumHeight = FMath::Max(MaximumHeight, Height);
+            Vertices[Index] = FVector(LocalX, LocalY, Height + PreviewDisplayOffsetZ);
+            UVs[Index] = FVector2D(
+                static_cast<double>(X) / (Columns - 1),
+                static_cast<double>(Y) / (Rows - 1)
+            );
+        }
+    }
+
+    for (int32 Y = 0; Y < Rows; ++Y)
+    {
+        for (int32 X = 0; X < Columns; ++X)
+        {
+            const int32 Index = GridIndex(X, Y);
+            const double Left = Heights[GridIndex(FMath::Max(0, X - 1), Y)];
+            const double Right = Heights[GridIndex(FMath::Min(Columns - 1, X + 1), Y)];
+            const double Down = Heights[GridIndex(X, FMath::Max(0, Y - 1))];
+            const double Up = Heights[GridIndex(X, FMath::Min(Rows - 1, Y + 1))];
+            Normals[Index] = FVector(Left - Right, Down - Up, StepX + StepY).GetSafeNormal();
+            const float HeightAlpha = static_cast<float>(FMath::GetRangePct(
+                MinimumHeight,
+                FMath::Max(MinimumHeight + 1.0, MaximumHeight),
+                Heights[Index]
+            ));
+            VertexColors[Index] = FLinearColor::LerpUsingHSV(
+                FLinearColor(0.08f, 0.22f, 0.07f),
+                FLinearColor(0.72f, 0.72f, 0.68f),
+                HeightAlpha
+            );
+        }
+    }
+    for (int32 Y = 0; Y + 1 < Rows; ++Y)
+    {
+        for (int32 X = 0; X + 1 < Columns; ++X)
+        {
+            const int32 A = GridIndex(X, Y);
+            const int32 B = GridIndex(X + 1, Y);
+            const int32 C = GridIndex(X, Y + 1);
+            const int32 D = GridIndex(X + 1, Y + 1);
+            Triangles.Add(A);
+            Triangles.Add(B);
+            Triangles.Add(D);
+            Triangles.Add(A);
+            Triangles.Add(D);
+            Triangles.Add(C);
+        }
+    }
+
+    FastPreviewMesh->ClearAllMeshSections();
+    FastPreviewMesh->CreateMeshSection_LinearColor(
+        0, Vertices, Triangles, Normals, UVs, VertexColors, Tangents, false
+    );
+    FastPreviewMesh->SetVisibility(true);
+    FastPreviewMesh->MarkRenderStateDirty();
+    if (GEditor)
+    {
+        GEditor->RedrawLevelEditingViewports(true);
+    }
+    LastBuildStamp = FString::Printf(
+        TEXT("Fast preview generated %s | %.1f x %.1f km | %d vertices | production Mesh Partition unchanged"),
+        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        SizeX / 100000.0,
+        SizeY / 100000.0,
+        Vertices.Num()
+    );
 #endif
 }
 

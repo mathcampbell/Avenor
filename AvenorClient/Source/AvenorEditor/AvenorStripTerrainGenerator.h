@@ -7,6 +7,7 @@
 #include "AvenorStripTerrainGenerator.generated.h"
 
 struct FAvenorStripData;
+class UProceduralMeshComponent;
 
 UENUM(BlueprintType)
 enum class EAvenorStripLongAxis : uint8
@@ -76,6 +77,33 @@ public:
     void GenerateRefinementSplines();
 
     /**
+     * Complete editor iteration path. Recalculates the feature plan, replaces
+     * refinement splines, then notifies and refreshes Mesh Partition in-place.
+     * The Mesh Partition build can still take time, but saving/reloading the
+     * level should not be necessary to see its result.
+     */
+    UFUNCTION(CallInEditor, Category = "Avenor|Generation",
+        meta = (DisplayName = "Generate + Refresh Mesh Terrain"))
+    void RegenerateAndRefreshTerrain();
+
+    /** Re-submit the current modifiers and redraw Mesh Partition in-place. */
+    UFUNCTION(CallInEditor, Category = "Avenor|Generation",
+        meta = (DisplayName = "Refresh Mesh Terrain In Place"))
+    void RefreshMeshTerrainInPlace();
+
+    /**
+     * Build a lightweight local mesh directly from the analytic height
+     * function. This bypasses Mesh Partition, collision and water so terrain
+     * parameters can be iterated in seconds.
+     */
+    UFUNCTION(CallInEditor, Category = "Avenor|Preview",
+        meta = (DisplayName = "Generate Fast Local Preview"))
+    void GenerateFastPreview();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Preview")
+    void ClearFastPreview();
+
+    /**
      * Stage 3: create Water actors from the exact cached river/lake plan
      * used to carve the terrain. Refuses to run until stage 1 has
      * succeeded; run this after stage 2's Mesh Partition build finishes.
@@ -102,6 +130,27 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Target")
     TObjectPtr<UAvenorStripTerrainModifier> TerrainModifier = nullptr;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Avenor|Preview")
+    TObjectPtr<UProceduralMeshComponent> FastPreviewMesh = nullptr;
+
+    /** Centre of the preview relative to this generator, in centimetres. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Preview", meta = (Units = "cm"))
+    FVector2D PreviewCentreOffset = FVector2D::ZeroVector;
+
+    /** A 2 km square is large enough to judge a proof-of-concept district. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Preview",
+        meta = (Units = "cm", ClampMin = "10000.0"))
+    FVector2D PreviewSize = FVector2D(200000.0, 200000.0);
+
+    /** Preview-only grid spacing; does not alter production terrain density. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Preview",
+        meta = (Units = "cm", ClampMin = "500.0", ClampMax = "25000.0"))
+    double PreviewVertexSpacing = 2500.0;
+
+    /** Keeps the preview visibly separate from the currently compiled mesh. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Preview", meta = (Units = "cm"))
+    double PreviewDisplayOffsetZ = 500000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|World", meta = (ClampMin = "10000.0"))
     FVector2D WorldSize = FVector2D(10000000.0, 2000000.0);
@@ -401,7 +450,9 @@ protected:
 private:
     void InvalidateData();
     void CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data);
+    bool BindModifiersAndRefresh(bool bShowFailureDialog);
 
     mutable FCriticalSection DataMutex;
     mutable TSharedPtr<const FAvenorStripData> CachedData;
+    bool bDeferMeshRefresh = false;
 };
