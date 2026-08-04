@@ -15,8 +15,14 @@
 #include "WaterBodyRiverActor.h"
 #include "WaterSplineComponent.h"
 #include "WaterSplineMetadata.h"
+#include "WaterBodyHeightmapSettings.h"
+#include "WaterBodyWeightmapSettings.h"
+#include "WaterBrushEffects.h"
+#include "WaterCurveSettings.h"
+#include "WaterFalloffSettings.h"
 #include "Components/SplineComponent.h"
 #include "ProceduralMeshComponent.h"
+#include "MeshPartitionWaterModifier.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
@@ -1691,135 +1697,10 @@ static void ExtractRivers(
 
 double FAvenorStripData::SampleHeight(const FVector2D& Position) const
 {
-    using namespace UE::Avenor::Strip;
-    const double Underlying = SampleGrid(Height, Position);
-    double Result = Underlying;
-    int32 AffectedLakeIndex = INDEX_NONE;
-    double BestBankAlpha = TNumericLimits<double>::Max();
-    for (int32 BasinIndex = 0; BasinIndex < Lakes.Num(); ++BasinIndex)
-    {
-        const FLakeBasin& Lake = Lakes[BasinIndex];
-        if (!Lake.Bounds.IsInside(Position) || Lake.Shoreline.Num() < 3)
-        {
-            continue;
-        }
-        double EdgeDistance = 0.0;
-        const bool bInside = IsInsidePolygon(Position, Lake.Shoreline, &EdgeDistance);
-        const double Radius = FMath::Max(CellSize * 0.35, Lake.DepthRampWidth);
-        if (bInside)
-        {
-            // The shoreline is the dry rim, while SurfaceHeight is the
-            // actual water plane (normally inset below it). Meet the rim at
-            // the polygon edge, descend through the waterline just inside
-            // it, then deepen the bed. Previously the terrain was forced to
-            // SurfaceHeight at the exact edge, leaving no containing bank
-            // and allowing small Water Mesh rasterisation errors to appear
-            // as visibly floating water.
-            const double SurfaceInset = FMath::Max(0.0, Lake.ShorelineHeight - Lake.SurfaceHeight);
-            const double ShoreRampWidth = FMath::Clamp(
-                FMath::Max(SurfaceInset * 4.0, CellSize * 0.12),
-                200.0,
-                FMath::Max(200.0, Radius * 0.35)
-            );
-            const double ShoreAlpha = Smooth01(FMath::Clamp(
-                EdgeDistance / FMath::Max(1.0, ShoreRampWidth), 0.0, 1.0
-            ));
-            const double NearShoreHeight = FMath::Lerp(
-                Lake.ShorelineHeight, Lake.SurfaceHeight, ShoreAlpha
-            );
-            const double BedDistance = FMath::Max(0.0, EdgeDistance - ShoreRampWidth);
-            const double DepthAlpha = Smooth01(FMath::Clamp(
-                BedDistance / FMath::Max(1.0, Radius - ShoreRampWidth), 0.0, 1.0
-            ));
-            const double BedNoise = Fbm(Position, FMath::Max(Radius * 2.0, CellSize * 2.0), FVector2D(4231.0, -8877.0), 3);
-            const double BedDepth = Lake.MaximumDepth * FMath::Clamp(0.86 + 0.14 * BedNoise, 0.72, 1.0);
-            Result = FMath::Lerp(NearShoreHeight, Lake.SurfaceHeight - BedDepth, DepthAlpha);
-            AffectedLakeIndex = BasinIndex;
-            break;
-        }
-        else if (EdgeDistance < Lake.BankBlendWidth)
-        {
-            const double BankAlpha = Smooth01(FMath::Clamp(EdgeDistance / FMath::Max(1.0, Lake.BankBlendWidth), 0.0, 1.0));
-            if (BankAlpha < BestBankAlpha)
-            {
-                BestBankAlpha = BankAlpha;
-                Result = FMath::Lerp(Lake.ShorelineHeight, Underlying, BankAlpha);
-                AffectedLakeIndex = BasinIndex;
-            }
-        }
-    }
-    bool bHasRiverProfile = false;
-    double BestRiverInfluence = 0.0;
-    double BestRiverTarget = Result;
-    for (const FRiverReach& River : Rivers)
-    {
-        if (AffectedLakeIndex != INDEX_NONE &&
-            River.StartLakeIndex != AffectedLakeIndex &&
-            River.EndLakeIndex != AffectedLakeIndex)
-        {
-            continue;
-        }
-        if (!River.Bounds.IsInside(Position) || River.Points.Num() < 2)
-        {
-            continue;
-        }
-        double ClosestDistance = TNumericLimits<double>::Max();
-        double SurfaceHeight = 0.0;
-        for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
-        {
-            const FVector& A = River.Points[Index];
-            const FVector& B = River.Points[Index + 1];
-            double Alpha = 0.0;
-            const double Distance = SegmentDistance(Position, FVector2D(A), FVector2D(B), &Alpha);
-            if (Distance < ClosestDistance)
-            {
-                ClosestDistance = Distance;
-                SurfaceHeight = FMath::Lerp(A.Z, B.Z, Alpha);
-            }
-        }
-        if (ClosestDistance >= River.ValleyHalfWidth)
-        {
-            continue;
-        }
-        const double WaterHalfWidth = FMath::Max(100.0, River.Width * 0.5);
-        double Influence = 0.0;
-        double CarveTarget = Underlying;
-        if (ClosestDistance <= WaterHalfWidth)
-        {
-            const double ChannelShape = FMath::Pow(
-                FMath::Clamp(ClosestDistance / WaterHalfWidth, 0.0, 1.0),
-                FMath::Max(0.1, River.ChannelSteepness)
-            );
-            const double ChannelAlpha = Smooth01(ChannelShape);
-            CarveTarget = FMath::Lerp(SurfaceHeight - River.Depth, SurfaceHeight, ChannelAlpha);
-            Influence = 2.0 - ChannelAlpha;
-        }
-        else
-        {
-            const double ValleyAlpha = FMath::Clamp(
-                (ClosestDistance - WaterHalfWidth) / FMath::Max(1.0, River.ValleyHalfWidth - WaterHalfWidth), 0.0, 1.0
-            );
-            const double Shaped = FMath::Pow(ValleyAlpha, FMath::Max(0.2, River.CrossSectionExponent));
-            const double BankAlpha = Smooth01(Shaped);
-            CarveTarget = FMath::Lerp(SurfaceHeight, Result, BankAlpha);
-            Influence = 1.0 - BankAlpha;
-        }
-        if (!bHasRiverProfile || Influence > BestRiverInfluence)
-        {
-            bHasRiverProfile = true;
-            BestRiverInfluence = Influence;
-            BestRiverTarget = CarveTarget;
-        }
-    }
-    if (bHasRiverProfile)
-    {
-        // Rivers are erosional features. In particular, a lake bank must be
-        // allowed to open at a connected inlet/outlet, but a river profile
-        // must never raise either the broad terrain or the lake blend into a
-        // mesa when its computed water datum is higher.
-        Result = FMath::Min(Result, BestRiverTarget);
-    }
-    return Result;
+    // This modifier owns only the broad, eroded land surface. River beds,
+    // banks, lake beds and shores are written later by MeshPartitionWater's
+    // native modifiers, using the Water Body spline as their shared datum.
+    return SampleGrid(Height, Position);
 }
 
 float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) const
@@ -2343,7 +2224,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("a9300f3a-b555-43c4-8a89-b289ba4bc463")); }
+    static FGuid Version() { return FGuid(TEXT("44a8e603-1920-4798-9177-7597c6c15d03")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2408,14 +2289,93 @@ static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVe
     Spline.K2_SynchronizeAndBroadcastDataChange();
 }
 
-static void DisableSecondaryTerrainCarving(AActor& WaterActor)
+static void ConfigureWaterTerrainSettings(
+    AWaterBody& Water,
+    bool bLake,
+    double ChannelDepth,
+    double BankOrShoreWidth,
+    const FAvenorWaterTerrainSettings& Settings
+)
 {
-    TInlineComponentArray<UE::MeshPartition::UModifierComponent*> Modifiers;
-    WaterActor.GetComponents(Modifiers);
-    for (UE::MeshPartition::UModifierComponent* Modifier : Modifiers)
+    FWaterCurveSettings& Curve = Water.GetWaterCurveSettings();
+    Curve.bUseCurveChannel = true;
+    Curve.ChannelDepth = static_cast<float>(FMath::Max(100.0, ChannelDepth));
+    Curve.ChannelEdgeOffset = 0.0f;
+    Curve.CurveRampWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
+
+    FWaterBodyHeightmapSettings& Heightmap = const_cast<FWaterBodyHeightmapSettings&>(
+        Water.GetWaterHeightmapSettings()
+    );
+    Heightmap.BlendMode = EWaterBrushBlendType::AlphaBlend;
+    Heightmap.FalloffSettings.FalloffMode = EWaterBrushFalloffMode::Width;
+    Heightmap.FalloffSettings.FalloffWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
+    Heightmap.FalloffSettings.EdgeOffset = 0.0f;
+    Heightmap.FalloffSettings.ZOffset = 0.0f;
+    Heightmap.Effects.Blurring.bBlurShape = Settings.BlurRadius > 0;
+    Heightmap.Effects.Blurring.Radius = FMath::Clamp(Settings.BlurRadius, 0, 16);
+    const float Roughness = static_cast<float>(FMath::Clamp(Settings.EdgeRoughness, 0.0, 1.0));
+    Heightmap.Effects.CurlNoise.Curl1Amount = Roughness * (bLake ? 1800.0f : 600.0f);
+    Heightmap.Effects.CurlNoise.Curl1Tiling = bLake ? 65000.0f : 30000.0f;
+    Heightmap.Effects.CurlNoise.Curl2Amount = Roughness * (bLake ? 650.0f : 250.0f);
+    Heightmap.Effects.CurlNoise.Curl2Tiling = bLake ? 18000.0f : 9000.0f;
+    // Displacement requires an authored texture. Leaving height at zero is
+    // intentional; curl noise supplies controlled natural edge variation.
+    Heightmap.Effects.Displacement.DisplacementHeight = 0.0f;
+    Heightmap.Effects.SmoothBlending.InnerSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.2);
+    Heightmap.Effects.SmoothBlending.OuterSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.35);
+
+    TMap<FName, FWaterBodyWeightmapSettings>& Weightmaps =
+        const_cast<TMap<FName, FWaterBodyWeightmapSettings>&>(Water.GetLayerWeightmapSettings());
+    Weightmaps.Reset();
+    auto AddWeight = [&](FName Name, float EdgeOffset, float FalloffWidth)
     {
-        Modifier->SetAffectedMeshPartition(nullptr);
+        if (Name.IsNone())
+        {
+            return;
+        }
+        FWaterBodyWeightmapSettings& Weight = Weightmaps.Add(Name);
+        Weight.EdgeOffset = EdgeOffset;
+        Weight.FalloffWidth = FMath::Max(0.1f, FalloffWidth);
+        Weight.FinalOpacity = 1.0f;
+        Weight.Midpoint = 0.5f;
+        Weight.TextureInfluence = 0.0f;
+    };
+    if (bLake)
+    {
+        AddWeight(Settings.LakeBedWeight, 0.0f, 100.0f);
+        AddWeight(Settings.LakeShoreWeight, static_cast<float>(BankOrShoreWidth), static_cast<float>(BankOrShoreWidth));
     }
+    else
+    {
+        AddWeight(Settings.RiverBedWeight, 0.0f, 100.0f);
+        AddWeight(Settings.RiverBankWeight, static_cast<float>(BankOrShoreWidth), static_cast<float>(BankOrShoreWidth));
+    }
+}
+
+template<typename TModifier>
+static TModifier* AddNativeWaterModifier(
+    AWaterBody& Water,
+    UE::MeshPartition::AMeshPartition& MeshPartition,
+    FName PriorityLayer
+)
+{
+    TModifier* Modifier = NewObject<TModifier>(
+        &Water, TModifier::StaticClass(), TEXT("AvenorMeshTerrainWaterModifier"), RF_Transactional
+    );
+    if (!Modifier)
+    {
+        return nullptr;
+    }
+    Modifier->bIsEditorOnly = true;
+    Modifier->SetupAttachment(Water.GetRootComponent());
+    Water.AddInstanceComponent(Modifier);
+    Modifier->RegisterComponent();
+    Modifier->SetMaxZDistance(1000000.0);
+    Modifier->BP_SetAffectedMegaMesh(&MeshPartition);
+    Modifier->SetPriorityLayer(PriorityLayer);
+    Modifier->SetPriority(10.0);
+    Modifier->PostEditChange();
+    return Modifier;
 }
 } // namespace UE::Avenor::Strip
 
@@ -2465,6 +2425,45 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
     FastPreviewMesh->SetHiddenInGame(true);
     FastPreviewMesh->SetVisibility(false);
     LastBuildStamp = TEXT("Never generated");
+    ResolveSettings();
+}
+
+void AAvenorStripTerrainGenerator::ResolveSettings()
+{
+    AnalysisCellSize = Erosion.AnalysisSpacing;
+    bGenerateMountains = Landforms.bMountains;
+    MountainRelief = Landforms.MountainHeight;
+    MountainRangesPer100Km = Landforms.MountainRangesPer100Km;
+    MountainExclusionHalfWidth = Landforms.MountainClearanceFromSpine;
+    bGenerateHills = Landforms.bHills;
+    HillsRelief = Landforms.HillHeight;
+    HillsScale = Landforms.HillSize;
+
+    const double ErosionStrength = FMath::Clamp(Erosion.Strength, 0.0, 1.0);
+    ThermalErosionIterations = FMath::Clamp(Erosion.Passes, 1, 24);
+    StreamPowerIterations = FMath::Clamp(FMath::RoundToInt(Erosion.Passes * 0.75), 1, 18);
+    ThermalErosionStrength = FMath::Lerp(0.1, 0.7, ErosionStrength);
+    StreamPowerStrength = FMath::Lerp(0.2, 1.8, ErosionStrength);
+
+    bGenerateRivers = Hydrology.bRivers;
+    const double Density = FMath::Clamp(Hydrology.RiverDensity, 0.0, 1.0);
+    MountainStreamStartArea = FMath::Lerp(2.0, 0.25, Density);
+    LowlandStreamStartArea = FMath::Lerp(12.0, 2.0, Density);
+    MinimumRiverSystemLength = Hydrology.MinimumRiverLength;
+    HeadwaterWidth = 800.0 * WaterTerrain.RiverWidthScale;
+    MainRiverWidth = 12000.0 * WaterTerrain.RiverWidthScale;
+    MaximumRiverDepth = 1800.0 * WaterTerrain.RiverDepthScale;
+    HeadwaterValleyHalfWidth = FMath::Max(10000.0, WaterTerrain.RiverBankWidth);
+    MainValleyHalfWidth = FMath::Max(80000.0, WaterTerrain.RiverBankWidth * 3.0);
+
+    bGenerateLakes = Hydrology.bLakes;
+    MaximumLakeCount = Hydrology.MaximumLakes;
+    MinimumLakeDepth = Hydrology.MinimumLakeDepression;
+    MinimumLakeBedDepth = FMath::Max(100.0, WaterTerrain.LakeBedDepth * 0.35);
+    MaximumLakeBedDepth = FMath::Max(MinimumLakeBedDepth, WaterTerrain.LakeBedDepth);
+    LakeBankBlendWidth = WaterTerrain.LakeShoreWidth;
+    LakeDepthRampWidth = FMath::Max(1000.0, WaterTerrain.LakeShoreWidth * 0.35);
+    LakeSurfaceInset = 0.0;
 }
 
 FBox AAvenorStripTerrainGenerator::GetGenerationBounds() const
@@ -2529,13 +2528,15 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
                 EAppMsgType::Ok,
                 FText::FromString(TEXT(
                     "The Mesh Partition Definition needs at least two Modifier Priority Layers. "
-                    "Avenor uses the first for remeshing and the last for terrain carving."
+                    "Avenor uses the first for broad terrain and the last for refinement and water."
                 ))
             );
         }
         return false;
     }
-    TerrainModifier->SetPriorityLayer(PriorityLayers.Last());
+    // Broad eroded terrain is first. Refinement and native water carving
+    // then share the final layer, ordered by sub-priority.
+    TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
     TerrainModifier->SetPriority(0.0);
     TerrainModifier->PostEditChange();
 
@@ -2557,9 +2558,33 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
                 Modifier->UpdateSplineData();
                 Modifier->SetAffectedMeshPartition(nullptr);
                 Modifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
-                Modifier->SetPriorityLayer(PriorityLayers[0]);
+                Modifier->SetPriorityLayer(PriorityLayers.Last());
                 Modifier->SetPriority(0.0);
                 ++BoundRefinementModifiers;
+            }
+        }
+    }
+
+    int32 BoundWaterModifiers = 0;
+    if (UWorld* World = GetWorld())
+    {
+        for (TActorIterator<AWaterBody> It(World); It; ++It)
+        {
+            if (!It->Tags.Contains(GeneratedWaterTag) || !It->Tags.Contains(OwnerTag))
+            {
+                continue;
+            }
+            TInlineComponentArray<UE::MeshPartition::UModifierComponent*> Modifiers;
+            It->GetComponents(Modifiers);
+            for (UE::MeshPartition::UModifierComponent* Modifier : Modifiers)
+            {
+                Modifier->Modify();
+                Modifier->SetAffectedMeshPartition(nullptr);
+                Modifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
+                Modifier->SetPriorityLayer(PriorityLayers.Last());
+                Modifier->SetPriority(10.0);
+                Modifier->PostEditChange();
+                ++BoundWaterModifiers;
             }
         }
     }
@@ -2576,8 +2601,9 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor refreshed Mesh Partition in-place with terrain plus %d refinement modifiers."),
-        BoundRefinementModifiers
+        TEXT("Avenor refreshed Mesh Partition in-place with broad terrain, %d refinement modifiers and %d native water modifiers."),
+        BoundRefinementModifiers,
+        BoundWaterModifiers
     );
     return true;
 #else
@@ -2613,7 +2639,6 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
     }
     for (AWaterBody* Water : ToDelete)
     {
-        DisableSecondaryTerrainCarving(*Water);
         World->EditorDestroyActor(Water, true);
     }
 #endif
@@ -2623,10 +2648,18 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
 {
 #if WITH_EDITOR
     UWorld* World = GetWorld();
-    if (!World || !Data)
+    UE::MeshPartition::AMeshPartition* TargetMeshPartition =
+        Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
+    if (!World || !Data || !TargetMeshPartition || !TerrainModifier)
     {
         return;
     }
+    const TArray<FName> PriorityLayers = TerrainModifier->GetDefinitionPriorityLayers();
+    if (PriorityLayers.Num() < 2)
+    {
+        return;
+    }
+    const FName WaterPriorityLayer = PriorityLayers.Last();
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     auto ToWorldPoints = [&](const TArray<FVector>& Source)
     {
@@ -2642,10 +2675,8 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         if (AWaterBodyOcean* Ocean = SpawnWaterActor<AWaterBodyOcean>(
             *World, TEXT("Avenor_Strip_Ocean"), OwnerTag))
         {
-            DisableSecondaryTerrainCarving(*Ocean);
             ConfigureExactSpline(*Ocean->GetWaterBodyComponent()->GetWaterSpline(), ToWorldPoints(Data->OceanBoundary), true);
             Ocean->PostEditChange();
-            DisableSecondaryTerrainCarving(*Ocean);
         }
     }
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
@@ -2664,27 +2695,41 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             FString::Printf(TEXT("Avenor_Strip_Lake_%02d"), Index + 1),
             OwnerTag))
         {
-            DisableSecondaryTerrainCarving(*Lake);
-            ConfigureExactSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
-            Lake->PostEditChange();
             ConfigureExactSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
             Lake->GetWaterBodyComponent()->GetWaterSpline()->K2_SynchronizeAndBroadcastDataChange();
-            DisableSecondaryTerrainCarving(*Lake);
+            ConfigureWaterTerrainSettings(
+                *Lake, true, WaterTerrain.LakeBedDepth,
+                WaterTerrain.LakeShoreWidth, WaterTerrain
+            );
+            AddNativeWaterModifier<UE::MeshPartition::ULakeModifier>(
+                *Lake, *TargetMeshPartition, WaterPriorityLayer
+            );
+            Lake->PostEditChange();
         }
     }
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
-        TArray<FVector> RiverPoints = ToWorldPoints(Data->Rivers[Index].Points);
+        const FRiverReach& Reach = Data->Rivers[Index];
+        TArray<FVector> RiverPoints = ToWorldPoints(Reach.Points);
         if (AWaterBodyRiver* River = SpawnWaterActor<AWaterBodyRiver>(
             *World,
             FString::Printf(TEXT("Avenor_Strip_River_%03d"), Index + 1),
             OwnerTag))
         {
-            DisableSecondaryTerrainCarving(*River);
-            ConfigureRiverSpline(*River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints, Data->Rivers[Index].Width, Data->Rivers[Index].Depth);
+            ConfigureRiverSpline(
+                *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
+                Reach.Width, Reach.Depth
+            );
+            ConfigureWaterTerrainSettings(
+                *River, false, Reach.Depth,
+                WaterTerrain.RiverBankWidth, WaterTerrain
+            );
+            // Register only after spline metadata exists. URiverModifier
+            // asserts when registered against a river without metadata.
+            AddNativeWaterModifier<UE::MeshPartition::URiverModifier>(
+                *River, *TargetMeshPartition, WaterPriorityLayer
+            );
             River->PostEditChange();
-            ConfigureRiverSpline(*River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints, Data->Rivers[Index].Width, Data->Rivers[Index].Depth);
-            DisableSecondaryTerrainCarving(*River);
         }
     }
 #endif
@@ -2693,6 +2738,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
 void AAvenorStripTerrainGenerator::GenerateTerrain()
 {
 #if WITH_EDITOR
+    ResolveSettings();
     UE::MeshPartition::AMeshPartition* TargetMeshPartition =
         Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
     if (!TargetMeshPartition)
@@ -2720,14 +2766,13 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
             EAppMsgType::Ok,
             FText::FromString(TEXT(
                 "The Mesh Partition Definition needs at least two Modifier "
-                "Priority Layers. Avenor uses the first for Spline Remesh "
-                "and the last for terrain/carving, so newly-created vertices "
-                "receive freshly evaluated heights."
+                "Priority Layers. Avenor uses the first for the broad eroded "
+                "terrain and the last for refinement plus native water carving."
             ))
         );
         return;
     }
-    TerrainModifier->SetPriorityLayer(PriorityLayers.Last());
+    TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
     TerrainModifier->SetPriority(0.0);
 
     FScopedSlowTask Progress(3.0f, FText::FromString(TEXT("Generating strip terrain plan...")));
@@ -2838,9 +2883,8 @@ static bool SpawnRefinementSpline(
     SplineComp->ClearSplinePoints(false);
     SplineComp->SetSplinePoints(WorldPoints, ESplineCoordinateSpace::World, false);
     SplineComp->SetClosedLoop(bClosed, false);
-    // SampleHeight uses analytic distance to the stored straight polyline
-    // segments. Keep the remesh corridor on that exact path; cubic spline
-    // tangents can overshoot lake corners and river junction endpoints.
+    // Keep tessellation on the authoritative water path. Cubic tangents can
+    // overshoot shoreline corners and confluence endpoints.
     for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
     {
         SplineComp->SetSplinePointType(PointIndex, ESplinePointType::Linear, false);
@@ -2920,7 +2964,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         );
         return;
     }
-    TerrainModifier->SetPriorityLayer(PriorityLayers.Last());
+    TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
 
     FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating refinement splines...")));
     Progress.MakeDialog();
@@ -2938,8 +2982,8 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         {
             // Spline Remesh executes before the Avenor height modifier, so
             // its region of interest must intersect the original rectangle.
-            // The later terrain pass moves every newly-created vertex to its
-            // analytic river/lake/canyon height.
+            // Native water modifiers later deform these new vertices into
+            // the final bed, bank and shoreline profiles.
             Point.Z = SourceMeshWorldZ;
         }
         return Result;
@@ -3008,7 +3052,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
     }
 
     LastBuildStamp = FString::Printf(
-        TEXT("Refinement splines placed %s | code %s | %d/%d river reaches | %d/%d lake shores | IN-PLACE MESH REFRESH REQUESTED; WAIT, THEN GENERATE WATER"),
+        TEXT("Refinement splines placed %s | code %s | %d/%d river reaches | %d/%d lake shores"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         CreatedRiverSplines, CachedData->Rivers.Num(),
@@ -3032,18 +3076,61 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
 void AAvenorStripTerrainGenerator::RegenerateAndRefreshTerrain()
 {
 #if WITH_EDITOR
+    GenerateCompleteWorld();
+#endif
+}
+
+void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
+{
+#if WITH_EDITOR
+    ResolveSettings();
     bDeferMeshRefresh = true;
+    ClearGeneratedWater();
+    ClearGeneratedRefinementSplines();
     GenerateTerrain();
     if (bTerrainPlanReadyForWater)
     {
         GenerateRefinementSplines();
     }
-    bDeferMeshRefresh = false;
-
     if (bTerrainPlanReadyForWater && bRefinementPlanReadyForWater)
     {
-        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
-        LastBuildStamp += TEXT(" | in-place refresh requested");
+        CreateWaterActors(CachedData);
+    }
+    bDeferMeshRefresh = false;
+
+    if (!bTerrainPlanReadyForWater || !bRefinementPlanReadyForWater)
+    {
+        return;
+    }
+    bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+    LastBuildStamp = FString::Printf(
+        TEXT("Complete world generated %s | code %s | seed %d | %d rivers | %d lakes | native water modifiers bound"),
+        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
+        Seed,
+        CachedData ? CachedData->Rivers.Num() : 0,
+        CachedData ? CachedData->Lakes.Num() : 0
+    );
+#endif
+}
+
+void AAvenorStripTerrainGenerator::ClearGeneratedWorld()
+{
+#if WITH_EDITOR
+    ClearGeneratedWater();
+    ClearGeneratedRefinementSplines();
+    ClearFastPreview();
+    InvalidateData();
+    LastBuildStamp = TEXT("Generated Avenor water, refinement and preview cleared");
+    if (TerrainModifier)
+    {
+        TerrainModifier->SetAffectedMeshPartition(nullptr);
+    }
+    if (UE::MeshPartition::AMeshPartition* TargetMeshPartition =
+        Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor))
+    {
+        TargetMeshPartition->PostEditChange();
+        TargetMeshPartition->ReregisterAllComponents();
     }
 #endif
 }
@@ -3069,6 +3156,8 @@ void AAvenorStripTerrainGenerator::ClearFastPreview()
 void AAvenorStripTerrainGenerator::GenerateFastPreview()
 {
 #if WITH_EDITOR
+    ResolveSettings();
+    InvalidateData();
     if (!FastPreviewMesh)
     {
         return;
@@ -3212,24 +3301,10 @@ void AAvenorStripTerrainGenerator::GenerateWater()
         FMessageDialog::Open(
             EAppMsgType::Ok,
             FText::FromString(TEXT(
-                "Run Generate Terrain, then Generate/Update Refinement "
-                "Splines, then wait until the Mesh Partition rebuild has "
-                "visibly completed before pressing Generate Water."
+                "A terrain and refinement plan is required before water can be created. "
+                "Use Generate Complete World for the normal one-button workflow."
             ))
         );
-        return;
-    }
-
-    const EAppReturnType::Type Confirmation = FMessageDialog::Open(
-        EAppMsgType::YesNo,
-        FText::FromString(TEXT(
-            "Has the Mesh Partition terrain build completely finished?\n\n"
-            "Choose No if it is still building. Water actors must not inspect "
-            "the old mesh."
-        ))
-    );
-    if (Confirmation != EAppReturnType::Yes)
-    {
         return;
     }
 
@@ -3239,9 +3314,10 @@ void AAvenorStripTerrainGenerator::GenerateWater()
     ClearGeneratedWater();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Creating lakes and rivers")));
     CreateWaterActors(CachedData);
+    BindModifiersAndRefresh(true);
 
     LastBuildStamp = FString::Printf(
-        TEXT("Water created %s | code %s | seed %d | %d rivers | %d lakes"),
+        TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, CachedData->Rivers.Num(), CachedData->Lakes.Num()
@@ -3253,6 +3329,7 @@ void AAvenorStripTerrainGenerator::GenerateWater()
 #if WITH_EDITOR
 void AAvenorStripTerrainGenerator::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
+    ResolveSettings();
     InvalidateData();
     Super::PostEditChangeProperty(PropertyChangedEvent);
 }
