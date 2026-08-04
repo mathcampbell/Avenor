@@ -302,6 +302,113 @@ static TArray<FVector> ResamplePolyline(
     return Result;
 }
 
+// Reduce dense analysis polylines to the control points actually needed by
+// Unreal's curved splines. Ramer-Douglas-Peucker is evaluated in 3D so a
+// river's meaningful vertical profile is preserved as well as its plan shape.
+static TArray<FVector> SimplifyOpenPolyline(
+    const TArray<FVector>& Input,
+    double Tolerance
+)
+{
+    if (Input.Num() <= 2 || Tolerance <= 0.0)
+    {
+        return Input;
+    }
+
+    TBitArray<> Keep(false, Input.Num());
+    Keep[0] = true;
+    Keep[Input.Num() - 1] = true;
+    TArray<FIntPoint> PendingRanges;
+    PendingRanges.Emplace(0, Input.Num() - 1);
+    while (!PendingRanges.IsEmpty())
+    {
+        const FIntPoint Range = PendingRanges.Pop(EAllowShrinking::No);
+        if (Range.Y <= Range.X + 1)
+        {
+            continue;
+        }
+        double MaximumDistance = 0.0;
+        int32 MaximumIndex = INDEX_NONE;
+        for (int32 Index = Range.X + 1; Index < Range.Y; ++Index)
+        {
+            const double Distance = FMath::PointDistToSegment(
+                Input[Index], Input[Range.X], Input[Range.Y]
+            );
+            if (Distance > MaximumDistance)
+            {
+                MaximumDistance = Distance;
+                MaximumIndex = Index;
+            }
+        }
+        if (MaximumIndex != INDEX_NONE && MaximumDistance > Tolerance)
+        {
+            Keep[MaximumIndex] = true;
+            PendingRanges.Emplace(Range.X, MaximumIndex);
+            PendingRanges.Emplace(MaximumIndex, Range.Y);
+        }
+    }
+
+    TArray<FVector> Result;
+    Result.Reserve(Input.Num());
+    for (int32 Index = 0; Index < Input.Num(); ++Index)
+    {
+        if (Keep[Index])
+        {
+            Result.Add(Input[Index]);
+        }
+    }
+    return Result;
+}
+
+static TArray<FVector> SimplifyFeaturePolyline(
+    const TArray<FVector>& Input,
+    double Tolerance,
+    bool bClosed
+)
+{
+    if (!bClosed)
+    {
+        return SimplifyOpenPolyline(Input, Tolerance);
+    }
+    if (Input.Num() <= 4 || Tolerance <= 0.0)
+    {
+        return Input;
+    }
+
+    // A closed RDP loop cannot use the same point as both endpoints. Split it
+    // at the point furthest from point zero, simplify both arcs, then rejoin
+    // without duplicating either preserved endpoint.
+    int32 OppositeIndex = 1;
+    double MaximumDistanceSquared = 0.0;
+    for (int32 Index = 1; Index < Input.Num(); ++Index)
+    {
+        const double DistanceSquared = FVector::DistSquared(Input[0], Input[Index]);
+        if (DistanceSquared > MaximumDistanceSquared)
+        {
+            MaximumDistanceSquared = DistanceSquared;
+            OppositeIndex = Index;
+        }
+    }
+
+    TArray<FVector> FirstArc;
+    FirstArc.Append(Input.GetData(), OppositeIndex + 1);
+    TArray<FVector> SecondArc;
+    for (int32 Index = OppositeIndex; Index < Input.Num(); ++Index)
+    {
+        SecondArc.Add(Input[Index]);
+    }
+    SecondArc.Add(Input[0]);
+
+    FirstArc = SimplifyOpenPolyline(FirstArc, Tolerance);
+    SecondArc = SimplifyOpenPolyline(SecondArc, Tolerance);
+    TArray<FVector> Result = FirstArc;
+    for (int32 Index = 1; Index + 1 < SecondArc.Num(); ++Index)
+    {
+        Result.Add(SecondArc[Index]);
+    }
+    return Result.Num() >= 3 ? Result : Input;
+}
+
 static void AddBroadMeanders(
     TArray<FVector>& Points,
     double CellSize,
@@ -902,14 +1009,14 @@ static TArray<FVector> TraceComponentBoundary(
     }
     TArray<FVector> Reduced = ResamplePolyline(Boundary, FMath::Max(Data.CellSize, 3500.0), true);
     Boundary = ChaikinSmooth(Reduced, true, 2);
-    // Preserve the smooth contour generated above instead of throwing it
-    // away by resampling back to the 25 m (or coarser) analysis resolution.
-    // This final polygon is shared by carving, remeshing and water.
-    return ResamplePolyline(
-        Boundary,
-        FMath::Clamp(FinalPointSpacing, 100.0, Data.CellSize),
-        true
+    // Preserve the smoothed outline, but retain only control points whose
+    // removal would move the shoreline by a meaningful amount. The same
+    // simplified loop drives the Water Body and its refinement modifier.
+    const double SimplificationTolerance = FMath::Max(
+        FinalPointSpacing * 4.0,
+        Data.CellSize * 0.15
     );
+    return SimplifyFeaturePolyline(Boundary, SimplificationTolerance, true);
 }
 
 struct FLakeCandidate
@@ -1391,6 +1498,40 @@ static bool FindClosestLakeShorePoint(
     return OutLakeIndex != INDEX_NONE;
 }
 
+static void BlendRiverEndpointToHeight(
+    TArray<FVector>& Points,
+    bool bAtStart,
+    double TargetHeight,
+    double ApproachLength
+)
+{
+    if (Points.Num() < 2)
+    {
+        return;
+    }
+    const int32 EndpointIndex = bAtStart ? 0 : Points.Num() - 1;
+    const double HeightDelta = TargetHeight - Points[EndpointIndex].Z;
+    double Distance = 0.0;
+    for (int32 Step = 0; Step < Points.Num(); ++Step)
+    {
+        const int32 Index = bAtStart ? Step : Points.Num() - 1 - Step;
+        if (Step > 0)
+        {
+            const int32 Previous = bAtStart ? Index - 1 : Index + 1;
+            Distance += FVector2D::Distance(
+                FVector2D(Points[Previous]), FVector2D(Points[Index])
+            );
+        }
+        if (Distance >= ApproachLength)
+        {
+            break;
+        }
+        const double Weight = Smooth01(1.0 - Distance / FMath::Max(1.0, ApproachLength));
+        Points[Index].Z += HeightDelta * Weight;
+    }
+    Points[EndpointIndex].Z = TargetHeight;
+}
+
 static void AnchorRiverToLakes(
     const FAvenorStripData& Data,
     TArray<FVector>& Points,
@@ -1402,50 +1543,123 @@ static void AnchorRiverToLakes(
         return;
     }
     constexpr double MinimumGradient = 0.0006;
-    if (Data.Lakes.IsValidIndex(StartLakeIndex))
+    const bool bStartsAtLake = Data.Lakes.IsValidIndex(StartLakeIndex);
+    const bool bEndsAtLake = Data.Lakes.IsValidIndex(EndLakeIndex);
+    const double ApproachLength = FMath::Max(Data.CellSize * 4.0, 40000.0);
+
+    if (bStartsAtLake)
     {
-        Points[0].Z = Data.Lakes[StartLakeIndex].SurfaceHeight;
+        BlendRiverEndpointToHeight(
+            Points, true, Data.Lakes[StartLakeIndex].SurfaceHeight, ApproachLength
+        );
     }
-    if (Data.Lakes.IsValidIndex(EndLakeIndex))
+    if (bEndsAtLake)
     {
-        Points.Last().Z = Data.Lakes[EndLakeIndex].SurfaceHeight;
+        BlendRiverEndpointToHeight(
+            Points, false, Data.Lakes[EndLakeIndex].SurfaceHeight, ApproachLength
+        );
     }
 
-    if (Data.Lakes.IsValidIndex(StartLakeIndex) && Data.Lakes.IsValidIndex(EndLakeIndex))
+    // Preserve a downhill water surface without reintroducing a one-segment
+    // cliff at either fixed lake datum.
+    if (bStartsAtLake && bEndsAtLake)
     {
-        double TotalLength = 0.0;
+        TArray<double> Distances;
+        Distances.SetNum(Points.Num());
+        Distances[0] = 0.0;
         for (int32 Index = 1; Index < Points.Num(); ++Index)
         {
-            TotalLength += FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
+            Distances[Index] = Distances[Index - 1] + FVector2D::Distance(
+                FVector2D(Points[Index - 1]), FVector2D(Points[Index])
+            );
         }
+        const double TotalLength = Distances.Last();
         const double StartHeight = Data.Lakes[StartLakeIndex].SurfaceHeight;
         const double EndHeight = Data.Lakes[EndLakeIndex].SurfaceHeight;
         if (StartHeight >= EndHeight + TotalLength * MinimumGradient)
         {
-            double Distance = 0.0;
             for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
             {
-                Distance += FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
-                const double Alpha = TotalLength > UE_DOUBLE_SMALL_NUMBER ? Distance / TotalLength : 0.0;
-                const double AnchoredHeight = FMath::Lerp(StartHeight, EndHeight, Alpha);
-                Points[Index].Z = FMath::Min(Points[Index - 1].Z -
-                    FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index])) * MinimumGradient,
-                    FMath::Max(Points[Index].Z, AnchoredHeight));
+                const double HighestAllowed =
+                    StartHeight - Distances[Index] * MinimumGradient;
+                const double LowestAllowed =
+                    EndHeight + (TotalLength - Distances[Index]) * MinimumGradient;
+                Points[Index].Z = FMath::Clamp(
+                    Points[Index].Z, LowestAllowed, HighestAllowed
+                );
             }
-            return;
+        }
+        else
+        {
+            for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+            {
+                const double Alpha = TotalLength > UE_DOUBLE_SMALL_NUMBER
+                    ? Distances[Index] / TotalLength : 0.0;
+                Points[Index].Z = FMath::Lerp(StartHeight, EndHeight, Alpha);
+            }
         }
     }
-
-    if (Data.Lakes.IsValidIndex(StartLakeIndex))
+    else if (bStartsAtLake)
     {
         EnforceDownhill(Points);
     }
-    if (Data.Lakes.IsValidIndex(EndLakeIndex))
+    else if (bEndsAtLake)
     {
         for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
         {
-            const double HorizontalDistance = FVector2D::Distance(FVector2D(Points[Index]), FVector2D(Points[Index + 1]));
-            Points[Index].Z = FMath::Max(Points[Index].Z, Points[Index + 1].Z + HorizontalDistance * MinimumGradient);
+            const double HorizontalDistance = FVector2D::Distance(
+                FVector2D(Points[Index]), FVector2D(Points[Index + 1])
+            );
+            Points[Index].Z = FMath::Max(
+                Points[Index].Z,
+                Points[Index + 1].Z + HorizontalDistance * MinimumGradient
+            );
+        }
+    }
+    if (bStartsAtLake)
+    {
+        Points[0].Z = Data.Lakes[StartLakeIndex].SurfaceHeight;
+    }
+    if (bEndsAtLake)
+    {
+        Points.Last().Z = Data.Lakes[EndLakeIndex].SurfaceHeight;
+    }
+}
+
+static void ResolveLakeSurfaceHeightsFromRivers(FAvenorStripData& Data)
+{
+    TArray<TArray<double>> ConnectedHeights;
+    ConnectedHeights.SetNum(Data.Lakes.Num());
+    for (const FRiverReach& River : Data.Rivers)
+    {
+        if (Data.Lakes.IsValidIndex(River.StartLakeIndex) && !River.Points.IsEmpty())
+        {
+            ConnectedHeights[River.StartLakeIndex].Add(River.Points[0].Z);
+        }
+        if (Data.Lakes.IsValidIndex(River.EndLakeIndex) && !River.Points.IsEmpty())
+        {
+            ConnectedHeights[River.EndLakeIndex].Add(River.Points.Last().Z);
+        }
+    }
+
+    for (int32 LakeIndex = 0; LakeIndex < Data.Lakes.Num(); ++LakeIndex)
+    {
+        TArray<double>& Heights = ConnectedHeights[LakeIndex];
+        if (Heights.IsEmpty())
+        {
+            continue;
+        }
+        Heights.Sort();
+        // Use the median connected channel datum so one anomalous tributary
+        // cannot drag an entire lake hundreds of metres up or down. Never
+        // raise a depression lake above its geomorphically detected surface.
+        const double RiverDatum = Heights[(Heights.Num() - 1) / 2];
+        FLakeBasin& Lake = Data.Lakes[LakeIndex];
+        Lake.SurfaceHeight = FMath::Min(Lake.SurfaceHeight, RiverDatum);
+        Lake.ShorelineHeight = Lake.SurfaceHeight;
+        for (FVector& Point : Lake.Shoreline)
+        {
+            Point.Z = Lake.SurfaceHeight;
         }
     }
 }
@@ -1659,10 +1873,6 @@ static void ExtractRivers(
                 Points.Last().Y = ShorePoint.Y;
             }
         }
-        AnchorRiverToLakes(
-            Data, Points, CandidateReach.StartLakeIndex, CandidateReach.EndLakeIndex
-        );
-
         const int32 EndCell = CandidateReach.Cells.Last();
         const double Area = Data.Accumulation[EndCell];
         const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
@@ -1693,6 +1903,30 @@ static void ExtractRivers(
         }
         River.Bounds = River.Bounds.ExpandBy(River.ValleyHalfWidth);
         Data.Rivers.Add(MoveTemp(River));
+    }
+
+    // Rivers initially retain their independently sampled channel elevations.
+    // Let those connected channel termini lower their lake before fixing the
+    // shared endpoint, then grade the approach and simplify the final spline.
+    ResolveLakeSurfaceHeightsFromRivers(Data);
+    const double SimplificationTolerance = FMath::Max(
+        FeaturePointSpacing * 4.0,
+        Data.CellSize * 0.15
+    );
+    for (FRiverReach& River : Data.Rivers)
+    {
+        AnchorRiverToLakes(
+            Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
+        );
+        River.Points = SimplifyFeaturePolyline(
+            River.Points, SimplificationTolerance, false
+        );
+        River.Bounds = FBox2D(ForceInit);
+        for (const FVector& Point : River.Points)
+        {
+            River.Bounds += FVector2D(Point);
+        }
+        River.Bounds = River.Bounds.ExpandBy(River.ValleyHalfWidth);
     }
 }
 } // namespace UE::Avenor::Strip
@@ -2226,7 +2460,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("44a8e603-1920-4798-9177-7597c6c15d03")); }
+    static FGuid Version() { return FGuid(TEXT("97d82db4-18a0-4b13-b7aa-e95a2cb945f1")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2262,7 +2496,7 @@ static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVe
     Spline.SetClosedLoop(bClosed, false);
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
-        Spline.SetSplinePointType(Index, ESplinePointType::Linear, false);
+        Spline.SetSplinePointType(Index, ESplinePointType::CurveAutoClamped, false);
     }
     Spline.UpdateSpline();
 }
@@ -2986,11 +3220,11 @@ static bool SpawnRefinementSpline(
     SplineComp->ClearSplinePoints(false);
     SplineComp->SetSplinePoints(WorldPoints, ESplineCoordinateSpace::World, false);
     SplineComp->SetClosedLoop(bClosed, false);
-    // Keep tessellation on the authoritative water path. Cubic tangents can
-    // overshoot shoreline corners and confluence endpoints.
+    // Match the sparse authoritative Water Body path. Auto-clamped curves
+    // remain smooth without the overshoot of unconstrained cubic tangents.
     for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
     {
-        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::Linear, false);
+        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::CurveAutoClamped, false);
     }
     SplineComp->UpdateSpline();
 
