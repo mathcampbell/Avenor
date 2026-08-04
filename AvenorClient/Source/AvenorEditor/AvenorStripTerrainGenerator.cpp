@@ -1839,13 +1839,12 @@ static void ExtractRivers(
             const FVector2D Position(Point);
             const double LocalArea = Data.SampleGrid(Data.Accumulation, Position);
             const double LocalAlpha = DrainageScaleAlpha(LocalArea, MainRiverArea);
-            double ValleyInset = FMath::Lerp(MaximumValleyDepth * 0.12, MaximumValleyDepth, LocalAlpha);
-            const double LocalResistance = Data.SampleGrid(Data.Resistance, Position);
-            if (bCanyons && LocalArea >= CanyonStartArea)
-            {
-                ValleyInset *= FMath::Lerp(1.05, 1.5, LocalResistance);
-            }
-            Point.Z = Data.SampleGrid(Data.Height, Position) - FMath::Lerp(150.0, 900.0, LocalAlpha) - ValleyInset;
+            // River spline Z is the water surface datum. Reach.Depth and
+            // ValleyDepth describe terrain below/beside that datum and are
+            // consumed by the native water modifier; subtracting them here
+            // placed the Water Body itself at the carved bed elevation.
+            Point.Z = Data.SampleGrid(Data.Height, Position) -
+                FMath::Lerp(150.0, 900.0, LocalAlpha);
         }
         EnforceDownhill(Points);
 
@@ -2185,39 +2184,111 @@ static double EvaluateLandform(
             const double Across = FVector2D::DotProduct(Delta, Range.Across);
             const double AlongNorm = FMath::Abs(Along) / FMath::Max(1.0, Range.HalfLength);
             const double AcrossNorm = FMath::Abs(Across) / FMath::Max(1.0, Range.HalfWidth);
-            // Core body plus a wider, much lower foothill skirt so ranges
-            // taper into surrounding terrain instead of cutting off sharply.
-            const double CoreEnvelope = Smooth01(1.0 - AlongNorm) * Smooth01(1.0 - AcrossNorm);
-            const double SkirtEnvelope = Smooth01(1.0 - AlongNorm / 1.4) * Smooth01(1.0 - AcrossNorm / 1.8);
+            // A broad low skirt tapers the range into surrounding terrain.
+            // The displaced main ridge is evaluated separately below.
+            const double SkirtEnvelope = Smooth01(1.0 - AlongNorm / 1.4) *
+                Smooth01(1.0 - AcrossNorm / 1.8);
             if (SkirtEnvelope <= 0.0)
             {
                 continue;
             }
-            // A perfect cosine gives perfectly even peak spacing and
-            // height - a row of identical cones. Blend it with genuine
-            // noise perturbation so both spacing and height vary the way
-            // a real ridgeline's summits do, while keeping enough of the
-            // cosine tendency that peaks still read as a ridge, not chaos.
-            const double PeakCoordinate = Along / FMath::Max(1.0, Range.PeakSpacing);
-            const double PeakNoise = Fbm(
-                FVector2D(PeakCoordinate, Range.Phase * 13.0), 1.0,
-                SeedOffset + FVector2D(211.0, 883.0), 3, 0.55, 2.0
+            // Build an irregular ridgeline rather than a row of radial
+            // cosine peaks. The crest wanders laterally, the two flanks have
+            // different gradients, and ridged detail forms subsidiary spurs.
+            const double RidgeWander = Fbm(
+                FVector2D(Along, Range.Phase * Range.PeakSpacing),
+                Range.PeakSpacing * 2.4,
+                SeedOffset + FVector2D(421.0, 719.0), 4, 0.56, 2.03
             );
-            const double CosineBase = FMath::Max(
-                0.0, 0.5 + 0.5 * FMath::Cos(PeakCoordinate * 2.0 * PI + Range.Phase)
+            const double RidgeOffset = RidgeWander * Range.HalfWidth * 0.22;
+            const double RidgeAcross = Across - RidgeOffset;
+            const double RidgeSide = RidgeAcross < 0.0 ? -1.0 : 1.0;
+            const double RidgeAcrossNorm =
+                FMath::Abs(RidgeAcross) / FMath::Max(1.0, Range.HalfWidth);
+            const double AlongEnvelope = Smooth01(1.0 - AlongNorm);
+            const double FlankAsymmetry = FMath::Clamp(
+                1.0 + RidgeSide * 0.2 * Fbm(
+                    FVector2D(Along, Range.Phase * 173.0),
+                    Range.PeakSpacing * 3.0,
+                    SeedOffset + FVector2D(877.0, 149.0), 3, 0.55, 2.0
+                ),
+                0.78, 1.22
             );
-            const double Peaks = FMath::Clamp(
-                0.28 + 0.5 * FMath::Pow(CosineBase, 1.6) + 0.4 * PeakNoise,
-                0.0, 1.15
+            const double FlankDistance = RidgeAcrossNorm * FlankAsymmetry;
+            const double MainFlank = AlongEnvelope *
+                FMath::Pow(FMath::Max(0.0, 1.0 - FlankDistance), 1.28);
+            const double SummitNoise = Fbm(
+                FVector2D(Along, Range.Phase * 311.0),
+                Range.PeakSpacing * 1.65,
+                SeedOffset + FVector2D(211.0, 883.0), 5, 0.54, 2.07
             );
-            const double Ridge = RidgedFbm(
-                Warped, Range.PeakSpacing * 1.1,
-                SeedOffset + FVector2D(Range.Phase * 997.0, 313.0), 5
+            const double SummitVariation = FMath::Clamp(
+                0.78 + 0.27 * SummitNoise, 0.52, 1.08
             );
+            const double SpurNoise = RidgedFbm(
+                Warped + Range.Along * FMath::Abs(RidgeAcross) * 0.7,
+                Range.PeakSpacing * 0.72,
+                SeedOffset + FVector2D(Range.Phase * 997.0, 313.0), 6
+            );
+            const double DownSlope = FMath::Clamp(RidgeAcrossNorm, 0.0, 1.25);
+            const double SpurLift = MainFlank * DownSlope *
+                FMath::Pow(FMath::Clamp(SpurNoise, 0.0, 1.0), 2.2);
+
+            // Incise a family of branching gullies down both flanks. Their
+            // heads are narrow near the crest and they widen/deepen
+            // downslope, giving the later stream-power pass real drainage
+            // structure to develop instead of a smooth plasticine cone.
+            const double ChannelSpacing = FMath::Max(
+                Range.PeakSpacing * 0.62, 30000.0
+            );
+            const double ChannelWander = Fbm(
+                Position,
+                ChannelSpacing * 1.8,
+                SeedOffset + FVector2D(Range.Phase * 601.0, 109.0),
+                3, 0.55, 2.0
+            );
+            const double ChannelCoordinate =
+                Along / ChannelSpacing +
+                RidgeSide * DownSlope * (0.48 + 0.22 * ChannelWander);
+            const double ChannelDistance = FMath::Abs(
+                ChannelCoordinate - static_cast<double>(FMath::RoundToInt(ChannelCoordinate))
+            );
+            const double ChannelHalfWidth = FMath::Lerp(
+                0.075, 0.22, Smooth01(FMath::Min(1.0, DownSlope))
+            );
+            const double ChannelMask = 1.0 - Smooth01(
+                ChannelDistance / FMath::Max(0.001, ChannelHalfWidth)
+            );
+            const double ChannelLongitudinalVariation = FMath::Clamp(
+                0.72 + 0.28 * Fbm(
+                    Position,
+                    ChannelSpacing * 0.7,
+                    SeedOffset + FVector2D(53.0, Range.Phase * 733.0),
+                    3, 0.55, 2.0
+                ),
+                0.42, 1.0
+            );
+            const double GullyProfile =
+                FMath::Pow(FMath::Min(1.0, DownSlope), 0.72) *
+                Smooth01((1.25 - DownSlope) / 0.25) *
+                ChannelMask * ChannelLongitudinalVariation;
+
             const double MountainStrength = FMath::Max(0.0, MountainWeight);
-            const double Core = Range.Relief * MountainStrength * CoreEnvelope * Peaks * FMath::Lerp(0.5, 1.0, Ridge);
-            const double Foothills = Range.Relief * MountainStrength * 0.2 *
-                FMath::Max(0.0, SkirtEnvelope - CoreEnvelope * 0.6) * (0.4 + 0.6 * Ridge);
+            const double Core = Range.Relief * MountainStrength *
+                FMath::Max(
+                    0.0,
+                    MainFlank * SummitVariation +
+                    SpurLift * 0.2 -
+                    GullyProfile * 0.19
+                );
+            const double IrregularFoothills = RidgedFbm(
+                Warped,
+                Range.PeakSpacing * 1.35,
+                SeedOffset + FVector2D(947.0, Range.Phase * 271.0), 5
+            );
+            const double Foothills = Range.Relief * MountainStrength * 0.16 *
+                FMath::Max(0.0, SkirtEnvelope - MainFlank * 0.65) *
+                FMath::Lerp(0.3, 1.0, IrregularFoothills);
             Height = FMath::Max(Height, Core + Foothills);
             OutMountainMask = FMath::Max(OutMountainMask, SkirtEnvelope);
         }
@@ -2460,7 +2531,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("97d82db4-18a0-4b13-b7aa-e95a2cb945f1")); }
+    static FGuid Version() { return FGuid(TEXT("f2b0de2c-ef1e-4d41-9f14-7a8c55edc9a6")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2496,7 +2567,7 @@ static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVe
     Spline.SetClosedLoop(bClosed, false);
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
-        Spline.SetSplinePointType(Index, ESplinePointType::CurveClamped, false);
+        Spline.SetSplinePointType(Index, ESplinePointType::Curve, false);
     }
     Spline.UpdateSpline();
 }
@@ -3220,11 +3291,12 @@ static bool SpawnRefinementSpline(
     SplineComp->ClearSplinePoints(false);
     SplineComp->SetSplinePoints(WorldPoints, ESplineCoordinateSpace::World, false);
     SplineComp->SetClosedLoop(bClosed, false);
-    // Match the sparse authoritative Water Body path. Auto-clamped curves
-    // remain smooth without the overshoot of unconstrained cubic tangents.
+    // Match the sparse authoritative Water Body path. Ordinary Curve is
+    // deliberately used here: CurveClamped visibly facets these simplified
+    // paths in UE 5.8, while automatic curve tangents remain smooth.
     for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
     {
-        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::CurveClamped, false);
+        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
     }
     SplineComp->UpdateSpline();
 
