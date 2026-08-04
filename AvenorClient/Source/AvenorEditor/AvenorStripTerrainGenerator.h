@@ -299,16 +299,16 @@ public:
     bool bGenerateRivers = true;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0.01"))
-    double MountainStreamStartArea = 1.5;
+    double MountainStreamStartArea = 0.6;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0.01"))
-    double LowlandStreamStartArea = 8.0;
+    double LowlandStreamStartArea = 4.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0.01"))
     double MainRiverArea = 80.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "0.0"))
-    double MinimumRiverSystemLength = 150000.0;
+    double MinimumRiverSystemLength = 75000.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Rivers", meta = (EditCondition = "bGenerateRivers", ClampMin = "100.0"))
     double HeadwaterWidth = 800.0;
@@ -391,7 +391,7 @@ public:
     bool bGenerateLakes = true;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Lakes", meta = (EditCondition = "bGenerateLakes", ClampMin = "0.0"))
-    double MinimumLakeDepth = 800.0;
+    double MinimumLakeDepth = 1500.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Lakes", meta = (EditCondition = "bGenerateLakes", ClampMin = "1.0"))
     double MinimumLakeBedDepth = 500.0;
@@ -403,10 +403,10 @@ public:
     double MaximumLakeArea = 250.0;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Lakes", meta = (EditCondition = "bGenerateLakes", ClampMin = "0", ClampMax = "1024"))
-    int32 MaximumLakeCount = 32;
+    int32 MaximumLakeCount = 12;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Lakes", meta = (EditCondition = "bGenerateLakes", ClampMin = "0.0", ClampMax = "0.5"))
-    double MaximumLakeCoverageFraction = 0.08;
+    double MaximumLakeCoverageFraction = 0.03;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Hydrology|Lakes", meta = (EditCondition = "bGenerateLakes", ClampMin = "0.0"))
     double LakeBankBlendWidth = 24000.0;

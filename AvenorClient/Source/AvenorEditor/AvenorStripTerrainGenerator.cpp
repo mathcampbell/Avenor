@@ -420,6 +420,8 @@ struct FAvenorStripData
     int32 RequestedMountainRanges = 0;
     int32 PlacedMountainRanges = 0;
     int32 AuthoritativeRiverCells = 0;
+    int32 RiverSeedCells = 0;
+    int32 RiverContinuationCells = 0;
     int32 RejectedShortRiverSystems = 0;
     int32 RiverTerminusLakeCandidates = 0;
     int32 AcceptedRiverTerminusLakes = 0;
@@ -718,11 +720,9 @@ static void ApplyStreamPowerErosion(
         Delta.Init(0.0, Data.Height.Num());
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
-            // Identical per-cell threshold to Channel[] in ExtractRivers
-            // and FindDrainageTerminusSeeds. Using a single flat minimum
-            // here let erosion carve visible grooves in gentle terrain
-            // that the stricter, slope-adaptive extraction pass would
-            // then reject - a groove with no river to match it.
+            // Use the same slope-adaptive start threshold as river seeding.
+            // The authoritative extraction pass subsequently continues an
+            // accepted seed downhill even where this local threshold rises.
             const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
             const double StreamStartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
             if (Data.Accumulation[Cell] < StreamStartArea || Data.ReceiverA[Cell] == INDEX_NONE)
@@ -924,17 +924,54 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
     double MountainStartArea,
     double LowlandStartArea,
     double MinimumSystemLength,
+    int32& OutSeedCellCount,
+    int32& OutContinuationCellCount,
     int32& OutRejectedSystemCount
 )
 {
+    OutSeedCellCount = 0;
+    OutContinuationCellCount = 0;
     OutRejectedSystemCount = 0;
     TArray<bool> Channel;
     Channel.Init(false, Data.Height.Num());
+    TArray<bool> SeedCells;
+    SeedCells.Init(false, Data.Height.Num());
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
         const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
         const double StartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
-        Channel[Cell] = Data.Accumulation[Cell] >= StartArea && PrimaryReceiver(Data, Cell) != INDEX_NONE;
+        if (Data.Accumulation[Cell] >= StartArea && PrimaryReceiver(Data, Cell) != INDEX_NONE)
+        {
+            SeedCells[Cell] = true;
+            Channel[Cell] = true;
+        }
+    }
+
+    // A slope-adaptive threshold decides where a stream may begin, not
+    // whether it is allowed to continue. Previously every cell was tested
+    // independently, so a mountain tributary could disappear the instant it
+    // reached gentler terrain and inherited the higher lowland threshold.
+    // Follow every accepted seed down its primary receiver chain instead.
+    // Breaking when an existing channel is reached is safe: that cell is
+    // either another seed whose route will be followed, or a route already
+    // completed by an earlier seed.
+    for (int32 SeedCell = 0; SeedCell < Data.Height.Num(); ++SeedCell)
+    {
+        if (!SeedCells[SeedCell])
+        {
+            continue;
+        }
+        int32 Cell = SeedCell;
+        for (int32 Guard = 0; Guard < Data.Height.Num(); ++Guard)
+        {
+            const int32 Receiver = PrimaryReceiver(Data, Cell);
+            if (Receiver == INDEX_NONE || !Channel.IsValidIndex(Receiver) || Channel[Receiver])
+            {
+                break;
+            }
+            Channel[Receiver] = true;
+            Cell = Receiver;
+        }
     }
     TArray<int32> SystemParent;
     SystemParent.Init(INDEX_NONE, Data.Height.Num());
@@ -1006,6 +1043,13 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
         }
     }
     OutRejectedSystemCount = RejectedRoots.Num();
+    for (int32 Cell = 0; Cell < Channel.Num(); ++Cell)
+    {
+        if (Channel[Cell])
+        {
+            SeedCells[Cell] ? ++OutSeedCellCount : ++OutContinuationCellCount;
+        }
+    }
     return Channel;
 }
 
@@ -1174,8 +1218,14 @@ static void ExtractLakes(
         // A river terminus makes a basin higher priority, not automatically
         // valid. Every lake must satisfy the same depth, area, total coverage
         // and count limits; rejected basins remain ordinary river terrain.
+        // Optional depressions need stronger evidence than a river-connected
+        // basin so shallow incidental pits do not outnumber the drainage
+        // network merely because erosion produced many local minima.
+        const double RequiredDepth = CandidateBasin.bRiverTerminus
+            ? MinimumDepth
+            : MinimumDepth * 1.5;
         if (AcceptedCount >= MaximumCount ||
-            CandidateBasin.MaximumDepth < MinimumDepth ||
+            CandidateBasin.MaximumDepth < RequiredDepth ||
             BasinArea > MaximumArea ||
             AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
@@ -1192,7 +1242,8 @@ static void ExtractLakes(
             const double BoundingWidth = FMath::Max(1.0, CandidateBasin.MaxX - CandidateBasin.MinX);
             const double BoundingHeight = FMath::Max(1.0, CandidateBasin.MaxY - CandidateBasin.MinY);
             const double FillRatio = BasinArea / FMath::Max(0.0001, (BoundingWidth * BoundingHeight) / 10000000000.0);
-            if (FillRatio < 0.12)
+            const double MinimumFillRatio = CandidateBasin.bRiverTerminus ? 0.12 : 0.18;
+            if (FillRatio < MinimumFillRatio)
             {
                 continue;
             }
@@ -2172,7 +2223,9 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     {
         AuthoritativeRiverNetwork = BuildAuthoritativeRiverNetwork(
             *Data, Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea,
-            Generator.MinimumRiverSystemLength, Data->RejectedShortRiverSystems
+            Generator.MinimumRiverSystemLength,
+            Data->RiverSeedCells, Data->RiverContinuationCells,
+            Data->RejectedShortRiverSystems
         );
         for (bool bChannelCell : AuthoritativeRiverNetwork)
         {
@@ -2290,7 +2343,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("84a6351d-857c-45d5-a0f0-cc5660f08b1e")); }
+    static FGuid Version() { return FGuid(TEXT("a9300f3a-b555-43c4-8a89-b289ba4bc463")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2700,11 +2753,12 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     }
 
     LastBuildStamp = FString::Printf(
-        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | mountains %d/%d | channel cells %d | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
+        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | mountains %d/%d | river seeds %d + %d downstream cells = %d channel cells | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, Data->Height.Num(), Data->CellSize,
         Data->PlacedMountainRanges, Data->RequestedMountainRanges,
+        Data->RiverSeedCells, Data->RiverContinuationCells,
         Data->AuthoritativeRiverCells, Data->RejectedShortRiverSystems,
         Data->Rivers.Num(), Data->Lakes.Num(),
         Data->AcceptedRiverTerminusLakes, Data->AcceptedOptionalLakes,
