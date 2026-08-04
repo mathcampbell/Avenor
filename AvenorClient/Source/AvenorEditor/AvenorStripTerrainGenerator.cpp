@@ -2297,7 +2297,9 @@ static void ConfigureWaterTerrainSettings(
     const FAvenorWaterTerrainSettings& Settings
 )
 {
-    FWaterCurveSettings& Curve = Water.GetWaterCurveSettings();
+    FWaterCurveSettings& Curve = const_cast<FWaterCurveSettings&>(
+        Water.GetWaterCurveSettings()
+    );
     Curve.bUseCurveChannel = true;
     Curve.ChannelDepth = static_cast<float>(FMath::Max(100.0, ChannelDepth));
     Curve.ChannelEdgeOffset = 0.0f;
@@ -2701,7 +2703,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, WaterTerrain.LakeBedDepth,
                 WaterTerrain.LakeShoreWidth, WaterTerrain
             );
-            AddNativeWaterModifier<UE::MeshPartition::ULakeModifier>(
+            AddNativeWaterModifier<ULakeModifier>(
                 *Lake, *TargetMeshPartition, WaterPriorityLayer
             );
             Lake->PostEditChange();
@@ -2726,7 +2728,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             );
             // Register only after spline metadata exists. URiverModifier
             // asserts when registered against a river without metadata.
-            AddNativeWaterModifier<UE::MeshPartition::URiverModifier>(
+            AddNativeWaterModifier<URiverModifier>(
                 *River, *TargetMeshPartition, WaterPriorityLayer
             );
             River->PostEditChange();
