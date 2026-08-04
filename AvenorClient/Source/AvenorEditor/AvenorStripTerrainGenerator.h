@@ -3,11 +3,30 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "MeshPartitionModifierComponent.h"
+#include "MeshPartitionWaterModifier.h"
 
 #include "AvenorStripTerrainGenerator.generated.h"
 
 struct FAvenorStripData;
 class UProceduralMeshComponent;
+
+/**
+ * MeshPartitionWater exposes UWaterModifier as its sole public native water
+ * modifier class. The LakeModifier and RiverModifier shown in Mesh Terrain
+ * mode are editor presets rather than public C++ classes, so generated Water
+ * Bodies use these concrete project-owned component types.
+ */
+UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
+class AVENOREDITOR_API UAvenorLakeWaterModifier final : public UWaterModifier
+{
+    GENERATED_BODY()
+};
+
+UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
+class AVENOREDITOR_API UAvenorRiverWaterModifier final : public UWaterModifier
+{
+    GENERATED_BODY()
+};
 
 UENUM(BlueprintType)
 enum class EAvenorStripLongAxis : uint8

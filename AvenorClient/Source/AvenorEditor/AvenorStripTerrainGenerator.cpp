@@ -2703,7 +2703,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, WaterTerrain.LakeBedDepth,
                 WaterTerrain.LakeShoreWidth, WaterTerrain
             );
-            AddNativeWaterModifier<ULakeModifier>(
+            AddNativeWaterModifier<UAvenorLakeWaterModifier>(
                 *Lake, *TargetMeshPartition, WaterPriorityLayer
             );
             Lake->PostEditChange();
@@ -2726,9 +2726,9 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *River, false, Reach.Depth,
                 WaterTerrain.RiverBankWidth, WaterTerrain
             );
-            // Register only after spline metadata exists. URiverModifier
-            // asserts when registered against a river without metadata.
-            AddNativeWaterModifier<URiverModifier>(
+            // Register only after spline metadata exists. UWaterModifier
+            // expects river metadata to be available during registration.
+            AddNativeWaterModifier<UAvenorRiverWaterModifier>(
                 *River, *TargetMeshPartition, WaterPriorityLayer
             );
             River->PostEditChange();
