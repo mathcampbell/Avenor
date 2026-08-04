@@ -17,6 +17,7 @@ public class AvenorEditor : ModuleRules
                 "Core",
                 "CoreUObject",
                 "Engine",
+                "AssetRegistry",
                 "Avenor",
                 "UnrealEd",
                 "Water",

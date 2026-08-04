@@ -1,8 +1,11 @@
 #include "AvenorStripTerrainGenerator.h"
 
 #include "ActorFactories/ActorFactory.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Editor.h"
+#include "Engine/Blueprint.h"
 #include "EngineUtils.h"
+#include "Modules/ModuleManager.h"
 #include "MeshPartition.h"
 #include "MeshPartitionMeshView.h"
 #include "Misc/ScopedSlowTask.h"
@@ -22,7 +25,6 @@
 #include "WaterFalloffSettings.h"
 #include "Components/SplineComponent.h"
 #include "ProceduralMeshComponent.h"
-#include "MeshPartitionWaterModifier.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
@@ -2354,15 +2356,93 @@ static void ConfigureWaterTerrainSettings(
     }
 }
 
-template<typename TModifier>
-static TModifier* AddNativeWaterModifier(
+// UE 5.8 documents LakeModifier and RiverModifier as reflected component
+// classes while exposing only their abstract UWaterModifier base in the public
+// C++ headers. Resolve Epic's actual reflected classes instead of inventing
+// project-owned subclasses. Current engine builds may supply them as private
+// native classes or as plugin-content Blueprints, so support both forms.
+static UClass* FindWaterModifierClass(FName ModifierName)
+{
+    static TMap<FName, TWeakObjectPtr<UClass>> Cache;
+    if (const TWeakObjectPtr<UClass>* Cached = Cache.Find(ModifierName))
+    {
+        if (Cached->IsValid())
+        {
+            return Cached->Get();
+        }
+    }
+
+    const FString NativeClassPath = FString::Printf(
+        TEXT("/Script/MeshPartitionWater.%s"), *ModifierName.ToString()
+    );
+    if (UClass* NativeClass = StaticLoadClass(
+        UE::MeshPartition::UModifierComponent::StaticClass(),
+        nullptr,
+        *NativeClassPath
+    ))
+    {
+        if (!NativeClass->HasAnyClassFlags(CLASS_Abstract))
+        {
+            Cache.Add(ModifierName, NativeClass);
+            return NativeClass;
+        }
+    }
+
+    FAssetRegistryModule& AssetRegistryModule =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(TEXT("/MeshPartitionWater"));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+    TArray<FAssetData> Assets;
+    AssetRegistry.GetAssets(Filter, Assets);
+    for (const FAssetData& Asset : Assets)
+    {
+        if (Asset.AssetName != ModifierName)
+        {
+            continue;
+        }
+
+        UBlueprint* Blueprint = Cast<UBlueprint>(Asset.GetAsset());
+        UClass* ModifierClass = Blueprint ? Blueprint->GeneratedClass : nullptr;
+        if (ModifierClass
+            && ModifierClass->IsChildOf(UE::MeshPartition::UModifierComponent::StaticClass())
+            && !ModifierClass->HasAnyClassFlags(CLASS_Abstract))
+        {
+            Cache.Add(ModifierName, ModifierClass);
+            return ModifierClass;
+        }
+    }
+
+    UE_LOG(
+        LogTemp,
+        Error,
+        TEXT("Avenor water: could not resolve Epic's MeshPartitionWater %s component class as either /Script/MeshPartitionWater.%s or a /MeshPartitionWater Blueprint asset. Ensure the plugin is enabled and its content is mounted."),
+        *ModifierName.ToString(),
+        *ModifierName.ToString()
+    );
+    return nullptr;
+}
+
+static UE::MeshPartition::UModifierComponent* AddNativeWaterModifier(
     AWaterBody& Water,
     UE::MeshPartition::AMeshPartition& MeshPartition,
-    FName PriorityLayer
+    FName PriorityLayer,
+    UClass& ModifierClass
 )
 {
-    TModifier* Modifier = NewObject<TModifier>(
-        &Water, TModifier::StaticClass(), TEXT("AvenorMeshTerrainWaterModifier"), RF_Transactional
+    if (!ModifierClass.IsChildOf(UE::MeshPartition::UModifierComponent::StaticClass())
+        || ModifierClass.HasAnyClassFlags(CLASS_Abstract))
+    {
+        return nullptr;
+    }
+
+    UE::MeshPartition::UModifierComponent* Modifier =
+        NewObject<UE::MeshPartition::UModifierComponent>(
+        &Water, &ModifierClass, TEXT("AvenorMeshTerrainWaterModifier"), RF_Transactional
     );
     if (!Modifier)
     {
@@ -2372,7 +2452,6 @@ static TModifier* AddNativeWaterModifier(
     Modifier->SetupAttachment(Water.GetRootComponent());
     Water.AddInstanceComponent(Modifier);
     Modifier->RegisterComponent();
-    Modifier->SetMaxZDistance(1000000.0);
     Modifier->BP_SetAffectedMegaMesh(&MeshPartition);
     Modifier->SetPriorityLayer(PriorityLayer);
     Modifier->SetPriority(10.0);
@@ -2662,6 +2741,26 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         return;
     }
     const FName WaterPriorityLayer = PriorityLayers.Last();
+    UClass* LakeModifierClass = Hydrology.bLakes
+        ? FindWaterModifierClass(TEXT("LakeModifier"))
+        : nullptr;
+    UClass* RiverModifierClass = Hydrology.bRivers
+        ? FindWaterModifierClass(TEXT("RiverModifier"))
+        : nullptr;
+    if ((Hydrology.bLakes && !LakeModifierClass)
+        || (Hydrology.bRivers && !RiverModifierClass))
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "Unreal's MeshPartitionWater LakeModifier or RiverModifier "
+                "Blueprint class could not be loaded. Check that the "
+                "MeshPartitionWater plugin is enabled and Show Plugin Content "
+                "reveals its modifier assets. No water actors were generated."
+            ))
+        );
+        return;
+    }
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     auto ToWorldPoints = [&](const TArray<FVector>& Source)
     {
@@ -2703,8 +2802,9 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, WaterTerrain.LakeBedDepth,
                 WaterTerrain.LakeShoreWidth, WaterTerrain
             );
-            AddNativeWaterModifier<UAvenorLakeWaterModifier>(
-                *Lake, *TargetMeshPartition, WaterPriorityLayer
+            AddNativeWaterModifier(
+                *Lake, *TargetMeshPartition, WaterPriorityLayer,
+                *LakeModifierClass
             );
             Lake->PostEditChange();
         }
@@ -2728,8 +2828,9 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             );
             // Register only after spline metadata exists. UWaterModifier
             // expects river metadata to be available during registration.
-            AddNativeWaterModifier<UAvenorRiverWaterModifier>(
-                *River, *TargetMeshPartition, WaterPriorityLayer
+            AddNativeWaterModifier(
+                *River, *TargetMeshPartition, WaterPriorityLayer,
+                *RiverModifierClass
             );
             River->PostEditChange();
         }
