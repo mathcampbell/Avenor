@@ -1626,40 +1626,69 @@ static void AnchorRiverToLakes(
     }
 }
 
-static void ResolveLakeSurfaceHeightsFromRivers(FAvenorStripData& Data)
+static void AddLevelLakeJunctionPads(
+    const FAvenorStripData& Data,
+    TArray<FVector>& Points,
+    int32 StartLakeIndex,
+    int32 EndLakeIndex
+)
 {
-    TArray<TArray<double>> ConnectedHeights;
-    ConnectedHeights.SetNum(Data.Lakes.Num());
-    for (const FRiverReach& River : Data.Rivers)
+    if (Points.Num() < 2)
     {
-        if (Data.Lakes.IsValidIndex(River.StartLakeIndex) && !River.Points.IsEmpty())
+        return;
+    }
+
+    // Put one point inside the lake, the exact shoreline point, and one point
+    // just outside at the same height. Automatic Curve tangents are then
+    // horizontal at the join instead of immediately diving towards the next
+    // lower river point. The short overlap also prevents a visible crack
+    // between the separately rendered river and lake Water Body meshes.
+    const double PadLength = FMath::Clamp(Data.CellSize * 0.05, 200.0, 500.0);
+
+    if (Data.Lakes.IsValidIndex(StartLakeIndex))
+    {
+        const double LakeHeight = Data.Lakes[StartLakeIndex].SurfaceHeight;
+        const FVector Shore = Points[0];
+        FVector2D Downstream = FVector2D(Points[1]) - FVector2D(Shore);
+        if (Downstream.Normalize())
         {
-            ConnectedHeights[River.StartLakeIndex].Add(River.Points[0].Z);
-        }
-        if (Data.Lakes.IsValidIndex(River.EndLakeIndex) && !River.Points.IsEmpty())
-        {
-            ConnectedHeights[River.EndLakeIndex].Add(River.Points.Last().Z);
+            const FVector Inside(
+                Shore.X - Downstream.X * PadLength,
+                Shore.Y - Downstream.Y * PadLength,
+                LakeHeight
+            );
+            const FVector Outside(
+                Shore.X + Downstream.X * PadLength,
+                Shore.Y + Downstream.Y * PadLength,
+                LakeHeight
+            );
+            Points[0].Z = LakeHeight;
+            Points.Insert(Inside, 0);
+            Points.Insert(Outside, 2);
         }
     }
 
-    for (int32 LakeIndex = 0; LakeIndex < Data.Lakes.Num(); ++LakeIndex)
+    if (Data.Lakes.IsValidIndex(EndLakeIndex) && Points.Num() >= 2)
     {
-        TArray<double>& Heights = ConnectedHeights[LakeIndex];
-        if (Heights.IsEmpty())
+        const double LakeHeight = Data.Lakes[EndLakeIndex].SurfaceHeight;
+        const int32 ShoreIndex = Points.Num() - 1;
+        const FVector Shore = Points[ShoreIndex];
+        FVector2D IntoLake = FVector2D(Shore) - FVector2D(Points[ShoreIndex - 1]);
+        if (IntoLake.Normalize())
         {
-            continue;
-        }
-        Heights.Sort();
-        // Use the median connected channel datum so one anomalous tributary
-        // cannot drag an entire lake hundreds of metres up or down. Never
-        // raise a depression lake above its geomorphically detected surface.
-        const double RiverDatum = Heights[(Heights.Num() - 1) / 2];
-        FLakeBasin& Lake = Data.Lakes[LakeIndex];
-        Lake.SurfaceHeight = FMath::Min(Lake.SurfaceHeight, RiverDatum);
-        Lake.ShorelineHeight = Lake.SurfaceHeight;
-        for (FVector& Point : Lake.Shoreline)
-        {
-            Point.Z = Lake.SurfaceHeight;
+            const FVector Outside(
+                Shore.X - IntoLake.X * PadLength,
+                Shore.Y - IntoLake.Y * PadLength,
+                LakeHeight
+            );
+            const FVector Inside(
+                Shore.X + IntoLake.X * PadLength,
+                Shore.Y + IntoLake.Y * PadLength,
+                LakeHeight
+            );
+            Points[ShoreIndex].Z = LakeHeight;
+            Points.Insert(Outside, ShoreIndex);
+            Points.Add(Inside);
         }
     }
 }
@@ -1837,14 +1866,11 @@ static void ExtractRivers(
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
-            const double LocalArea = Data.SampleGrid(Data.Accumulation, Position);
-            const double LocalAlpha = DrainageScaleAlpha(LocalArea, MainRiverArea);
             // River spline Z is the water surface datum. Reach.Depth and
             // ValleyDepth describe terrain below/beside that datum and are
-            // consumed by the native water modifier; subtracting them here
-            // placed the Water Body itself at the carved bed elevation.
-            Point.Z = Data.SampleGrid(Data.Height, Position) -
-                FMath::Lerp(150.0, 900.0, LocalAlpha);
+            // consumed by the native water modifier. Do not lower the Water
+            // Body below the surface that its own modifier is about to carve.
+            Point.Z = Data.SampleGrid(Data.Height, Position);
         }
         EnforceDownhill(Points);
 
@@ -1904,10 +1930,8 @@ static void ExtractRivers(
         Data.Rivers.Add(MoveTemp(River));
     }
 
-    // Rivers initially retain their independently sampled channel elevations.
-    // Let those connected channel termini lower their lake before fixing the
-    // shared endpoint, then grade the approach and simplify the final spline.
-    ResolveLakeSurfaceHeightsFromRivers(Data);
+    // The detected lake surface is authoritative. Grade connected rivers to
+    // it, but never move the whole lake to an independently sampled reach.
     const double SimplificationTolerance = FMath::Max(
         FeaturePointSpacing * 4.0,
         Data.CellSize * 0.15
@@ -1919,6 +1943,9 @@ static void ExtractRivers(
         );
         River.Points = SimplifyFeaturePolyline(
             River.Points, SimplificationTolerance, false
+        );
+        AddLevelLakeJunctionPads(
+            Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
         River.Bounds = FBox2D(ForceInit);
         for (const FVector& Point : River.Points)
@@ -2531,7 +2558,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("f2b0de2c-ef1e-4d41-9f14-7a8c55edc9a6")); }
+    static FGuid Version() { return FGuid(TEXT("4dd30dc7-b50b-4cef-a221-f1d67ed2e929")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2609,7 +2636,9 @@ static void ConfigureWaterTerrainSettings(
     );
     Curve.bUseCurveChannel = true;
     Curve.ChannelDepth = static_cast<float>(FMath::Max(100.0, ChannelDepth));
-    Curve.ChannelEdgeOffset = 0.0f;
+    Curve.ChannelEdgeOffset = static_cast<float>(
+        FMath::Max(0.0, Settings.DryBankWidth)
+    );
     Curve.CurveRampWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
 
     FWaterBodyHeightmapSettings& Heightmap = const_cast<FWaterBodyHeightmapSettings&>(
@@ -2618,7 +2647,9 @@ static void ConfigureWaterTerrainSettings(
     Heightmap.BlendMode = EWaterBrushBlendType::AlphaBlend;
     Heightmap.FalloffSettings.FalloffMode = EWaterBrushFalloffMode::Width;
     Heightmap.FalloffSettings.FalloffWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
-    Heightmap.FalloffSettings.EdgeOffset = 0.0f;
+    Heightmap.FalloffSettings.EdgeOffset = static_cast<float>(
+        FMath::Max(0.0, Settings.DryBankWidth)
+    );
     Heightmap.FalloffSettings.ZOffset = 0.0f;
     Heightmap.Effects.Blurring.bBlurShape = Settings.BlurRadius > 0;
     Heightmap.Effects.Blurring.Radius = FMath::Clamp(Settings.BlurRadius, 0, 16);
@@ -2849,7 +2880,7 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     MaximumLakeBedDepth = FMath::Max(MinimumLakeBedDepth, WaterTerrain.LakeBedDepth);
     LakeBankBlendWidth = WaterTerrain.LakeShoreWidth;
     LakeDepthRampWidth = FMath::Max(1000.0, WaterTerrain.LakeShoreWidth * 0.35);
-    LakeSurfaceInset = 0.0;
+    LakeSurfaceInset = FMath::Max(0.0, WaterTerrain.LakeSurfaceInset);
 }
 
 FBox AAvenorStripTerrainGenerator::GetGenerationBounds() const

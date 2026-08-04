@@ -106,6 +106,12 @@ struct FAvenorWaterTerrainSettings
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0"))
     double LakeShoreWidth = 24000.0;
 
+    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Lowers generated lake surfaces below the detected basin shoreline. 200 cm exposes roughly two metres of natural bank without changing the lake outline."))
+    double LakeSurfaceInset = 200.0;
+
+    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Generator-wide dry margin between rendered water and the start of the broad terrain ramp. Applied to every generated river and lake modifier."))
+    double DryBankWidth = 300.0;
+
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (ClampMin = "0", ClampMax = "16", ToolTip = "Native Water Body heightmap blur radius. Small values soften triangulation without washing out the bank."))
     int32 BlurRadius = 2;
 
