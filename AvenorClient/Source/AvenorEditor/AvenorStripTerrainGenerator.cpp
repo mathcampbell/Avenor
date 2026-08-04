@@ -2496,7 +2496,7 @@ static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVe
     Spline.SetClosedLoop(bClosed, false);
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
-        Spline.SetSplinePointType(Index, ESplinePointType::CurveAutoClamped, false);
+        Spline.SetSplinePointType(Index, ESplinePointType::CurveClamped, false);
     }
     Spline.UpdateSpline();
 }
@@ -3224,7 +3224,7 @@ static bool SpawnRefinementSpline(
     // remain smooth without the overshoot of unconstrained cubic tangents.
     for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
     {
-        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::CurveAutoClamped, false);
+        SplineComp->SetSplinePointType(PointIndex, ESplinePointType::CurveClamped, false);
     }
     SplineComp->UpdateSpline();
 
