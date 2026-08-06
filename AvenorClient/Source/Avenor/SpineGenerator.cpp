@@ -91,6 +91,9 @@ void ASpineGenerator::ClearGeneratedPlanningData()
     StationRecords.Reset();
     BlockRecords.Reset();
     GreyboxSegments.Reset();
+    GuidewayPlacements.Reset();
+    MonorailPierPlacements.Reset();
+    MonorailSupportPlacements.Reset();
 
     USplineComponent* Splines[] = {
         HighwayPositiveSpline,
@@ -113,14 +116,18 @@ void ASpineGenerator::RebuildLayoutData()
     RebuildDerivedSplines();
     RebuildStationAndBlockRecords();
     RebuildGreyboxSegments();
+    RebuildMonorailPlacements();
 
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor Spine: rebuilt %d stations, %d blocks and %d greybox segments."),
+        TEXT("Avenor Spine: rebuilt %d stations, %d blocks, %d greybox segments, %d guideways, %d piers and %d supports."),
         StationRecords.Num(),
         BlockRecords.Num(),
-        GreyboxSegments.Num()
+        GreyboxSegments.Num(),
+        GuidewayPlacements.Num(),
+        MonorailPierPlacements.Num(),
+        MonorailSupportPlacements.Num()
     );
 }
 
@@ -613,18 +620,6 @@ void ASpineGenerator::RebuildGreyboxSegments()
                 DistrictIndex,
                 Side
             );
-            AddGreyboxSpan(
-                TEXT("Guideway"),
-                Chainage,
-                Next,
-                Side * MonorailTrackCentreOffset,
-                Side * MonorailTrackCentreOffset,
-                MonorailGuidewayCentreHeight,
-                MonorailGuidewayWidth,
-                MonorailGuidewayDepth,
-                DistrictIndex,
-                Side
-            );
         }
     }
 
@@ -723,5 +718,106 @@ void ASpineGenerator::RebuildGreyboxSegments()
             DistrictsAfterStationZero,
             Side
         );
+    }
+}
+
+void ASpineGenerator::RebuildMonorailPlacements()
+{
+    GuidewayPlacements.Reset();
+    MonorailPierPlacements.Reset();
+    MonorailSupportPlacements.Reset();
+
+    const float Start = GetMinimumChainage();
+    const float End = GetMaximumChainage();
+    const float SpanLength = FMath::Max(100.0f, MonorailSpanLength);
+    const float TotalLength = FMath::Max(0.0f, End - Start);
+    const int32 SpanCount = FMath::CeilToInt(TotalLength / SpanLength);
+
+    auto AddSharedPlacement = [this](
+        TArray<FSpineInfrastructurePlacement>& Placements,
+        FName Kind,
+        int32 SpanIndex,
+        float Chainage,
+        float Height)
+    {
+        FSpineInfrastructurePlacement& Placement =
+            Placements.AddDefaulted_GetRef();
+        Placement.Kind = Kind;
+        Placement.SpanIndex = SpanIndex;
+        Placement.Side = 0;
+        Placement.Chainage = Chainage;
+        FVector HorizontalForward = GetSpineTransformAtChainage(Chainage)
+            .GetUnitAxis(EAxis::X);
+        HorizontalForward.Z = 0.0f;
+        if (!HorizontalForward.Normalize())
+        {
+            HorizontalForward = GetActorForwardVector();
+            HorizontalForward.Z = 0.0f;
+            HorizontalForward.Normalize();
+        }
+        Placement.Transform = FTransform(
+            HorizontalForward.Rotation(),
+            GetSpineLocationAtChainage(Chainage, 0.0f, Height),
+            FVector::OneVector
+        );
+    };
+
+    // Piers and their upper supports share the same chainage and orientation.
+    // There is one at both ends of every span, without duplicated boundaries.
+    for (int32 BoundaryIndex = 0; BoundaryIndex <= SpanCount; ++BoundaryIndex)
+    {
+        const float Chainage = BoundaryIndex == SpanCount
+            ? End
+            : FMath::Min(Start + BoundaryIndex * SpanLength, End);
+        AddSharedPlacement(
+            MonorailPierPlacements,
+            TEXT("MonorailPier"),
+            BoundaryIndex,
+            Chainage,
+            0.0f
+        );
+        AddSharedPlacement(
+            MonorailSupportPlacements,
+            TEXT("MonorailSupport"),
+            BoundaryIndex,
+            Chainage,
+            MonorailSupportPivotHeight
+        );
+    }
+
+    for (int32 SpanIndex = 0; SpanIndex < SpanCount; ++SpanIndex)
+    {
+        const float SpanStart = Start + SpanIndex * SpanLength;
+        const float SpanEnd = FMath::Min(SpanStart + SpanLength, End);
+        for (const int32 Side : {-1, 1})
+        {
+            FVector A = GetSpineLocationAtChainage(
+                SpanStart,
+                Side * MonorailTrackCentreOffset,
+                MonorailGuidewayCentreHeight
+            );
+            FVector B = GetSpineLocationAtChainage(
+                SpanEnd,
+                Side * MonorailTrackCentreOffset,
+                MonorailGuidewayCentreHeight
+            );
+            const FVector Delta = B - A;
+            if (Delta.IsNearlyZero())
+            {
+                continue;
+            }
+
+            FSpineInfrastructurePlacement& Placement =
+                GuidewayPlacements.AddDefaulted_GetRef();
+            Placement.Kind = TEXT("Guideway");
+            Placement.SpanIndex = SpanIndex;
+            Placement.Side = Side;
+            Placement.Chainage = (SpanStart + SpanEnd) * 0.5f;
+            Placement.Transform = FTransform(
+                Delta.Rotation(),
+                (A + B) * 0.5f,
+                FVector(Delta.Size() / SpanLength, 1.0f, 1.0f)
+            );
+        }
     }
 }
