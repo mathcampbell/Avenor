@@ -9,35 +9,6 @@ class UPCGGraphInterface;
 class USceneComponent;
 class USplineComponent;
 
-/** An art-directed adjustment applied on top of the authored guide spline. */
-USTRUCT(BlueprintType)
-struct FSpineEffector
-{
-    GENERATED_BODY()
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
-    bool bEnabled = true;
-
-    /** Signed centimetres from Station 0. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
-    float Chainage = 0.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine",
-        meta = (ClampMin = "100.0"))
-    float InfluenceRadius = 50000.0f;
-
-    /** Positive values move the Spine towards local right. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
-    float LateralOffset = 0.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine")
-    float VerticalOffset = 0.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spine",
-        meta = (ClampMin = "0.1"))
-    float FalloffExponent = 2.0f;
-};
-
 /**
  * A station datum consumed by PCG through Get Actor Property.
  * Transform is the road-level station origin; PlatformDatum is relative to it.
@@ -270,9 +241,6 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Alignment",
         meta = (ClampMin = "100.0"))
     float AlignmentSampleLength = 2500.0f;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Alignment")
-    TArray<FSpineEffector> Effectors;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Extent",
         meta = (ClampMin = "0"))
