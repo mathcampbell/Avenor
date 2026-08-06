@@ -76,7 +76,8 @@ struct FSpineBlockRecord
 
 /**
  * Disposable visible blockout input. With Engine/Cube as the mesh, Transform
- * already contains the scale required for roads, guideways and local streets.
+ * already contains the scale required for highway and local-street cubes.
+ * Finished monorail assets use FSpineInfrastructurePlacement instead.
  */
 USTRUCT(BlueprintType)
 struct FSpineGreyboxSegment
@@ -96,6 +97,33 @@ struct FSpineGreyboxSegment
     int32 Side = 0;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Greybox")
+    float Chainage = 0.0f;
+};
+
+/**
+ * Unit-scale placement for a finished infrastructure mesh. Unlike a greybox
+ * segment, Transform does not contain cube dimensions. PCG can therefore feed
+ * it directly to a Static Mesh Spawner using an asset authored in centimetres.
+ */
+USTRUCT(BlueprintType)
+struct FSpineInfrastructurePlacement
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Infrastructure")
+    FTransform Transform = FTransform::Identity;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Infrastructure")
+    FName Kind;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Infrastructure")
+    int32 SpanIndex = 0;
+
+    /** -1/+1 for individual guideways; zero for a shared pier/support. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Infrastructure")
+    int32 Side = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Infrastructure")
     float Chainage = 0.0f;
 };
 
@@ -173,6 +201,7 @@ private:
     void ClearGeneratedPlanningData();
     void RebuildStationAndBlockRecords();
     void RebuildGreyboxSegments();
+    void RebuildMonorailPlacements();
     void AddDerivedSplinePoint(
         USplineComponent* Spline,
         float Chainage,
@@ -307,6 +336,18 @@ private:
         meta = (ClampMin = "100.0"))
     float MonorailGuidewayCentreHeight = 780.0f;
 
+    /** Length of the reusable straight guideway mesh along local X. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Monorail",
+        meta = (ClampMin = "100.0"))
+    float MonorailSpanLength = 2500.0f;
+
+    /**
+     * Local pivot height for the separately exported support mesh. Set this to
+     * zero when the FBX retains the common ground-level origin from Modo.
+     */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Monorail")
+    float MonorailSupportPivotHeight = 680.0f;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Station",
         meta = (ClampMin = "100.0"))
     float StationPlatformDatum = 930.0f;
@@ -329,4 +370,22 @@ private:
         Category = "Avenor|PCG Data",
         meta = (AllowPrivateAccess = "true"))
     TArray<FSpineGreyboxSegment> GreyboxSegments;
+
+    /** One unit-scale placement for each individual 25 m guideway beam. */
+    UPROPERTY(Transient, BlueprintReadOnly,
+        Category = "Avenor|PCG Data",
+        meta = (AllowPrivateAccess = "true"))
+    TArray<FSpineInfrastructurePlacement> GuidewayPlacements;
+
+    /** One central, ground-level placement at every guideway span boundary. */
+    UPROPERTY(Transient, BlueprintReadOnly,
+        Category = "Avenor|PCG Data",
+        meta = (AllowPrivateAccess = "true"))
+    TArray<FSpineInfrastructurePlacement> MonorailPierPlacements;
+
+    /** One central upper-support placement corresponding to each pier. */
+    UPROPERTY(Transient, BlueprintReadOnly,
+        Category = "Avenor|PCG Data",
+        meta = (AllowPrivateAccess = "true"))
+    TArray<FSpineInfrastructurePlacement> MonorailSupportPlacements;
 };
