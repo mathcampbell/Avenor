@@ -1,16 +1,23 @@
 #include "SpineGenerator.h"
 
-#include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
-#include "Engine/StaticMesh.h"
 #include "PCGComponent.h"
 #include "PCGGraph.h"
-#include "UObject/ConstructorHelpers.h"
+
+namespace AvenorSpineTags
+{
+    static const FName Center(TEXT("Avenor.Spine.Center"));
+    static const FName HighwayPositive(TEXT("Avenor.Highway.Positive"));
+    static const FName HighwayNegative(TEXT("Avenor.Highway.Negative"));
+    static const FName MonorailPositive(TEXT("Avenor.Monorail.Positive"));
+    static const FName MonorailNegative(TEXT("Avenor.Monorail.Negative"));
+}
 
 ASpineGenerator::ASpineGenerator()
 {
     PrimaryActorTick.bCanEverTick = false;
+    Tags.AddUnique(FName(TEXT("Avenor.Spine.Source")));
 
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
@@ -18,80 +25,115 @@ ASpineGenerator::ASpineGenerator()
     GuideSpline = CreateDefaultSubobject<USplineComponent>(TEXT("GuideSpline"));
     GuideSpline->SetupAttachment(SceneRoot);
     GuideSpline->SetClosedLoop(false);
+    GuideSpline->ComponentTags.Add(AvenorSpineTags::Center);
     GuideSpline->ClearSplinePoints(false);
     GuideSpline->AddSplinePoint(
-        FVector(-50000.0f, 0.0f, 0.0f),
+        FVector(-204800.0f, 0.0f, 0.0f),
         ESplineCoordinateSpace::Local,
         false
     );
     GuideSpline->AddSplinePoint(
-        FVector(50000.0f, 0.0f, 0.0f),
+        FVector(204800.0f, 0.0f, 0.0f),
         ESplineCoordinateSpace::Local,
         true
+    );
+
+    auto CreateDerivedSpline = [this](const TCHAR* Name, FName Tag)
+    {
+        USplineComponent* Spline =
+            CreateDefaultSubobject<USplineComponent>(Name);
+        Spline->SetupAttachment(SceneRoot);
+        Spline->SetClosedLoop(false);
+        Spline->bInputSplinePointsToConstructionScript = false;
+        Spline->ComponentTags.Add(Tag);
+        return Spline;
+    };
+
+    HighwayPositiveSpline = CreateDerivedSpline(
+        TEXT("HighwayPositiveSpline"),
+        AvenorSpineTags::HighwayPositive
+    );
+    HighwayNegativeSpline = CreateDerivedSpline(
+        TEXT("HighwayNegativeSpline"),
+        AvenorSpineTags::HighwayNegative
+    );
+    MonorailPositiveSpline = CreateDerivedSpline(
+        TEXT("MonorailPositiveSpline"),
+        AvenorSpineTags::MonorailPositive
+    );
+    MonorailNegativeSpline = CreateDerivedSpline(
+        TEXT("MonorailNegativeSpline"),
+        AvenorSpineTags::MonorailNegative
     );
 
     InfrastructurePCG = CreateDefaultSubobject<UPCGComponent>(
         TEXT("InfrastructurePCG")
     );
-    InfrastructurePCG->bIsComponentPartitioned = true;
+    InfrastructurePCG->bIsComponentPartitioned = false;
     InfrastructurePCG->bRegenerateInEditor = false;
+}
 
-    auto CreateInstances = [this](const TCHAR* Name)
+void ASpineGenerator::PostLoad()
+{
+    Super::PostLoad();
+
+    // Older versions serialized very large generated arrays and derived
+    // splines into the level. They are disposable PCG inputs, so discard them
+    // on load instead of paying their memory and Details-panel costs.
+    if (!HasAnyFlags(RF_ClassDefaultObject))
     {
-        UInstancedStaticMeshComponent* Component =
-            CreateDefaultSubobject<UInstancedStaticMeshComponent>(Name);
-        Component->SetupAttachment(SceneRoot);
-        Component->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-        return Component;
-    };
-
-    RoadInstances = CreateInstances(TEXT("RoadInstances"));
-    MedianInstances = CreateInstances(TEXT("MedianInstances"));
-    PavementInstances = CreateInstances(TEXT("PavementInstances"));
-    ParcelInstances = CreateInstances(TEXT("ParcelInstances"));
-    MonorailInstances = CreateInstances(TEXT("MonorailInstances"));
-
-    static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(
-        TEXT("/Engine/BasicShapes/Cube.Cube")
-    );
-
-    if (CubeMeshFinder.Succeeded())
-    {
-        CubeMesh = CubeMeshFinder.Object;
-        RoadInstances->SetStaticMesh(CubeMesh);
-        MedianInstances->SetStaticMesh(CubeMesh);
-        PavementInstances->SetStaticMesh(CubeMesh);
-        ParcelInstances->SetStaticMesh(CubeMesh);
-        MonorailInstances->SetStaticMesh(CubeMesh);
+        ClearGeneratedPlanningData();
     }
 }
 
-void ASpineGenerator::OnConstruction(const FTransform& Transform)
+void ASpineGenerator::ClearGeneratedPlanningData()
 {
-    Super::OnConstruction(Transform);
-    if (bUseLegacyBlockout)
+    StationRecords.Reset();
+    BlockRecords.Reset();
+    GreyboxSegments.Reset();
+
+    USplineComponent* Splines[] = {
+        HighwayPositiveSpline,
+        HighwayNegativeSpline,
+        MonorailPositiveSpline,
+        MonorailNegativeSpline
+    };
+    for (USplineComponent* Spline : Splines)
     {
-        RebuildStrip();
+        if (Spline)
+        {
+            Spline->ClearSplinePoints(true);
+        }
     }
-    else
-    {
-        RoadInstances->ClearInstances();
-        MedianInstances->ClearInstances();
-        PavementInstances->ClearInstances();
-        ParcelInstances->ClearInstances();
-        MonorailInstances->ClearInstances();
-    }
+}
+
+void ASpineGenerator::RebuildLayoutData()
+{
+    InfrastructurePCG->bIsComponentPartitioned = bPartitionedGeneration;
+    RebuildDerivedSplines();
+    RebuildStationAndBlockRecords();
+    RebuildGreyboxSegments();
+
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor Spine: rebuilt %d stations, %d blocks and %d greybox segments."),
+        StationRecords.Num(),
+        BlockRecords.Num(),
+        GreyboxSegments.Num()
+    );
 }
 
 void ASpineGenerator::RegenerateInfrastructure()
 {
 #if WITH_EDITOR
+    RebuildLayoutData();
     if (!InfrastructurePCG || !InfrastructureGraph)
     {
         UE_LOG(
             LogTemp,
             Warning,
-            TEXT("Assign a Spine Infrastructure PCG graph first.")
+            TEXT("Avenor Spine: assign PCG_Spine_Master before generating.")
         );
         return;
     }
@@ -109,17 +151,53 @@ void ASpineGenerator::ClearInfrastructure()
     {
         InfrastructurePCG->CleanupLocal(true);
     }
+    ClearGeneratedPlanningData();
+#endif
+}
+
+void ASpineGenerator::ResetToPrototypeDefaults()
+{
+#if WITH_EDITOR
+    Modify();
+    if (InfrastructurePCG)
+    {
+        InfrastructurePCG->CleanupLocal(true);
+        InfrastructurePCG->bIsComponentPartitioned = false;
+        InfrastructurePCG->bRegenerateInEditor = false;
+    }
+
+    bPartitionedGeneration = false;
+    DistrictsBeforeStationZero = 0;
+    DistrictsAfterStationZero = 1;
+    DevelopmentRowsPerSide = 1;
+    AlignmentSampleLength = 2500.0f;
+    ClearGeneratedPlanningData();
+    MarkPackageDirty();
+
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor Spine: cleared generated data and restored lightweight prototype defaults.")
+    );
 #endif
 }
 
 float ASpineGenerator::GetMinimumChainage() const
 {
-    return -static_cast<float>(BlocksWest) * BlockSize;
+    return -static_cast<float>(DistrictsBeforeStationZero) * StationSpacing;
 }
 
 float ASpineGenerator::GetMaximumChainage() const
 {
-    return static_cast<float>(BlocksEast) * BlockSize;
+    return static_cast<float>(DistrictsAfterStationZero) * StationSpacing;
+}
+
+float ASpineGenerator::GetResolvedLocalStreetWidth() const
+{
+    const float Remaining = StationSpacing
+        - BlocksPerDistrict * BlockSize
+        - StationStreetWidth;
+    return FMath::Max(0.0f, Remaining / (BlocksPerDistrict - 1));
 }
 
 void ASpineGenerator::GetBaseSplineFrameAtChainage(
@@ -153,8 +231,6 @@ void ASpineGenerator::GetBaseSplineFrameAtChainage(
         ESplineCoordinateSpace::World
     ).GetSafeNormal();
 
-    // Continue along the end tangent instead of collapsing every out-of-range
-    // terrain row onto the first/last spline point.
     if (RequestedDistance < 0.0f)
     {
         OutLocation += OutForward * RequestedDistance;
@@ -167,11 +243,6 @@ void ASpineGenerator::GetBaseSplineFrameAtChainage(
 
 FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
 {
-    if (!GuideSpline || GuideSpline->GetSplineLength() <= KINDA_SMALL_NUMBER)
-    {
-        return GetActorTransform();
-    }
-
     FVector Location;
     FVector Forward;
     GetBaseSplineFrameAtChainage(Chainage, Location, Forward);
@@ -180,86 +251,58 @@ FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
         .GetSafeNormal();
     if (Right.IsNearlyZero())
     {
-        Right = FVector::RightVector;
+        Right = GetActorRightVector();
     }
 
-    float AppliedLateralOffset = 0.0f;
-    float AppliedVerticalOffset = 0.0f;
-
-    for (const FSpineEffector& Effector : Effectors)
+    auto GetEffectorOffsets = [this](float AtChainage)
     {
-        if (!Effector.bEnabled || Effector.InfluenceRadius <= 0.0f)
-        {
-            continue;
-        }
-
-        const float NormalisedDistance =
-            FMath::Abs(Chainage - Effector.Chainage) /
-            Effector.InfluenceRadius;
-
-        if (NormalisedDistance >= 1.0f)
-        {
-            continue;
-        }
-
-        const float SmoothFalloff =
-            FMath::SmoothStep(0.0f, 1.0f, 1.0f - NormalisedDistance);
-        const float Weight = FMath::Pow(
-            SmoothFalloff,
-            FMath::Max(0.1f, Effector.FalloffExponent)
-        );
-
-        AppliedLateralOffset += Effector.LateralOffset * Weight;
-        AppliedVerticalOffset += Effector.VerticalOffset * Weight;
-    }
-
-    Location += Right * AppliedLateralOffset;
-    Location.Z += AppliedVerticalOffset;
-
-    // Sampling nearby effected locations makes rotation follow effector bends.
-    const float Probe = FMath::Max(100.0f, GenerationSegmentLength * 0.25f);
-    // Terrain and other systems may query well beyond the currently generated
-    // road blocks. Never clamp this orientation probe to the road extent:
-    // doing so reverses the tangent beyond BlocksEast and folds spine-space.
-    const float AheadChainage = Chainage + Probe;
-    if (!FMath::IsNearlyEqual(AheadChainage, Chainage))
-    {
-        FVector Ahead;
-        FVector AheadBaseForward;
-        GetBaseSplineFrameAtChainage(
-            AheadChainage,
-            Ahead,
-            AheadBaseForward
-        );
-        FVector AheadRight = FVector::CrossProduct(
-            FVector::UpVector,
-            AheadBaseForward
-        ).GetSafeNormal();
-
-        float AheadLateral = 0.0f;
-        float AheadVertical = 0.0f;
+        FVector2D Offsets = FVector2D::ZeroVector;
         for (const FSpineEffector& Effector : Effectors)
         {
             if (!Effector.bEnabled || Effector.InfluenceRadius <= 0.0f)
             {
                 continue;
             }
-            const float D = FMath::Abs(AheadChainage - Effector.Chainage) /
-                Effector.InfluenceRadius;
-            if (D < 1.0f)
+
+            const float Distance = FMath::Abs(
+                AtChainage - Effector.Chainage
+            ) / Effector.InfluenceRadius;
+            if (Distance >= 1.0f)
             {
-                const float W = FMath::Pow(
-                    FMath::SmoothStep(0.0f, 1.0f, 1.0f - D),
-                    FMath::Max(0.1f, Effector.FalloffExponent)
-                );
-                AheadLateral += Effector.LateralOffset * W;
-                AheadVertical += Effector.VerticalOffset * W;
+                continue;
             }
+
+            const float Smooth = FMath::SmoothStep(
+                0.0f,
+                1.0f,
+                1.0f - Distance
+            );
+            const float Weight = FMath::Pow(
+                Smooth,
+                FMath::Max(0.1f, Effector.FalloffExponent)
+            );
+            Offsets.X += Effector.LateralOffset * Weight;
+            Offsets.Y += Effector.VerticalOffset * Weight;
         }
-        Ahead += AheadRight * AheadLateral;
-        Ahead.Z += AheadVertical;
-        Forward = (Ahead - Location).GetSafeNormal();
-    }
+        return Offsets;
+    };
+
+    const FVector2D Offsets = GetEffectorOffsets(Chainage);
+    Location += Right * Offsets.X;
+    Location.Z += Offsets.Y;
+
+    const float Probe = FMath::Max(100.0f, AlignmentSampleLength * 0.25f);
+    FVector Ahead;
+    FVector AheadForward;
+    GetBaseSplineFrameAtChainage(Chainage + Probe, Ahead, AheadForward);
+    FVector AheadRight = FVector::CrossProduct(
+        FVector::UpVector,
+        AheadForward
+    ).GetSafeNormal();
+    const FVector2D AheadOffsets = GetEffectorOffsets(Chainage + Probe);
+    Ahead += AheadRight * AheadOffsets.X;
+    Ahead.Z += AheadOffsets.Y;
+    Forward = (Ahead - Location).GetSafeNormal();
 
     return FTransform(Forward.Rotation(), Location);
 }
@@ -270,9 +313,9 @@ FVector ASpineGenerator::GetSpineLocationAtChainage(
     float VerticalOffset
 ) const
 {
-    const FTransform SpineTransform = GetSpineTransformAtChainage(Chainage);
-    return SpineTransform.GetLocation()
-        + SpineTransform.GetUnitAxis(EAxis::Y) * LateralOffset
+    const FTransform Frame = GetSpineTransformAtChainage(Chainage);
+    return Frame.GetLocation()
+        + Frame.GetUnitAxis(EAxis::Y) * LateralOffset
         + FVector::UpVector * VerticalOffset;
 }
 
@@ -300,26 +343,19 @@ void ASpineGenerator::GetSpineSpaceForWorldLocation(
     float Distance =
         GuideSpline->GetDistanceAlongSplineAtSplineInputKey(InputKey);
 
-    // The authored guide spline can be much shorter than the generated world.
-    // Extend its end tangents for reverse lookups just as
-    // GetBaseSplineFrameAtChainage does for forward lookups. Without this,
-    // every Landscape vertex beyond an endpoint receives the same chainage,
-    // collapsing one axis of terrain noise into long flat plateaux.
-    const FVector StartLocation =
-        GuideSpline->GetLocationAtDistanceAlongSpline(
-            0.0f,
-            ESplineCoordinateSpace::World
-        );
+    const FVector StartLocation = GuideSpline->GetLocationAtDistanceAlongSpline(
+        0.0f,
+        ESplineCoordinateSpace::World
+    );
     const FVector StartDirection =
         GuideSpline->GetDirectionAtDistanceAlongSpline(
             0.0f,
             ESplineCoordinateSpace::World
         ).GetSafeNormal();
-    const FVector EndLocation =
-        GuideSpline->GetLocationAtDistanceAlongSpline(
-            SplineLength,
-            ESplineCoordinateSpace::World
-        );
+    const FVector EndLocation = GuideSpline->GetLocationAtDistanceAlongSpline(
+        SplineLength,
+        ESplineCoordinateSpace::World
+    );
     const FVector EndDirection =
         GuideSpline->GetDirectionAtDistanceAlongSpline(
             SplineLength,
@@ -337,14 +373,12 @@ void ASpineGenerator::GetSpineSpaceForWorldLocation(
     {
         Distance = BeforeStart;
     }
-    else if (Distance >= SplineLength - KINDA_SMALL_NUMBER &&
-             BeyondEnd > 0.0f)
+    else if (Distance >= SplineLength - KINDA_SMALL_NUMBER && BeyondEnd > 0.0f)
     {
         Distance = SplineLength + BeyondEnd;
     }
 
     OutChainage = Distance - StationZeroSplineDistance;
-
     const FTransform Frame = GetSpineTransformAtChainage(OutChainage);
     const FVector Delta = WorldLocation - Frame.GetLocation();
     OutLateral = FVector::DotProduct(
@@ -354,170 +388,392 @@ void ASpineGenerator::GetSpineSpaceForWorldLocation(
     OutVertical = FVector::DotProduct(Delta, FVector::UpVector);
 }
 
-void ASpineGenerator::AddBox(
-    UInstancedStaticMeshComponent* Component,
-    const FVector& Location,
-    const FVector& Size,
-    const FQuat& Rotation
+void ASpineGenerator::AddDerivedSplinePoint(
+    USplineComponent* Spline,
+    float Chainage,
+    float Lateral,
+    float Vertical
 )
 {
-    if (!Component)
+    if (Spline)
     {
-        return;
+        Spline->AddSplinePoint(
+            GetSpineLocationAtChainage(Chainage, Lateral, Vertical),
+            ESplineCoordinateSpace::World,
+            false
+        );
     }
-    Component->AddInstance(
-        FTransform(Rotation, Location, Size / 100.0f),
-        true
-    );
 }
 
-void ASpineGenerator::AddStripSegment(
-    UInstancedStaticMeshComponent* Component,
-    float StartChainage,
-    float EndChainage,
-    float LateralOffset,
-    float CentreHeight,
-    float Width,
-    float Thickness
-)
+void ASpineGenerator::RebuildDerivedSplines()
 {
-    const FTransform Start = GetSpineTransformAtChainage(StartChainage);
-    const FTransform End = GetSpineTransformAtChainage(EndChainage);
-    FVector StartLocation = Start.GetLocation()
-        + Start.GetUnitAxis(EAxis::Y) * LateralOffset;
-    FVector EndLocation = End.GetLocation()
-        + End.GetUnitAxis(EAxis::Y) * LateralOffset;
-    StartLocation.Z += CentreHeight;
-    EndLocation.Z += CentreHeight;
-
-    const FVector Delta = EndLocation - StartLocation;
-    const float Length = Delta.Size();
-    if (Length <= KINDA_SMALL_NUMBER)
+    USplineComponent* Splines[] = {
+        HighwayPositiveSpline,
+        HighwayNegativeSpline,
+        MonorailPositiveSpline,
+        MonorailNegativeSpline
+    };
+    for (USplineComponent* Spline : Splines)
     {
-        return;
+        if (Spline)
+        {
+            Spline->ClearSplinePoints(false);
+        }
     }
 
-    AddBox(
-        Component,
-        (StartLocation + EndLocation) * 0.5f,
-        FVector(Length, Width, Thickness),
-        Delta.Rotation().Quaternion()
-    );
-}
-
-void ASpineGenerator::RebuildStrip()
-{
-    RoadInstances->ClearInstances();
-    MedianInstances->ClearInstances();
-    PavementInstances->ClearInstances();
-    ParcelInstances->ClearInstances();
-    MonorailInstances->ClearInstances();
-
-    if (!CubeMesh || !GuideSpline)
-    {
-        return;
-    }
-
+    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
+        + HighwayCarriagewayWidth * 0.5f;
     const float Start = GetMinimumChainage();
     const float End = GetMaximumChainage();
-    if (End <= Start)
+    const float Step = FMath::Max(100.0f, AlignmentSampleLength);
+    for (float Chainage = Start; Chainage < End; Chainage += Step)
+    {
+        AddDerivedSplinePoint(
+            HighwayPositiveSpline,
+            Chainage,
+            CarriagewayOffset,
+            0.0f
+        );
+        AddDerivedSplinePoint(
+            HighwayNegativeSpline,
+            Chainage,
+            -CarriagewayOffset,
+            0.0f
+        );
+        AddDerivedSplinePoint(
+            MonorailPositiveSpline,
+            Chainage,
+            MonorailTrackCentreOffset,
+            MonorailGuidewayCentreHeight
+        );
+        AddDerivedSplinePoint(
+            MonorailNegativeSpline,
+            Chainage,
+            -MonorailTrackCentreOffset,
+            MonorailGuidewayCentreHeight
+        );
+    }
+
+    AddDerivedSplinePoint(
+        HighwayPositiveSpline,
+        End,
+        CarriagewayOffset,
+        0.0f
+    );
+    AddDerivedSplinePoint(
+        HighwayNegativeSpline,
+        End,
+        -CarriagewayOffset,
+        0.0f
+    );
+    AddDerivedSplinePoint(
+        MonorailPositiveSpline,
+        End,
+        MonorailTrackCentreOffset,
+        MonorailGuidewayCentreHeight
+    );
+    AddDerivedSplinePoint(
+        MonorailNegativeSpline,
+        End,
+        -MonorailTrackCentreOffset,
+        MonorailGuidewayCentreHeight
+    );
+
+    for (USplineComponent* Spline : Splines)
+    {
+        if (Spline)
+        {
+            Spline->UpdateSpline();
+        }
+    }
+}
+
+float ASpineGenerator::GetBlockCentreOffset(int32 BayIndex) const
+{
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    return StationStreetWidth * 0.5f
+        + BlockSize * 0.5f
+        + BayIndex * (BlockSize + LocalStreetWidth);
+}
+
+float ASpineGenerator::GetInternalStreetCentreOffset(int32 StreetIndex) const
+{
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    return StationStreetWidth * 0.5f
+        + StreetIndex * BlockSize
+        + (static_cast<float>(StreetIndex) - 0.5f) * LocalStreetWidth;
+}
+
+float ASpineGenerator::GetDevelopmentOuterLateral() const
+{
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    return SpineReservationWidth * 0.5f
+        + DevelopmentRowsPerSide * (BlockSize + LocalStreetWidth);
+}
+
+FString ASpineGenerator::FormatSignedId(const TCHAR* Prefix, int32 Index) const
+{
+    return FString::Printf(
+        TEXT("%s%c%04d"),
+        Prefix,
+        Index < 0 ? TEXT('-') : TEXT('+'),
+        FMath::Abs(Index)
+    );
+}
+
+void ASpineGenerator::RebuildStationAndBlockRecords()
+{
+    StationRecords.Reset();
+    BlockRecords.Reset();
+
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    if (LocalStreetWidth <= KINDA_SMALL_NUMBER)
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("Avenor Spine: district dimensions leave no room for streets.")
+        );
+        return;
+    }
+
+    for (int32 StationIndex = -DistrictsBeforeStationZero;
+         StationIndex <= DistrictsAfterStationZero;
+         ++StationIndex)
+    {
+        FSpineStationRecord& Station = StationRecords.AddDefaulted_GetRef();
+        Station.StationIndex = StationIndex;
+        Station.Chainage = static_cast<float>(StationIndex) * StationSpacing;
+        Station.StationId = FName(*FormatSignedId(TEXT("S"), StationIndex));
+        Station.Transform = GetSpineTransformAtChainage(Station.Chainage);
+        Station.PlatformDatum = StationPlatformDatum;
+        Station.PublicRealmBayIndex = PublicRealmBayIndex;
+    }
+
+    for (int32 DistrictIndex = -DistrictsBeforeStationZero;
+         DistrictIndex < DistrictsAfterStationZero;
+         ++DistrictIndex)
+    {
+        const float DistrictStart =
+            static_cast<float>(DistrictIndex) * StationSpacing;
+        for (int32 BayIndex = 0; BayIndex < BlocksPerDistrict; ++BayIndex)
+        {
+            const float Chainage = DistrictStart
+                + GetBlockCentreOffset(BayIndex);
+            for (int32 RowIndex = 0;
+                 RowIndex < DevelopmentRowsPerSide;
+                 ++RowIndex)
+            {
+                const float RowCentre = SpineReservationWidth * 0.5f
+                    + LocalStreetWidth * 0.5f
+                    + BlockSize * 0.5f
+                    + RowIndex * (BlockSize + LocalStreetWidth);
+                for (const int32 Side : {-1, 1})
+                {
+                    FSpineBlockRecord& Block =
+                        BlockRecords.AddDefaulted_GetRef();
+                    Block.DistrictIndex = DistrictIndex;
+                    Block.BayIndex = BayIndex;
+                    Block.RowIndex = RowIndex;
+                    Block.Side = Side;
+                    Block.Chainage = Chainage;
+                    Block.Lateral = Side * RowCentre;
+                    Block.ClearSize = FVector(BlockSize, BlockSize, 0.0f);
+                    Block.ZoneRole = BayIndex == PublicRealmBayIndex
+                        ? FName(TEXT("PublicRealm"))
+                        : FName(TEXT("Development"));
+                    Block.Transform = FTransform(
+                        GetSpineTransformAtChainage(Chainage).GetRotation(),
+                        GetSpineLocationAtChainage(Chainage, Block.Lateral)
+                    );
+                    Block.BlockId = FName(*FString::Printf(
+                        TEXT("%s-B%02d-%c-R%02d"),
+                        *FormatSignedId(TEXT("D"), DistrictIndex),
+                        BayIndex,
+                        Side > 0 ? TEXT('P') : TEXT('N'),
+                        RowIndex
+                    ));
+                }
+            }
+        }
+    }
+
+}
+
+void ASpineGenerator::AddGreyboxSpan(
+    FName Kind,
+    float StartChainage,
+    float EndChainage,
+    float StartLateral,
+    float EndLateral,
+    float CentreHeight,
+    float Width,
+    float Thickness,
+    int32 DistrictIndex,
+    int32 Side
+)
+{
+    FVector A = GetSpineLocationAtChainage(StartChainage, StartLateral);
+    FVector B = GetSpineLocationAtChainage(EndChainage, EndLateral);
+    A.Z += CentreHeight;
+    B.Z += CentreHeight;
+    const FVector Delta = B - A;
+    if (Delta.IsNearlyZero())
     {
         return;
     }
 
-    const float HalfMedian = MedianWidth * 0.5f;
-    const float CarriagewayOffset = HalfMedian + CarriagewayWidth * 0.5f;
-    const float PavementOffset =
-        HalfMedian + CarriagewayWidth + PavementWidth * 0.5f;
-    const float HalfCorridor =
-        HalfMedian + CarriagewayWidth + PavementWidth;
+    FSpineGreyboxSegment& Segment =
+        GreyboxSegments.AddDefaulted_GetRef();
+    Segment.Kind = Kind;
+    Segment.DistrictIndex = DistrictIndex;
+    Segment.Side = Side;
+    Segment.Chainage = (StartChainage + EndChainage) * 0.5f;
+    Segment.Transform = FTransform(
+        Delta.Rotation(),
+        (A + B) * 0.5f,
+        FVector(Delta.Size(), Width, Thickness) / 100.0f
+    );
+}
 
-    const float Step = FMath::Max(100.0f, GenerationSegmentLength);
-    for (float S = Start; S < End; S += Step)
+void ASpineGenerator::RebuildGreyboxSegments()
+{
+    GreyboxSegments.Reset();
+    const float Start = GetMinimumChainage();
+    const float End = GetMaximumChainage();
+    const float Step = FMath::Max(200.0f, AlignmentSampleLength);
+    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
+        + HighwayCarriagewayWidth * 0.5f;
+
+    for (float Chainage = Start; Chainage < End; Chainage += Step)
     {
-        const float Next = FMath::Min(S + Step, End);
-        AddStripSegment(
-            MedianInstances, S, Next, 0.0f,
-            RoadThickness * 0.5f, MedianWidth, RoadThickness
+        const float Next = FMath::Min(Chainage + Step, End);
+        const int32 DistrictIndex = FMath::FloorToInt(
+            Chainage / StationSpacing
         );
-        AddStripSegment(
-            RoadInstances, S, Next, CarriagewayOffset,
-            RoadThickness * 0.5f, CarriagewayWidth, RoadThickness
-        );
-        AddStripSegment(
-            RoadInstances, S, Next, -CarriagewayOffset,
-            RoadThickness * 0.5f, CarriagewayWidth, RoadThickness
-        );
-        AddStripSegment(
-            PavementInstances, S, Next, PavementOffset,
-            PavementThickness * 0.5f, PavementWidth, PavementThickness
-        );
-        AddStripSegment(
-            PavementInstances, S, Next, -PavementOffset,
-            PavementThickness * 0.5f, PavementWidth, PavementThickness
-        );
-        AddStripSegment(
-            MonorailInstances, S, Next, 0.0f,
-            MonorailBeamCentreHeight,
-            MonorailGuidewayWidth, MonorailBeamDepth
-        );
+        for (const int32 Side : {-1, 1})
+        {
+            AddGreyboxSpan(
+                TEXT("Highway"),
+                Chainage,
+                Next,
+                Side * CarriagewayOffset,
+                Side * CarriagewayOffset,
+                RoadThickness * 0.5f,
+                HighwayCarriagewayWidth,
+                RoadThickness,
+                DistrictIndex,
+                Side
+            );
+            AddGreyboxSpan(
+                TEXT("Guideway"),
+                Chainage,
+                Next,
+                Side * MonorailTrackCentreOffset,
+                Side * MonorailTrackCentreOffset,
+                MonorailGuidewayCentreHeight,
+                MonorailGuidewayWidth,
+                MonorailGuidewayDepth,
+                DistrictIndex,
+                Side
+            );
+        }
     }
 
-    if (bShowLegacyParcelPads)
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    const float InnerLateral = SpineReservationWidth * 0.5f;
+    const float OuterLateral = GetDevelopmentOuterLateral();
+    for (int32 DistrictIndex = -DistrictsBeforeStationZero;
+         DistrictIndex < DistrictsAfterStationZero;
+         ++DistrictIndex)
     {
-        const float ParcelSize = FMath::Max(
-            100.0f,
-            BlockSize - ParcelGridGap
-        );
-        for (int32 Along = -BlocksWest; Along < BlocksEast; ++Along)
+        const float DistrictStart =
+            static_cast<float>(DistrictIndex) * StationSpacing;
+        for (const int32 Side : {-1, 1})
         {
-            const float Chainage =
-                (static_cast<float>(Along) + 0.5f) * BlockSize;
-            const FTransform Spine = GetSpineTransformAtChainage(Chainage);
-            for (int32 Depth = 0; Depth < ParcelRowsPerSide; ++Depth)
+            AddGreyboxSpan(
+                TEXT("StationStreet"),
+                DistrictStart,
+                DistrictStart,
+                Side * InnerLateral,
+                Side * OuterLateral,
+                RoadThickness * 0.5f,
+                StationStreetWidth,
+                RoadThickness,
+                DistrictIndex,
+                Side
+            );
+            for (int32 StreetIndex = 1;
+                 StreetIndex < BlocksPerDistrict;
+                 ++StreetIndex)
             {
-                const float Offset =
-                    HalfCorridor +
-                    (static_cast<float>(Depth) + 0.5f) * BlockSize;
-                for (const float Side : {-1.0f, 1.0f})
+                const float StreetChainage = DistrictStart
+                    + GetInternalStreetCentreOffset(StreetIndex);
+                AddGreyboxSpan(
+                    TEXT("LocalStreet"),
+                    StreetChainage,
+                    StreetChainage,
+                    Side * InnerLateral,
+                    Side * OuterLateral,
+                    RoadThickness * 0.5f,
+                    LocalStreetWidth,
+                    RoadThickness,
+                    DistrictIndex,
+                    Side
+                );
+            }
+
+            for (int32 Boundary = 0;
+                 Boundary <= DevelopmentRowsPerSide;
+                 ++Boundary)
+            {
+                const float Lateral = Side * (
+                    InnerLateral
+                    + static_cast<float>(Boundary)
+                        * (BlockSize + LocalStreetWidth)
+                );
+                for (float Chainage = DistrictStart;
+                     Chainage < DistrictStart + StationSpacing;
+                     Chainage += Step)
                 {
-                    FVector Location = GetSpineLocationAtChainage(
-                        Chainage,
-                        Side * Offset,
-                        ParcelPadThickness * 0.5f
+                    const float Next = FMath::Min(
+                        Chainage + Step,
+                        DistrictStart + StationSpacing
                     );
-                    AddBox(
-                        ParcelInstances,
-                        Location,
-                        FVector(
-                            ParcelSize,
-                            ParcelSize,
-                            ParcelPadThickness
-                        ),
-                        Spine.GetRotation()
+                    AddGreyboxSpan(
+                        TEXT("LocalStreet"),
+                        Chainage,
+                        Next,
+                        Lateral,
+                        Lateral,
+                        RoadThickness * 0.5f,
+                        LocalStreetWidth,
+                        RoadThickness,
+                        DistrictIndex,
+                        Side
                     );
                 }
             }
         }
     }
 
-    const float SupportHeight = FMath::Max(
-        100.0f,
-        MonorailBeamCentreHeight - MonorailBeamDepth * 0.5f
-    );
-    const int32 FirstSupport = FMath::CeilToInt(Start / SupportSpacing);
-    const int32 LastSupport = FMath::FloorToInt(End / SupportSpacing);
-    for (int32 Index = FirstSupport; Index <= LastSupport; ++Index)
+    // The final district contributes its starting station street above; add
+    // the terminal station street explicitly so the generated road grid has
+    // a closed outer boundary too.
+    const float TerminalChainage = GetMaximumChainage();
+    for (const int32 Side : {-1, 1})
     {
-        const float Chainage = static_cast<float>(Index) * SupportSpacing;
-        const FTransform Spine = GetSpineTransformAtChainage(Chainage);
-        FVector Location = Spine.GetLocation();
-        Location.Z += SupportHeight * 0.5f;
-        AddBox(
-            MonorailInstances,
-            Location,
-            FVector(SupportWidth, SupportWidth, SupportHeight),
-            Spine.GetRotation()
+        AddGreyboxSpan(
+            TEXT("StationStreet"),
+            TerminalChainage,
+            TerminalChainage,
+            Side * InnerLateral,
+            Side * OuterLateral,
+            RoadThickness * 0.5f,
+            StationStreetWidth,
+            RoadThickness,
+            DistrictsAfterStationZero,
+            Side
         );
     }
 }
