@@ -247,62 +247,10 @@ FTransform ASpineGenerator::GetSpineTransformAtChainage(float Chainage) const
     FVector Forward;
     GetBaseSplineFrameAtChainage(Chainage, Location, Forward);
 
-    FVector Right = FVector::CrossProduct(FVector::UpVector, Forward)
-        .GetSafeNormal();
-    if (Right.IsNearlyZero())
+    if (Forward.IsNearlyZero())
     {
-        Right = GetActorRightVector();
+        Forward = GetActorForwardVector();
     }
-
-    auto GetEffectorOffsets = [this](float AtChainage)
-    {
-        FVector2D Offsets = FVector2D::ZeroVector;
-        for (const FSpineEffector& Effector : Effectors)
-        {
-            if (!Effector.bEnabled || Effector.InfluenceRadius <= 0.0f)
-            {
-                continue;
-            }
-
-            const float Distance = FMath::Abs(
-                AtChainage - Effector.Chainage
-            ) / Effector.InfluenceRadius;
-            if (Distance >= 1.0f)
-            {
-                continue;
-            }
-
-            const float Smooth = FMath::SmoothStep(
-                0.0f,
-                1.0f,
-                1.0f - Distance
-            );
-            const float Weight = FMath::Pow(
-                Smooth,
-                FMath::Max(0.1f, Effector.FalloffExponent)
-            );
-            Offsets.X += Effector.LateralOffset * Weight;
-            Offsets.Y += Effector.VerticalOffset * Weight;
-        }
-        return Offsets;
-    };
-
-    const FVector2D Offsets = GetEffectorOffsets(Chainage);
-    Location += Right * Offsets.X;
-    Location.Z += Offsets.Y;
-
-    const float Probe = FMath::Max(100.0f, AlignmentSampleLength * 0.25f);
-    FVector Ahead;
-    FVector AheadForward;
-    GetBaseSplineFrameAtChainage(Chainage + Probe, Ahead, AheadForward);
-    FVector AheadRight = FVector::CrossProduct(
-        FVector::UpVector,
-        AheadForward
-    ).GetSafeNormal();
-    const FVector2D AheadOffsets = GetEffectorOffsets(Chainage + Probe);
-    Ahead += AheadRight * AheadOffsets.X;
-    Ahead.Z += AheadOffsets.Y;
-    Forward = (Ahead - Location).GetSafeNormal();
 
     return FTransform(Forward.Rotation(), Location);
 }
