@@ -151,3 +151,13 @@ AvenorClient/Content/SenseiTerrain/Textures/T_Voronoi_Perturbed_4k.uasset
 AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.zip
 AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator (2).zip
 AvenorClient/Source/AvenorEditor/AvenorEditor.zip
+AvenorClient/Content/Monorail_Beam.uasset
+AvenorClient/Content/Monorail_pier_glow.uasset
+AvenorClient/Content/Monorail_pier_main.uasset
+AvenorClient/Content/Monorail_pier_pipe.uasset
+AvenorClient/Content/Monorail_pier_support.uasset
+AvenorClient/Content/Monorail_rail_glow.uasset
+AvenorClient/Content/Monorail_rail_main.uasset
+AvenorClient/Content/Monorail_rail_pipe.uasset
+AvenorClient/Content/Monorail_Supports.uasset
+AvenorClient/Content/Monrail_Pier.uasset
