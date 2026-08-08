@@ -2,7 +2,9 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#if WITH_EDITOR
 #include "MeshPartitionModifierComponent.h"
+#endif
 #include "SpineGenerator.generated.h"
 
 class UPCGComponent;
@@ -41,6 +43,7 @@ struct FSpineAlignmentSample
  * Narrow cut-and-fill modifier owned by the Spine actor. It changes vertices
  * in the existing Mesh Terrain; it never creates a second terrain surface.
  */
+#if WITH_EDITOR
 UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
 class AVENOR_API UAvenorSpineTerrainModifier
     : public UE::MeshPartition::UModifierComponent
@@ -55,6 +58,7 @@ public:
         ) const override;
     virtual FGuid GetCodeVersionKey() const override;
 };
+#endif
 
 /**
  * A station datum consumed by PCG through Get Actor Property.
@@ -256,7 +260,9 @@ public:
 private:
     static constexpr int32 BlocksPerDistrict = 9;
 
+#if WITH_EDITOR
     friend class UAvenorSpineTerrainModifier;
+#endif
 
     void GetBaseSplineFrameAtChainage(
         float Chainage,
@@ -298,10 +304,12 @@ private:
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
 
+#if WITH_EDITORONLY_DATA
     /** Modifies the existing Mesh Terrain only inside the engineered corridor. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Terrain",
         meta = (AllowPrivateAccess = "true"))
     TObjectPtr<UAvenorSpineTerrainModifier> TerrainCorridorModifier;
+#endif
 
     /** Edit this spline directly. Station 0 is an offset along it. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Spine",

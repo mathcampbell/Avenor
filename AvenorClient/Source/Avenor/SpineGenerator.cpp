@@ -12,6 +12,7 @@ namespace UE::Avenor::Spine
 {
 static const FName SpineExclusionChannel(TEXT("SpineExclusion"));
 
+#if WITH_EDITOR
 struct FCorridorSample
 {
     FVector2D Centre = FVector2D::ZeroVector;
@@ -141,8 +142,10 @@ public:
     double TransitionHalfWidth = 12000.0;
     TArray<FCorridorSample> Samples;
 };
+#endif
 } // namespace UE::Avenor::Spine
 
+#if WITH_EDITOR
 TArray<FBox> UAvenorSpineTerrainModifier::ComputeBounds() const
 {
     const ASpineGenerator* Spine = Cast<ASpineGenerator>(GetOwner());
@@ -197,6 +200,7 @@ FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
     return FGuid(TEXT("a731c96c-aafb-4f72-8704-4015b6a94e49"));
 }
+#endif
 
 namespace AvenorSpineTags
 {
@@ -215,12 +219,14 @@ ASpineGenerator::ASpineGenerator()
     SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
     SetRootComponent(SceneRoot);
 
+#if WITH_EDITOR
     TerrainCorridorModifier =
         CreateDefaultSubobject<UAvenorSpineTerrainModifier>(
             TEXT("SpineTerrainCorridor")
         );
     TerrainCorridorModifier->SetupAttachment(SceneRoot);
     TerrainCorridorModifier->bIsEditorOnly = true;
+#endif
 
     GuideSpline = CreateDefaultSubobject<USplineComponent>(TEXT("GuideSpline"));
     GuideSpline->SetupAttachment(SceneRoot);
