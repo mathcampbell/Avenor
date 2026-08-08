@@ -10,8 +10,16 @@
   `PCGMeshPartitionInterop`.
 - Native Water Body actors own visible rivers and lakes.
   `MeshPartitionWater` connects them to River and Lake terrain modifiers.
-- `ASpineGenerator::GuideSpline` is the authoritative Spine route.
-- `AParcelGenerator` owns parcel policy and availability data.
+- `ASpineGenerator::GuideSpline` is the authoritative Spine route. The actor
+  resolves that route into a terrain-sampled, grade-limited vertical alignment
+  and exact station, block and infrastructure data for PCG.
+- `ASpineGenerator::SpineTerrainCorridor` is a narrow modifier on that same
+  Mesh Partition. It owns cut-and-fill for the engineered reservation without
+  rebuilding the broad landform/hydrology plan or creating overlapping ground.
+- PCG proposes the initial block geometry. A future versioned world-registry
+  snapshot becomes authoritative once that layout is published.
+- `AParcelGenerator` is legacy terrain-analysis/visualisation code and must
+  not be treated as the permanent parcel authority.
 
 The game module deliberately stores the experimental Mesh Partition actor as
 an `AActor` reference. Mesh Terrain work happens through assets, modifiers and
@@ -62,8 +70,8 @@ These are enabled by `Avenor.uproject`.
    - `Water`
 9. Add one Water Zone. Add the Mesh Partition integration component required
    by Mesh Terrain to each Water Body used by the Water graph.
-10. Assign the four PCG graphs on the world definition and the
-    Spine-specific infrastructure graph on `SpineGenerator`.
+10. Create `PCG_Spine_Master` using `SPINE_PCG_SETUP.md`, then assign it to
+    `Infrastructure Graph` on `SpineGenerator`.
 
 ## Graph contract
 
@@ -105,12 +113,18 @@ independent random terrain.
 
 ### Spine infrastructure graph
 
-- Sample `GuideSpline`.
-- Write the development-corridor modifier and `SpineExclusion` channel.
-- Generate guideway meshes and supports along the spline.
+- Read `GreyboxSegments`, `BlockRecords` and `StationRecords` from the
+  `SpineGenerator` with `Get Actor Property`.
+- Read the tagged derived highway and twin-guideway splines for production
+  mesh generation. Never make opposite-direction trams share one guideway.
+- Read the Spine-owned development-corridor modifier and `SpineExclusion`
+  channel; PCG does not duplicate terrain grading.
+- Generate highway, guideway meshes and supports along the derived splines.
 - Exclude supports from water, roads and station footprints.
-- Place stations, signage, lighting and street furniture in separately
-  controllable density/LOD groups.
+- Place reusable station actors/instances at `StationRecords` transforms.
+- Generate blocks and local roads from the exact 1,024 m district records.
+- Keep signage, lighting and street furniture in separately controllable
+  subgraphs and density/LOD groups.
 
 ### Parcels and roads
 

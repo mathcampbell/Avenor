@@ -2,12 +2,59 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "MeshPartitionModifierComponent.h"
 #include "SpineGenerator.generated.h"
 
 class UPCGComponent;
 class UPCGGraphInterface;
 class USceneComponent;
 class USplineComponent;
+class ASpineGenerator;
+
+/** One sample in the solved road-level vertical alignment. */
+USTRUCT(BlueprintType)
+struct FSpineAlignmentSample
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float Chainage = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float NaturalTerrainZ = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float RoadDatumZ = 0.0f;
+
+    /** Positive is fill/embankment; negative is cut into natural terrain. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float EarthworkDelta = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    bool bStructureCandidate = false;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    bool bTerrainHit = false;
+};
+
+/**
+ * Narrow cut-and-fill modifier owned by the Spine actor. It changes vertices
+ * in the existing Mesh Terrain; it never creates a second terrain surface.
+ */
+UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
+class AVENOR_API UAvenorSpineTerrainModifier
+    : public UE::MeshPartition::UModifierComponent
+{
+    GENERATED_BODY()
+
+public:
+    virtual TArray<FBox> ComputeBounds() const override;
+    virtual TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
+        CreateBackgroundOp(
+            UE::MeshPartition::EBuildType BuildType
+        ) const override;
+    virtual FGuid GetCodeVersionKey() const override;
+};
 
 /**
  * A station datum consumed by PCG through Get Actor Property.
@@ -174,6 +221,23 @@ public:
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
     void RegenerateInfrastructure();
 
+    /**
+     * Sample the existing terrain, solve a smooth maximum-grade road datum,
+     * and submit the narrow cut-and-fill corridor to Mesh Terrain.
+     */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain",
+        meta = (DisplayName = "Rebuild Terrain Alignment"))
+    void RebuildTerrainAlignment();
+
+    /** Rebuild terrain alignment first, then regenerate all infrastructure. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Spine",
+        meta = (DisplayName = "Regenerate Complete Spine"))
+    void RegenerateCompleteSpine();
+
+    /** Unbind the corridor modifier and discard its solved alignment. */
+    UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain")
+    void ClearTerrainAlignment();
+
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
     void ClearInfrastructure();
 
@@ -191,6 +255,8 @@ public:
 
 private:
     static constexpr int32 BlocksPerDistrict = 9;
+
+    friend class UAvenorSpineTerrainModifier;
 
     void GetBaseSplineFrameAtChainage(
         float Chainage,
@@ -224,9 +290,18 @@ private:
     float GetInternalStreetCentreOffset(int32 StreetIndex) const;
     float GetDevelopmentOuterLateral() const;
     FString FormatSignedId(const TCHAR* Prefix, int32 Index) const;
+    bool SolveTerrainAlignment();
+    bool BindTerrainModifier();
+    float EvaluateRoadDatumZ(float Chainage) const;
+    FBox GetTerrainCorridorBounds() const;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
+
+    /** Modifies the existing Mesh Terrain only inside the engineered corridor. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Terrain",
+        meta = (AllowPrivateAccess = "true"))
+    TObjectPtr<UAvenorSpineTerrainModifier> TerrainCorridorModifier;
 
     /** Edit this spline directly. Station 0 is an offset along it. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Spine",
@@ -261,6 +336,60 @@ private:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|PCG")
     bool bPartitionedGeneration = false;
+
+    /** The same Mesh Partition actor used by the main terrain generator. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain")
+    TObjectPtr<AActor> MeshPartitionActor;
+
+    /** Natural-terrain samples are averaged across this longitudinal window. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (Units = "cm", ClampMin = "2500.0"))
+    float AlignmentSmoothingDistance = 25000.0f;
+
+    /** Maximum road rise/run. 0.04 is a four percent grade. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (ClampMin = "0.001", ClampMax = "0.10"))
+    float MaximumRoadGrade = 0.04f;
+
+    /** Added to the sampled natural surface before solving the road datum. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (Units = "cm"))
+    float RoadDatumOffset = 0.0f;
+
+    /** Terrain exactly matches the road datum inside this distance. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (Units = "cm", ClampMin = "100.0"))
+    float CorridorFlatHalfWidth = 2700.0f;
+
+    /** Terrain blends back to its untouched height at this distance. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (Units = "cm", ClampMin = "100.0"))
+    float CorridorTransitionHalfWidth = 12000.0f;
+
+    /** Vertical reach of the terrain sampling ray above and below the guide. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
+        meta = (Units = "cm", ClampMin = "10000.0"))
+    float TerrainTraceHalfHeight = 1000000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced")
+    TEnumAsByte<ECollisionChannel> TerrainTraceChannel = ECC_Visibility;
+
+    /** Runs after broad terrain but before native water modifiers (priority 10). */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced")
+    float TerrainModifierPriority = 5.0f;
+
+    /** Samples beyond this cut/fill depth are flagged for bridge/tunnel review. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
+        meta = (Units = "cm", ClampMin = "100.0"))
+    float EarthworkWarningThreshold = 1000.0f;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Terrain|Status")
+    float LastMaximumCutDepth = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Terrain|Status")
+    float LastMaximumFillHeight = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Terrain|Status")
+    int32 LastStructureCandidateCount = 0;
 
     /** Distance along GuideSpline that represents Station 0. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Alignment",
@@ -388,4 +517,10 @@ private:
         Category = "Avenor|PCG Data",
         meta = (AllowPrivateAccess = "true"))
     TArray<FSpineInfrastructurePlacement> MonorailSupportPlacements;
+
+    /** Cached road-level profile shared by terrain, roads and monorail. */
+    UPROPERTY(BlueprintReadOnly,
+        Category = "Avenor|Terrain Data",
+        meta = (AllowPrivateAccess = "true"))
+    TArray<FSpineAlignmentSample> AlignmentSamples;
 };
