@@ -65,6 +65,11 @@ Create `/Game/Avenor/PCG/Spine/PCG_Spine_Master`.
    component.
 3. Add **Attribute Set To Point** and map the struct's `Transform` attribute to
    the point property `$Transform`.
+
+The generated transforms follow the same solved development surface used by
+Mesh Terrain. Cross-streets rise or fall away from the Spine, and block surface
+transforms use the local terrain normal instead of remaining level at the
+central road datum.
 4. Add a **Static Mesh Spawner**, add one Mesh Entry, and assign
    `/Engine/BasicShapes/Cube`. The Debug Point Mesh does not count as a mesh
    entry.
@@ -162,6 +167,9 @@ should read the tagged derived splines:
   footprints;
 - use `BlockRecords` for block surfaces and the authoritative registry snapshot
   for parcel contents;
+- rebuild terrain alignment before regenerating PCG infrastructure; the terrain
+  pass clears existing generated road/block collision so it cannot be sampled
+  as natural ground;
 - use `StationRecords` to place authored station variants;
 - run separate subgraphs for pavements, crossings, lights, signs, trees and
   other dressing.

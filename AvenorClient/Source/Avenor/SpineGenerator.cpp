@@ -3,6 +3,7 @@
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
+#include "Math/RotationMatrix.h"
 #include "MeshPartition.h"
 #include "MeshPartitionMeshView.h"
 #include "PCGComponent.h"
@@ -239,7 +240,10 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
     }
 
     Op->WorldBounds = Spine->GetTerrainCorridorBounds();
-    Op->FlatHalfWidth = FMath::Max(0.0f, Spine->CorridorFlatHalfWidth);
+    Op->FlatHalfWidth = FMath::Max(
+        0.0f,
+        Spine->GetDevelopmentProfileStartLateral()
+    );
     Op->DevelopmentHalfWidth = FMath::Max(
         Op->FlatHalfWidth + 1.0,
         static_cast<double>(Spine->GetDevelopmentOuterLateral())
@@ -281,7 +285,7 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
 
 FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
-    return FGuid(TEXT("f6381f56-560a-44dd-bcc1-42bbf6256fbc"));
+    return FGuid(TEXT("3d1e239d-7b66-4b7c-a7ea-822ed9f61287"));
 }
 #endif
 
@@ -469,9 +473,11 @@ bool ASpineGenerator::SolveTerrainAlignment()
     AlignmentSamples.Reserve(SampleCount);
 
     const float DevelopmentHalfWidth = GetDevelopmentOuterLateral();
+    const float DevelopmentProfileStart =
+        GetDevelopmentProfileStartLateral();
     const float DevelopmentProfileWidth = FMath::Max(
         1.0f,
-        DevelopmentHalfWidth - CorridorFlatHalfWidth
+        DevelopmentHalfWidth - DevelopmentProfileStart
     );
     const int32 DevelopmentProfileIntervalCount = FMath::Max(
         1,
@@ -578,7 +584,7 @@ bool ASpineGenerator::SolveTerrainAlignment()
              ProfileIndex < DevelopmentProfileSampleCount;
              ++ProfileIndex)
         {
-            const float Lateral = CorridorFlatHalfWidth
+            const float Lateral = DevelopmentProfileStart
                 + DevelopmentProfileStep * ProfileIndex;
             bool bProfileFallback = false;
             if (!TraceTerrain(
@@ -853,6 +859,8 @@ bool ASpineGenerator::SolveTerrainAlignment()
     LastMaximumCutDepth = 0.0f;
     LastMaximumFillHeight = 0.0f;
     LastStructureCandidateCount = 0;
+    float MaximumLateralRise = 0.0f;
+    float MaximumLateralFall = 0.0f;
     for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
     {
         AlignmentSamples[Index].EarthworkDelta =
@@ -871,17 +879,35 @@ bool ASpineGenerator::SolveTerrainAlignment()
             LastMaximumCutDepth,
             -AlignmentSamples[Index].EarthworkDelta
         );
+        for (const TArray<float>* Profile : {
+                 &AlignmentSamples[Index].LeftDevelopmentProfileZ,
+                 &AlignmentSamples[Index].RightDevelopmentProfileZ})
+        {
+            for (const float ProfileZ : *Profile)
+            {
+                MaximumLateralRise = FMath::Max(
+                    MaximumLateralRise,
+                    ProfileZ - AlignmentSamples[Index].RoadDatumZ
+                );
+                MaximumLateralFall = FMath::Max(
+                    MaximumLateralFall,
+                    AlignmentSamples[Index].RoadDatumZ - ProfileZ
+                );
+            }
+        }
     }
 
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor Spine: solved %d terrain samples at %.0f cm spacing (%d direct/proxy hits, %d proxy fallbacks), %.1f%% maximum grade; maximum cut %.1f m, fill %.1f m, %d structure candidates."),
+        TEXT("Avenor Spine: solved %d terrain samples at %.0f cm spacing (%d direct/proxy hits, %d proxy fallbacks), %.1f%% maximum road grade; lateral profile rises %.1f m and falls %.1f m; maximum cut %.1f m, fill %.1f m, %d structure candidates."),
         AlignmentSamples.Num(),
         Step,
         ValidHits - FallbackHits,
         FallbackHits,
         MaximumRoadGrade * 100.0f,
+        MaximumLateralRise / 100.0f,
+        MaximumLateralFall / 100.0f,
         LastMaximumCutDepth / 100.0f,
         LastMaximumFillHeight / 100.0f,
         LastStructureCandidateCount
@@ -934,6 +960,13 @@ void ASpineGenerator::RebuildTerrainAlignment()
 {
 #if WITH_EDITOR
     Modify();
+    // Generated block and road collision sits above Mesh Terrain and must not
+    // be mistaken for natural ground by the alignment traces. The complete
+    // regeneration path recreates it immediately after grading.
+    if (InfrastructurePCG)
+    {
+        InfrastructurePCG->CleanupLocal(true);
+    }
     if (!SolveTerrainAlignment())
     {
         return;
@@ -1217,9 +1250,114 @@ FVector ASpineGenerator::GetSpineLocationAtChainage(
 ) const
 {
     const FTransform Frame = GetSpineTransformAtChainage(Chainage);
-    return Frame.GetLocation()
-        + Frame.GetUnitAxis(EAxis::Y) * LateralOffset
-        + FVector::UpVector * VerticalOffset;
+    FVector Location = Frame.GetLocation()
+        + Frame.GetUnitAxis(EAxis::Y) * LateralOffset;
+    Location.Z = EvaluateDevelopmentSurfaceZ(Chainage, LateralOffset)
+        + VerticalOffset;
+    return Location;
+}
+
+float ASpineGenerator::EvaluateDevelopmentSurfaceZ(
+    float Chainage,
+    float Lateral
+) const
+{
+    const float RoadZ = EvaluateRoadDatumZ(Chainage);
+    const float ProfileStart = GetDevelopmentProfileStartLateral();
+    const float DevelopmentOuter = GetDevelopmentOuterLateral();
+    const float Distance = FMath::Abs(Lateral);
+    if (AlignmentSamples.Num() == 0 || Distance <= ProfileStart)
+    {
+        return RoadZ;
+    }
+
+    auto EvaluateSampleProfile = [&](const FSpineAlignmentSample& Sample)
+    {
+        const TArray<float>& Profile = Lateral >= 0.0f
+            ? Sample.RightDevelopmentProfileZ
+            : Sample.LeftDevelopmentProfileZ;
+        if (Profile.Num() < 2)
+        {
+            return Sample.RoadDatumZ;
+        }
+        const float CrossAlpha = FMath::Clamp(
+            (Distance - ProfileStart)
+                / FMath::Max(1.0f, DevelopmentOuter - ProfileStart),
+            0.0f,
+            1.0f
+        );
+        const float Position = CrossAlpha * (Profile.Num() - 1);
+        const int32 ProfileIndex = FMath::Min(
+            FMath::FloorToInt(Position),
+            Profile.Num() - 2
+        );
+        return FMath::Lerp(
+            Profile[ProfileIndex],
+            Profile[ProfileIndex + 1],
+            Position - ProfileIndex
+        );
+    };
+
+    if (Chainage <= AlignmentSamples[0].Chainage)
+    {
+        return EvaluateSampleProfile(AlignmentSamples[0]);
+    }
+    if (Chainage >= AlignmentSamples.Last().Chainage)
+    {
+        return EvaluateSampleProfile(AlignmentSamples.Last());
+    }
+    for (int32 Index = 1; Index < AlignmentSamples.Num(); ++Index)
+    {
+        if (Chainage <= AlignmentSamples[Index].Chainage)
+        {
+            const FSpineAlignmentSample& A = AlignmentSamples[Index - 1];
+            const FSpineAlignmentSample& B = AlignmentSamples[Index];
+            const float Alpha = FMath::GetRangePct(
+                A.Chainage,
+                B.Chainage,
+                Chainage
+            );
+            return FMath::Lerp(
+                EvaluateSampleProfile(A),
+                EvaluateSampleProfile(B),
+                Alpha
+            );
+        }
+    }
+    return RoadZ;
+}
+
+FTransform ASpineGenerator::GetDevelopmentSurfaceTransformAtChainage(
+    float Chainage,
+    float Lateral
+) const
+{
+    const float Probe = FMath::Max(100.0f, AlignmentSampleLength * 0.25f);
+    const FVector Centre = GetSpineLocationAtChainage(Chainage, Lateral);
+    const FVector Along = (
+        GetSpineLocationAtChainage(Chainage + Probe, Lateral)
+        - GetSpineLocationAtChainage(Chainage - Probe, Lateral)
+    ).GetSafeNormal();
+    const FVector Across = (
+        GetSpineLocationAtChainage(Chainage, Lateral + Probe)
+        - GetSpineLocationAtChainage(Chainage, Lateral - Probe)
+    ).GetSafeNormal();
+    FVector Up = FVector::CrossProduct(Along, Across).GetSafeNormal();
+    if (Up.Z < 0.0f)
+    {
+        Up *= -1.0f;
+    }
+    const FVector SafeAlong = Along.IsNearlyZero()
+        ? GetSpineTransformAtChainage(Chainage).GetUnitAxis(EAxis::X)
+        : Along;
+    if (Up.IsNearlyZero())
+    {
+        Up = FVector::UpVector;
+    }
+    return FTransform(
+        FRotationMatrix::MakeFromXZ(SafeAlong, Up).ToQuat(),
+        Centre
+    );
 }
 
 void ASpineGenerator::GetSpineSpaceForWorldLocation(
@@ -1414,6 +1552,18 @@ float ASpineGenerator::GetDevelopmentOuterLateral() const
         + DevelopmentRowsPerSide * (BlockSize + LocalStreetWidth);
 }
 
+float ASpineGenerator::GetDevelopmentProfileStartLateral() const
+{
+    // Keep the full Spine reservation and the road-facing half of the first
+    // local street on the common datum. The parcel frontage then meets that
+    // street exactly before the ground is allowed to bank farther outward.
+    return FMath::Max(
+        CorridorFlatHalfWidth,
+        SpineReservationWidth * 0.5f
+            + GetResolvedLocalStreetWidth() * 0.5f
+    );
+}
+
 FString ASpineGenerator::FormatSignedId(const TCHAR* Prefix, int32 Index) const
 {
     return FString::Printf(
@@ -1485,10 +1635,11 @@ void ASpineGenerator::RebuildStationAndBlockRecords()
                     Block.ZoneRole = BayIndex == PublicRealmBayIndex
                         ? FName(TEXT("PublicRealm"))
                         : FName(TEXT("Development"));
-                    Block.Transform = FTransform(
-                        GetSpineTransformAtChainage(Chainage).GetRotation(),
-                        GetSpineLocationAtChainage(Chainage, Block.Lateral)
-                    );
+                    Block.Transform =
+                        GetDevelopmentSurfaceTransformAtChainage(
+                            Chainage,
+                            Block.Lateral
+                        );
                     Block.BlockId = FName(*FString::Printf(
                         TEXT("%s-B%02d-%c-R%02d"),
                         *FormatSignedId(TEXT("D"), DistrictIndex),

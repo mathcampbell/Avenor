@@ -306,10 +306,19 @@ private:
     float GetBlockCentreOffset(int32 BayIndex) const;
     float GetInternalStreetCentreOffset(int32 StreetIndex) const;
     float GetDevelopmentOuterLateral() const;
+    float GetDevelopmentProfileStartLateral() const;
     FString FormatSignedId(const TCHAR* Prefix, int32 Index) const;
     bool SolveTerrainAlignment();
     bool BindTerrainModifier();
     float EvaluateRoadDatumZ(float Chainage) const;
+    float EvaluateDevelopmentSurfaceZ(
+        float Chainage,
+        float Lateral
+    ) const;
+    FTransform GetDevelopmentSurfaceTransformAtChainage(
+        float Chainage,
+        float Lateral
+    ) const;
     FBox GetTerrainCorridorBounds() const;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
