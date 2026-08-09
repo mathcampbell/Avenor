@@ -25,6 +25,14 @@ struct FSpineAlignmentSample
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     float NaturalTerrainZ = 0.0f;
 
+    /** Natural height sampled at the outside edge of development on the left. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float NaturalLeftEdgeZ = 0.0f;
+
+    /** Natural height sampled at the outside edge of development on the right. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    float NaturalRightEdgeZ = 0.0f;
+
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     float RoadDatumZ = 0.0f;
 
@@ -40,7 +48,7 @@ struct FSpineAlignmentSample
 };
 
 /**
- * Narrow cut-and-fill modifier owned by the Spine actor. It changes vertices
+ * Development grading modifier owned by the Spine actor. It changes vertices
  * in the existing Mesh Terrain; it never creates a second terrain surface.
  */
 #if WITH_EDITOR
@@ -227,7 +235,7 @@ public:
 
     /**
      * Sample the existing terrain, solve a smooth maximum-grade road datum,
-     * and submit the narrow cut-and-fill corridor to Mesh Terrain.
+     * and grade the complete adjoining development area into Mesh Terrain.
      */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain",
         meta = (DisplayName = "Rebuild Terrain Alignment"))
@@ -238,7 +246,7 @@ public:
         meta = (DisplayName = "Regenerate Complete Spine"))
     void RegenerateCompleteSpine();
 
-    /** Unbind the corridor modifier and discard its solved alignment. */
+    /** Unbind the grading modifier and discard its solved alignment. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain")
     void ClearTerrainAlignment();
 
@@ -305,7 +313,7 @@ private:
     TObjectPtr<USceneComponent> SceneRoot;
 
 #if WITH_EDITORONLY_DATA
-    /** Modifies the existing Mesh Terrain only inside the engineered corridor. */
+    /** Grades the road reservation, parcels and outer transition together. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Terrain",
         meta = (AllowPrivateAccess = "true"))
     TObjectPtr<UAvenorSpineTerrainModifier> TerrainCorridorModifier;
@@ -354,6 +362,14 @@ private:
         meta = (Units = "cm", ClampMin = "2500.0"))
     float AlignmentSmoothingDistance = 25000.0f;
 
+    /**
+     * Moves the smoothed datum toward the lower terrain in each sample window.
+     * Zero is a balanced average; one strongly favours cut over embankment.
+     */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float AlignmentCutBias = 0.65f;
+
     /** Maximum road rise/run. 0.04 is a four percent grade. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
         meta = (ClampMin = "0.001", ClampMax = "0.10"))
@@ -363,15 +379,24 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (Units = "cm"))
     float RoadDatumOffset = 0.0f;
 
-    /** Terrain exactly matches the road datum inside this distance. */
+    /** Terrain exactly matches the road datum inside the road reservation. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
         meta = (Units = "cm", ClampMin = "100.0"))
     float CorridorFlatHalfWidth = 2700.0f;
 
-    /** Terrain blends back to its untouched height at this distance. */
+    /**
+     * Distance beyond the outside parcel/street edge used to blend the planned
+     * development surface back into untouched terrain.
+     */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
-        meta = (Units = "cm", ClampMin = "100.0"))
+        meta = (DisplayName = "Development Outer Blend Distance",
+            Units = "cm", ClampMin = "100.0"))
     float CorridorTransitionHalfWidth = 12000.0f;
+
+    /** Maximum gentle sideways grade beneath blocks and their side streets. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (ClampMin = "0.0", ClampMax = "0.10"))
+    float MaximumDevelopmentCrossGrade = 0.03f;
 
     /** Vertical reach of the terrain sampling ray above and below the guide. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",

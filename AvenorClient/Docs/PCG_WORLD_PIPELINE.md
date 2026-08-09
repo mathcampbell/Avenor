@@ -13,9 +13,10 @@
 - `ASpineGenerator::GuideSpline` is the authoritative Spine route. The actor
   resolves that route into a terrain-sampled, grade-limited vertical alignment
   and exact station, block and infrastructure data for PCG.
-- `ASpineGenerator::SpineTerrainCorridor` is a narrow modifier on that same
-  Mesh Partition. It owns cut-and-fill for the engineered reservation without
-  rebuilding the broad landform/hydrology plan or creating overlapping ground.
+- `ASpineGenerator::SpineTerrainCorridor` grades the road reservation and the
+  complete adjoining development footprint on that same Mesh Partition. It
+  gives parcel ground a gentle planned cross-slope, then blends back outside
+  the developed edge without creating overlapping ground.
 - PCG proposes the initial block geometry. A future versioned world-registry
   snapshot becomes authoritative once that layout is published.
 - `AParcelGenerator` is legacy terrain-analysis/visualisation code and must

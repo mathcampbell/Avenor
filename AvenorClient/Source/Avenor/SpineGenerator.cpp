@@ -17,6 +17,8 @@ struct FCorridorSample
 {
     FVector2D Centre = FVector2D::ZeroVector;
     double RoadDatumZ = 0.0;
+    double LeftDevelopmentEdgeZ = 0.0;
+    double RightDevelopmentEdgeZ = 0.0;
 };
 
 class FSpineTerrainCorridorOp final
@@ -58,7 +60,8 @@ public:
     ) const override
     {
         (void)InstanceInfo;
-        if (Samples.Num() < 2 || TransitionHalfWidth <= 0.0)
+        if (Samples.Num() < 2 || DevelopmentHalfWidth <= 0.0
+            || TransitionHalfWidth <= DevelopmentHalfWidth)
         {
             return;
         }
@@ -72,6 +75,9 @@ public:
 
             double BestDistanceSquared = TNumericLimits<double>::Max();
             double TargetRoadZ = WorldPosition.Z;
+            double TargetLeftEdgeZ = WorldPosition.Z;
+            double TargetRightEdgeZ = WorldPosition.Z;
+            double SignedLateral = 0.0;
             for (int32 Index = 0; Index + 1 < Samples.Num(); ++Index)
             {
                 const FVector2D A = Samples[Index].Centre;
@@ -92,9 +98,26 @@ public:
                 if (DistanceSquared < BestDistanceSquared)
                 {
                     BestDistanceSquared = DistanceSquared;
+                    const FVector2D Projected = A + Segment * Alpha;
+                    const FVector2D Offset = Position - Projected;
+                    const double SegmentLength = FMath::Sqrt(LengthSquared);
+                    SignedLateral = SegmentLength > UE_DOUBLE_SMALL_NUMBER
+                        ? FVector2D::CrossProduct(Segment, Offset)
+                            / SegmentLength
+                        : 0.0;
                     TargetRoadZ = FMath::Lerp(
                         Samples[Index].RoadDatumZ,
                         Samples[Index + 1].RoadDatumZ,
+                        Alpha
+                    );
+                    TargetLeftEdgeZ = FMath::Lerp(
+                        Samples[Index].LeftDevelopmentEdgeZ,
+                        Samples[Index + 1].LeftDevelopmentEdgeZ,
+                        Alpha
+                    );
+                    TargetRightEdgeZ = FMath::Lerp(
+                        Samples[Index].RightDevelopmentEdgeZ,
+                        Samples[Index + 1].RightDevelopmentEdgeZ,
                         Alpha
                     );
                 }
@@ -111,16 +134,31 @@ public:
                 continue;
             }
 
-            const double Blend = Distance <= FlatHalfWidth
+            const bool bRightSide = SignedLateral >= 0.0;
+            const double EdgeZ = bRightSide
+                ? TargetRightEdgeZ
+                : TargetLeftEdgeZ;
+            const double CrossSectionAlpha = FMath::Clamp(
+                (Distance - FlatHalfWidth) /
+                    FMath::Max(1.0, DevelopmentHalfWidth - FlatHalfWidth),
+                0.0,
+                1.0
+            );
+            const double TargetDevelopmentZ = FMath::Lerp(
+                TargetRoadZ,
+                EdgeZ,
+                FMath::SmoothStep(0.0, 1.0, CrossSectionAlpha)
+            );
+            const double Blend = Distance <= DevelopmentHalfWidth
                 ? 1.0
                 : 1.0 - FMath::SmoothStep(
-                    FlatHalfWidth,
+                    DevelopmentHalfWidth,
                     TransitionHalfWidth,
                     Distance
                 );
             WorldPosition.Z = FMath::Lerp(
                 WorldPosition.Z,
-                TargetRoadZ,
+                TargetDevelopmentZ,
                 Blend
             );
             MeshView.SetVertexPos(
@@ -139,7 +177,8 @@ public:
 
     FBox WorldBounds = FBox(ForceInit);
     double FlatHalfWidth = 2700.0;
-    double TransitionHalfWidth = 12000.0;
+    double DevelopmentHalfWidth = 12000.0;
+    double TransitionHalfWidth = 24000.0;
     TArray<FCorridorSample> Samples;
 };
 #endif
@@ -177,8 +216,12 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
 
     Op->WorldBounds = Spine->GetTerrainCorridorBounds();
     Op->FlatHalfWidth = FMath::Max(0.0f, Spine->CorridorFlatHalfWidth);
-    Op->TransitionHalfWidth = FMath::Max(
+    Op->DevelopmentHalfWidth = FMath::Max(
         Op->FlatHalfWidth + 1.0,
+        static_cast<double>(Spine->GetDevelopmentOuterLateral())
+    );
+    Op->TransitionHalfWidth = Op->DevelopmentHalfWidth + FMath::Max(
+        100.0,
         static_cast<double>(Spine->CorridorTransitionHalfWidth)
     );
     Op->Samples.Reserve(Spine->AlignmentSamples.Num());
@@ -194,13 +237,27 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
         FCorridorSample& OpSample = Op->Samples.AddDefaulted_GetRef();
         OpSample.Centre = FVector2D(Location.X, Location.Y);
         OpSample.RoadDatumZ = Sample.RoadDatumZ;
+        const double MaximumEdgeDelta = FMath::Max(
+            0.0f,
+            Spine->MaximumDevelopmentCrossGrade
+        ) * Op->DevelopmentHalfWidth;
+        OpSample.LeftDevelopmentEdgeZ = Sample.RoadDatumZ + FMath::Clamp(
+            static_cast<double>(Sample.NaturalLeftEdgeZ - Sample.RoadDatumZ),
+            -MaximumEdgeDelta,
+            MaximumEdgeDelta
+        );
+        OpSample.RightDevelopmentEdgeZ = Sample.RoadDatumZ + FMath::Clamp(
+            static_cast<double>(Sample.NaturalRightEdgeZ - Sample.RoadDatumZ),
+            -MaximumEdgeDelta,
+            MaximumEdgeDelta
+        );
     }
     return Op;
 }
 
 FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
-    return FGuid(TEXT("a731c96c-aafb-4f72-8704-4015b6a94e49"));
+    return FGuid(TEXT("7cd531e1-b2f4-4f31-aac2-27cead9e9468"));
 }
 #endif
 
@@ -408,54 +465,86 @@ bool ASpineGenerator::SolveTerrainAlignment()
             BaseForward
         );
 
-        const FVector TraceStart = BaseLocation
-            + FVector::UpVector * TerrainTraceHalfHeight;
-        const FVector TraceEnd = BaseLocation
-            - FVector::UpVector * TerrainTraceHalfHeight;
-        TArray<FHitResult> Hits;
-        World->LineTraceMultiByChannel(
-            Hits,
-            TraceStart,
-            TraceEnd,
-            TerrainTraceChannel,
-            QueryParams
-        );
-
-        const FHitResult* ChosenHit = nullptr;
-        for (const FHitResult& Hit : Hits)
+        auto TraceTerrain = [&](const FVector& TraceLocation,
+                                float& OutTerrainZ,
+                                bool& bOutUsedFallback)
         {
-            AActor* HitActor = Hit.GetActor();
-            for (AActor* Candidate = HitActor;
-                 Candidate;
-                 Candidate = Candidate->GetAttachParentActor())
+            const FVector TraceStart = TraceLocation
+                + FVector::UpVector * TerrainTraceHalfHeight;
+            const FVector TraceEnd = TraceLocation
+                - FVector::UpVector * TerrainTraceHalfHeight;
+            TArray<FHitResult> Hits;
+            World->LineTraceMultiByChannel(
+                Hits,
+                TraceStart,
+                TraceEnd,
+                TerrainTraceChannel,
+                QueryParams
+            );
+
+            const FHitResult* ChosenHit = nullptr;
+            for (const FHitResult& Hit : Hits)
             {
-                if (Candidate == TargetMeshPartition)
+                for (AActor* Candidate = Hit.GetActor();
+                     Candidate;
+                     Candidate = Candidate->GetAttachParentActor())
                 {
-                    ChosenHit = &Hit;
+                    if (Candidate == TargetMeshPartition)
+                    {
+                        ChosenHit = &Hit;
+                        break;
+                    }
+                }
+                if (ChosenHit)
+                {
                     break;
                 }
             }
-            if (ChosenHit)
+            bOutUsedFallback = !ChosenHit && Hits.Num() > 0;
+            if (bOutUsedFallback)
             {
-                break;
+                // Generated partition collision may be owned by proxy actors.
+                ChosenHit = &Hits[0];
             }
-        }
-        if (!ChosenHit && Hits.Num() > 0)
-        {
-            // Partition implementations may proxy collision through generated
-            // actors. With this Spine actor ignored, the first blocking hit is
-            // a useful fallback and is reported explicitly below.
-            ChosenHit = &Hits[0];
-            ++FallbackHits;
-        }
+            OutTerrainZ = ChosenHit
+                ? static_cast<float>(ChosenHit->ImpactPoint.Z)
+                : TraceLocation.Z;
+            return ChosenHit != nullptr;
+        };
 
         FSpineAlignmentSample& Sample =
             AlignmentSamples.AddDefaulted_GetRef();
         Sample.Chainage = Chainage;
-        Sample.bTerrainHit = ChosenHit != nullptr;
-        Sample.NaturalTerrainZ = ChosenHit
-            ? static_cast<float>(ChosenHit->ImpactPoint.Z)
-            : BaseLocation.Z;
+        bool bCentreFallback = false;
+        Sample.bTerrainHit = TraceTerrain(
+            BaseLocation,
+            Sample.NaturalTerrainZ,
+            bCentreFallback
+        );
+        FallbackHits += bCentreFallback ? 1 : 0;
+
+        const FVector BaseRight = FVector::CrossProduct(
+            FVector::UpVector,
+            BaseForward
+        ).GetSafeNormal();
+        const float DevelopmentHalfWidth = GetDevelopmentOuterLateral();
+        bool bEdgeFallback = false;
+        if (!TraceTerrain(
+                BaseLocation - BaseRight * DevelopmentHalfWidth,
+                Sample.NaturalLeftEdgeZ,
+                bEdgeFallback
+            ))
+        {
+            Sample.NaturalLeftEdgeZ = Sample.NaturalTerrainZ;
+        }
+        if (!TraceTerrain(
+                BaseLocation + BaseRight * DevelopmentHalfWidth,
+                Sample.NaturalRightEdgeZ,
+                bEdgeFallback
+            ))
+        {
+            Sample.NaturalRightEdgeZ = Sample.NaturalTerrainZ;
+        }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
         ValidHits += Sample.bTerrainHit ? 1 : 0;
     }
@@ -513,6 +602,8 @@ bool ASpineGenerator::SolveTerrainAlignment()
             FilledZ = AlignmentSamples[Right].NaturalTerrainZ;
         }
         AlignmentSamples[Index].NaturalTerrainZ = FilledZ;
+        AlignmentSamples[Index].NaturalLeftEdgeZ = FilledZ;
+        AlignmentSamples[Index].NaturalRightEdgeZ = FilledZ;
         AlignmentSamples[Index].RoadDatumZ = FilledZ + RoadDatumOffset;
     }
 
@@ -526,11 +617,13 @@ bool ASpineGenerator::SolveTerrainAlignment()
     {
         double Sum = 0.0;
         double TotalWeight = 0.0;
+        TArray<float> WindowHeights;
         const int32 First = FMath::Max(0, Index - SmoothingRadius);
         const int32 Last = FMath::Min(
             AlignmentSamples.Num() - 1,
             Index + SmoothingRadius
         );
+        WindowHeights.Reserve(Last - First + 1);
         for (int32 Neighbor = First; Neighbor <= Last; ++Neighbor)
         {
             const double Weight = static_cast<double>(
@@ -538,9 +631,19 @@ bool ASpineGenerator::SolveTerrainAlignment()
             );
             Sum += AlignmentSamples[Neighbor].RoadDatumZ * Weight;
             TotalWeight += Weight;
+            WindowHeights.Add(AlignmentSamples[Neighbor].RoadDatumZ);
         }
-        SmoothedHeights[Index] = static_cast<float>(
+        WindowHeights.Sort();
+        const int32 LowerQuartileIndex = FMath::FloorToInt(
+            static_cast<float>(WindowHeights.Num() - 1) * 0.25f
+        );
+        const float BalancedHeight = static_cast<float>(
             Sum / FMath::Max(1.0, TotalWeight)
+        );
+        SmoothedHeights[Index] = FMath::Lerp(
+            BalancedHeight,
+            WindowHeights[LowerQuartileIndex],
+            FMath::Clamp(AlignmentCutBias, 0.0f, 1.0f)
         );
     }
 
@@ -674,8 +777,9 @@ void ASpineGenerator::RebuildTerrainAlignment()
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor Spine: submitted the %.0f cm flat corridor and %.0f cm terrain transition."),
+        TEXT("Avenor Spine: graded the %.0f cm road reservation across %.0f cm of development per side, with a %.0f cm outer blend."),
         CorridorFlatHalfWidth,
+        GetDevelopmentOuterLateral(),
         CorridorTransitionHalfWidth
     );
 #endif
@@ -923,7 +1027,7 @@ FBox ASpineGenerator::GetTerrainCorridorBounds() const
     }
     const float HorizontalExtent = FMath::Max(
         CorridorFlatHalfWidth + 1.0f,
-        CorridorTransitionHalfWidth
+        GetDevelopmentOuterLateral() + CorridorTransitionHalfWidth
     );
     const FVector Expansion(
         HorizontalExtent,
