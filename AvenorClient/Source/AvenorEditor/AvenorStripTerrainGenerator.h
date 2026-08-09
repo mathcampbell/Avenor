@@ -8,6 +8,7 @@
 
 struct FAvenorStripData;
 class UProceduralMeshComponent;
+class UAvenorTerrainData;
 
 UENUM(BlueprintType)
 enum class EAvenorStripLongAxis : uint8
@@ -159,8 +160,14 @@ class AVENOREDITOR_API AAvenorStripTerrainGenerator : public AActor
 public:
     AAvenorStripTerrainGenerator();
 
-    UFUNCTION(CallInEditor, Category = "Avenor", meta = (DisplayName = "Generate Complete World"))
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Generate and Bake Geography"))
     void GenerateCompleteWorld();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Rebuild World from Baked Data"))
+    void RebuildWorldFromBakedData();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Regenerate Water from Baked Data"))
+    void RegenerateWaterFromBakedData();
 
     UFUNCTION(CallInEditor, Category = "Avenor", meta = (DisplayName = "Generate Fast Preview"))
     void GenerateFastPreview();
@@ -194,6 +201,12 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|World")
     int32 Seed = 1337;
 
+    UPROPERTY(EditAnywhere, Category = "Avenor|Baked Data", meta = (ToolTip = "Authoritative saved geography. Generate and Bake creates this automatically when unassigned."))
+    TSoftObjectPtr<UAvenorTerrainData> BakedTerrainData;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Baked Data", meta = (ClampMin = "16", ClampMax = "512", ToolTip = "Raster cells per independently compressed chunk. Async per-chunk loading can use this boundary later."))
+    int32 BakedChunkCellSize = 128;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (ShowOnlyInnerProperties))
     FAvenorLandformSettings Landforms;
 
@@ -226,6 +239,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Status")
     FString LastBuildStamp;
+
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|Status")
+    FString BakedDataStatus;
 
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
     bool bTerrainPlanReadyForWater = false;
@@ -311,10 +327,16 @@ protected:
 private:
     void ResolveSettings();
     void InvalidateData();
+    bool BakeData(const TSharedPtr<const FAvenorStripData>& Data);
+    TSharedPtr<const FAvenorStripData> LoadBakedData() const;
+    void BuildCompleteWorldFromCurrentData();
+    FString BuildSettingsSnapshot() const;
+    FString BuildSettingsHash() const;
     void CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data);
     bool BindModifiersAndRefresh(bool bShowFailureDialog);
 
     mutable FCriticalSection DataMutex;
     mutable TSharedPtr<const FAvenorStripData> CachedData;
     bool bDeferMeshRefresh = false;
+    mutable bool bGeneratingGeography = false;
 };

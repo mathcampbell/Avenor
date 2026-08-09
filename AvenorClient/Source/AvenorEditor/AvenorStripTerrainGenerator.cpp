@@ -1,7 +1,12 @@
 #include "AvenorStripTerrainGenerator.h"
 
+#include "AvenorTerrainData.h"
+
 #include "ActorFactories/ActorFactory.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Serialization/ArchiveLoadCompressedProxy.h"
+#include "Serialization/ArchiveSaveCompressedProxy.h"
+#include "Subsystems/EditorAssetSubsystem.h"
 #include "Editor.h"
 #include "Engine/Blueprint.h"
 #include "EngineUtils.h"
@@ -11,6 +16,7 @@
 #include "Misc/ScopedSlowTask.h"
 #include "Misc/DateTime.h"
 #include "Misc/MessageDialog.h"
+#include "Misc/SecureHash.h"
 #include "WaterBodyActor.h"
 #include "WaterBodyComponent.h"
 #include "WaterBodyLakeActor.h"
@@ -28,6 +34,7 @@
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
+#include "UObject/Package.h"
 
 #include <queue>
 #include <vector>
@@ -582,6 +589,212 @@ struct FAvenorStripData
     double SampleHeight(const FVector2D& Position) const;
     float SampleChannel(FName Channel, const FVector2D& Position) const;
 };
+
+namespace UE::Avenor::Strip::BakedData
+{
+static constexpr uint32 ChunkMagic = 0x41564431; // AVD1
+static constexpr int32 ChunkPayloadVersion = 1;
+static constexpr int32 GeneratorAlgorithmVersion = 1;
+
+static void ExtractFloatChunk(
+    const TArray<double>& Source,
+    const FAvenorStripData& Data,
+    int32 StartX,
+    int32 StartY,
+    int32 CountX,
+    int32 CountY,
+    TArray<float>& Output
+)
+{
+    Output.SetNumUninitialized(CountX * CountY);
+    const bool bHasSource = Source.Num() == Data.Columns * Data.Rows;
+    for (int32 LocalY = 0; LocalY < CountY; ++LocalY)
+    {
+        for (int32 LocalX = 0; LocalX < CountX; ++LocalX)
+        {
+            const int32 LocalIndex = LocalY * CountX + LocalX;
+            const int32 SourceIndex = Data.Index(StartX + LocalX, StartY + LocalY);
+            Output[LocalIndex] = bHasSource ? static_cast<float>(Source[SourceIndex]) : 0.0f;
+        }
+    }
+}
+
+static void ExtractIntChunk(
+    const TArray<int32>& Source,
+    const FAvenorStripData& Data,
+    int32 StartX,
+    int32 StartY,
+    int32 CountX,
+    int32 CountY,
+    TArray<int32>& Output
+)
+{
+    Output.SetNumUninitialized(CountX * CountY);
+    const bool bHasSource = Source.Num() == Data.Columns * Data.Rows;
+    for (int32 LocalY = 0; LocalY < CountY; ++LocalY)
+    {
+        for (int32 LocalX = 0; LocalX < CountX; ++LocalX)
+        {
+            const int32 LocalIndex = LocalY * CountX + LocalX;
+            const int32 SourceIndex = Data.Index(StartX + LocalX, StartY + LocalY);
+            Output[LocalIndex] = bHasSource ? Source[SourceIndex] : INDEX_NONE;
+        }
+    }
+}
+
+static bool CompressChunk(
+    const FAvenorStripData& Data,
+    int32 StartX,
+    int32 StartY,
+    int32 CountX,
+    int32 CountY,
+    FAvenorTerrainDataChunk& Chunk
+)
+{
+    Chunk.StartCell = FIntPoint(StartX, StartY);
+    Chunk.CellCount = FIntPoint(CountX, CountY);
+    Chunk.CompressedPayload.Reset();
+
+    FArchiveSaveCompressedProxy Archive(
+        Chunk.CompressedPayload,
+        NAME_Zlib,
+        ECompressionFlags::COMPRESS_BiasMemory
+    );
+    uint32 Magic = ChunkMagic;
+    int32 Version = ChunkPayloadVersion;
+    Archive << Magic;
+    Archive << Version;
+
+    TArray<float> FloatValues;
+    TArray<int32> IntValues;
+    auto WriteFloat = [&](const TArray<double>& Source)
+    {
+        ExtractFloatChunk(Source, Data, StartX, StartY, CountX, CountY, FloatValues);
+        Archive << FloatValues;
+    };
+    auto WriteInt = [&](const TArray<int32>& Source)
+    {
+        ExtractIntChunk(Source, Data, StartX, StartY, CountX, CountY, IntValues);
+        Archive << IntValues;
+    };
+
+    WriteFloat(Data.Height);
+    WriteFloat(Data.Resistance);
+    WriteFloat(Data.MountainMask);
+    WriteFloat(Data.HillMask);
+    WriteFloat(Data.DesertMask);
+    WriteFloat(Data.PlainsMask);
+    WriteFloat(Data.FilledHeight);
+    WriteFloat(Data.Accumulation);
+    WriteFloat(Data.Slope);
+    WriteInt(Data.ReceiverA);
+    WriteInt(Data.ReceiverB);
+    WriteFloat(Data.ReceiverWeightA);
+    WriteInt(Data.FillParent);
+    WriteInt(Data.LakeIndex);
+
+    Chunk.UncompressedBytes = static_cast<int64>(CountX) * CountY * 14 * sizeof(uint32);
+    Archive.Flush();
+    return !Archive.GetError() && !Chunk.CompressedPayload.IsEmpty();
+}
+
+static bool CopyFloatChunkToGrid(
+    FArchive& Archive,
+    TArray<double>& Destination,
+    const FAvenorTerrainDataChunk& Chunk,
+    const FAvenorStripData& Data
+)
+{
+    TArray<float> Values;
+    Archive << Values;
+    const int32 Expected = Chunk.CellCount.X * Chunk.CellCount.Y;
+    if (Values.Num() != Expected)
+    {
+        return false;
+    }
+    for (int32 LocalY = 0; LocalY < Chunk.CellCount.Y; ++LocalY)
+    {
+        for (int32 LocalX = 0; LocalX < Chunk.CellCount.X; ++LocalX)
+        {
+            Destination[Data.Index(
+                Chunk.StartCell.X + LocalX,
+                Chunk.StartCell.Y + LocalY
+            )] = Values[LocalY * Chunk.CellCount.X + LocalX];
+        }
+    }
+    return true;
+}
+
+static bool CopyIntChunkToGrid(
+    FArchive& Archive,
+    TArray<int32>& Destination,
+    const FAvenorTerrainDataChunk& Chunk,
+    const FAvenorStripData& Data
+)
+{
+    TArray<int32> Values;
+    Archive << Values;
+    const int32 Expected = Chunk.CellCount.X * Chunk.CellCount.Y;
+    if (Values.Num() != Expected)
+    {
+        return false;
+    }
+    for (int32 LocalY = 0; LocalY < Chunk.CellCount.Y; ++LocalY)
+    {
+        for (int32 LocalX = 0; LocalX < Chunk.CellCount.X; ++LocalX)
+        {
+            Destination[Data.Index(
+                Chunk.StartCell.X + LocalX,
+                Chunk.StartCell.Y + LocalY
+            )] = Values[LocalY * Chunk.CellCount.X + LocalX];
+        }
+    }
+    return true;
+}
+
+static bool DecompressChunk(
+    const FAvenorTerrainDataChunk& Chunk,
+    FAvenorStripData& Data
+)
+{
+    if (Chunk.CompressedPayload.IsEmpty()
+        || Chunk.StartCell.X < 0
+        || Chunk.StartCell.Y < 0
+        || Chunk.CellCount.X <= 0
+        || Chunk.CellCount.Y <= 0
+        || Chunk.StartCell.X + Chunk.CellCount.X > Data.Columns
+        || Chunk.StartCell.Y + Chunk.CellCount.Y > Data.Rows)
+    {
+        return false;
+    }
+
+    FArchiveLoadCompressedProxy Archive(Chunk.CompressedPayload, NAME_Zlib);
+    uint32 Magic = 0;
+    int32 Version = 0;
+    Archive << Magic;
+    Archive << Version;
+    if (Archive.GetError() || Magic != ChunkMagic || Version != ChunkPayloadVersion)
+    {
+        return false;
+    }
+
+    return CopyFloatChunkToGrid(Archive, Data.Height, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.Resistance, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.MountainMask, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.HillMask, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.DesertMask, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.PlainsMask, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.FilledHeight, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.Accumulation, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.Slope, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.ReceiverA, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.ReceiverB, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.ReceiverWeightA, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.FillParent, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.LakeIndex, Chunk, Data)
+        && !Archive.GetError();
+}
+} // namespace UE::Avenor::Strip::BakedData
 
 namespace UE::Avenor::Strip
 {
@@ -2558,7 +2771,7 @@ public:
     }
 
     virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("4dd30dc7-b50b-4cef-a221-f1d67ed2e929")); }
+    static FGuid Version() { return FGuid(TEXT("1b5d8f34-0798-4a24-845a-b4a35ce606e9")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -2842,6 +3055,7 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
     FastPreviewMesh->SetHiddenInGame(true);
     FastPreviewMesh->SetVisibility(false);
     LastBuildStamp = TEXT("Never generated");
+    BakedDataStatus = TEXT("No baked terrain data assigned");
     ResolveSettings();
 }
 
@@ -2885,6 +3099,23 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
 
 FBox AAvenorStripTerrainGenerator::GetGenerationBounds() const
 {
+    if (!bGeneratingGeography)
+    {
+        {
+            FScopeLock Lock(&DataMutex);
+            if (CachedData && CachedData->Bounds.IsValid)
+            {
+                return CachedData->Bounds;
+            }
+        }
+        if (const UAvenorTerrainData* Asset = BakedTerrainData.LoadSynchronous())
+        {
+            if (Asset->HasValidData())
+            {
+                return Asset->WorldBounds;
+            }
+        }
+    }
     const FVector Centre = GetActorLocation();
     const FVector Extent(
         FMath::Max(10000.0, WorldSize.X) * 0.5,
@@ -2899,7 +3130,15 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::GetOrCreateData
     FScopeLock Lock(&DataMutex);
     if (!CachedData)
     {
-        CachedData = GenerateData(*this);
+        CachedData = LoadBakedData();
+        if (!CachedData)
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Avenor terrain has no valid baked data. Use Generate and Bake Geography explicitly; automatic procedural regeneration is disabled.")
+            );
+        }
     }
     return CachedData;
 }
@@ -2910,6 +3149,302 @@ void AAvenorStripTerrainGenerator::InvalidateData()
     CachedData.Reset();
     bTerrainPlanReadyForWater = false;
     bRefinementPlanReadyForWater = false;
+}
+
+FString AAvenorStripTerrainGenerator::BuildSettingsSnapshot() const
+{
+    return FString::Printf(
+        TEXT("v%d|seed=%d|size=%.17g,%.17g|axis=%d|")
+        TEXT("land=%d,%.17g,%.17g,%.17g,%d,%.17g,%.17g|")
+        TEXT("erosion=%.17g,%d,%.17g|hydrology=%d,%.17g,%.17g,%d,%d,%.17g|")
+        TEXT("water=%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d,%.17g,%s,%s,%s,%s"),
+        UE::Avenor::Strip::BakedData::GeneratorAlgorithmVersion,
+        Seed, WorldSize.X, WorldSize.Y, static_cast<int32>(LongAxis),
+        Landforms.bMountains, Landforms.MountainHeight,
+        Landforms.MountainRangesPer100Km, Landforms.MountainClearanceFromSpine,
+        Landforms.bHills, Landforms.HillHeight, Landforms.HillSize,
+        Erosion.Strength, Erosion.Passes, Erosion.AnalysisSpacing,
+        Hydrology.bRivers, Hydrology.RiverDensity, Hydrology.MinimumRiverLength,
+        Hydrology.bLakes, Hydrology.MaximumLakes, Hydrology.MinimumLakeDepression,
+        WaterTerrain.RiverWidthScale, WaterTerrain.RiverDepthScale,
+        WaterTerrain.RiverBankWidth, WaterTerrain.LakeBedDepth,
+        WaterTerrain.LakeShoreWidth, WaterTerrain.LakeSurfaceInset,
+        WaterTerrain.DryBankWidth, WaterTerrain.BlurRadius,
+        WaterTerrain.EdgeRoughness,
+        *WaterTerrain.RiverBedWeight.ToString(),
+        *WaterTerrain.RiverBankWeight.ToString(),
+        *WaterTerrain.LakeBedWeight.ToString(),
+        *WaterTerrain.LakeShoreWeight.ToString()
+    );
+}
+
+FString AAvenorStripTerrainGenerator::BuildSettingsHash() const
+{
+    const FString Snapshot = BuildSettingsSnapshot();
+    return FMD5::HashAnsiString(*Snapshot);
+}
+
+bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripData>& Data)
+{
+#if WITH_EDITOR
+    if (!Data || Data->Columns < 2 || Data->Rows < 2)
+    {
+        return false;
+    }
+
+    UAvenorTerrainData* Asset = BakedTerrainData.LoadSynchronous();
+    if (!Asset)
+    {
+        bool bCreatedAsset = false;
+        const FString AssetName = FString::Printf(
+            TEXT("DA_AvenorTerrainData_%s"), *GetFName().ToString()
+        );
+        const FString PackageName = FString::Printf(
+            TEXT("/Game/Avenor/Generated/%s"), *AssetName
+        );
+        Asset = LoadObject<UAvenorTerrainData>(
+            nullptr,
+            *FString::Printf(TEXT("%s.%s"), *PackageName, *AssetName)
+        );
+        if (!Asset)
+        {
+            UPackage* Package = CreatePackage(*PackageName);
+            Asset = NewObject<UAvenorTerrainData>(
+                Package,
+                *AssetName,
+                RF_Public | RF_Standalone | RF_Transactional
+            );
+            bCreatedAsset = Asset != nullptr;
+        }
+        if (!Asset)
+        {
+            return false;
+        }
+        if (bCreatedAsset)
+        {
+            FAssetRegistryModule::AssetCreated(Asset);
+        }
+        Modify();
+        BakedTerrainData = Asset;
+        MarkPackageDirty();
+    }
+
+    Asset->Modify();
+    Asset->FormatVersion = UAvenorTerrainData::CurrentFormatVersion;
+    Asset->GeneratorAlgorithmVersion = UE::Avenor::Strip::BakedData::GeneratorAlgorithmVersion;
+    Asset->SettingsHash = BuildSettingsHash();
+    Asset->GenerationSettingsSnapshot = BuildSettingsSnapshot();
+    Asset->GeneratedAtUtc = FDateTime::UtcNow();
+    Asset->Seed = Seed;
+    Asset->WorldBounds = Data->Bounds;
+    Asset->Columns = Data->Columns;
+    Asset->Rows = Data->Rows;
+    Asset->CellSize = Data->CellSize;
+    Asset->ChunkCellSize = FMath::Clamp(BakedChunkCellSize, 16, 512);
+    Asset->Chunks.Reset();
+
+    const int32 ChunkColumns = FMath::DivideAndRoundUp(Data->Columns, Asset->ChunkCellSize);
+    const int32 ChunkRows = FMath::DivideAndRoundUp(Data->Rows, Asset->ChunkCellSize);
+    Asset->Chunks.Reserve(ChunkColumns * ChunkRows);
+    for (int32 ChunkY = 0; ChunkY < ChunkRows; ++ChunkY)
+    {
+        for (int32 ChunkX = 0; ChunkX < ChunkColumns; ++ChunkX)
+        {
+            FAvenorTerrainDataChunk& Chunk = Asset->Chunks.AddDefaulted_GetRef();
+            Chunk.ChunkCoordinate = FIntPoint(ChunkX, ChunkY);
+            const int32 StartX = ChunkX * Asset->ChunkCellSize;
+            const int32 StartY = ChunkY * Asset->ChunkCellSize;
+            const int32 CountX = FMath::Min(Asset->ChunkCellSize, Data->Columns - StartX);
+            const int32 CountY = FMath::Min(Asset->ChunkCellSize, Data->Rows - StartY);
+            if (!UE::Avenor::Strip::BakedData::CompressChunk(
+                *Data, StartX, StartY, CountX, CountY, Chunk
+            ))
+            {
+                Asset->Chunks.Reset();
+                return false;
+            }
+        }
+    }
+
+    Asset->Rivers.Reset(Data->Rivers.Num());
+    for (const FRiverReach& Source : Data->Rivers)
+    {
+        FAvenorBakedRiverReach& Target = Asset->Rivers.AddDefaulted_GetRef();
+        Target.Points = Source.Points;
+        Target.Width = Source.Width;
+        Target.Depth = Source.Depth;
+        Target.ValleyHalfWidth = Source.ValleyHalfWidth;
+        Target.ValleyDepth = Source.ValleyDepth;
+        Target.CrossSectionExponent = Source.CrossSectionExponent;
+        Target.ChannelSteepness = Source.ChannelSteepness;
+        Target.DrainageArea = Source.DrainageArea;
+        Target.StartLakeIndex = Source.StartLakeIndex;
+        Target.EndLakeIndex = Source.EndLakeIndex;
+        Target.bIsCanyon = Source.bIsCanyon;
+    }
+    Asset->Lakes.Reset(Data->Lakes.Num());
+    for (const FLakeBasin& Source : Data->Lakes)
+    {
+        FAvenorBakedLakeBasin& Target = Asset->Lakes.AddDefaulted_GetRef();
+        Target.Shoreline = Source.Shoreline;
+        Target.ShorelineHeight = Source.ShorelineHeight;
+        Target.SurfaceHeight = Source.SurfaceHeight;
+        Target.MaximumDepth = Source.MaximumDepth;
+        Target.BankBlendWidth = Source.BankBlendWidth;
+        Target.DepthRampWidth = Source.DepthRampWidth;
+    }
+    Asset->OceanBoundary = Data->OceanBoundary;
+    Asset->RequestedMountainRanges = Data->RequestedMountainRanges;
+    Asset->PlacedMountainRanges = Data->PlacedMountainRanges;
+    Asset->AuthoritativeRiverCells = Data->AuthoritativeRiverCells;
+    Asset->RiverSeedCells = Data->RiverSeedCells;
+    Asset->RiverContinuationCells = Data->RiverContinuationCells;
+    Asset->RejectedShortRiverSystems = Data->RejectedShortRiverSystems;
+    Asset->RiverTerminusLakeCandidates = Data->RiverTerminusLakeCandidates;
+    Asset->AcceptedRiverTerminusLakes = Data->AcceptedRiverTerminusLakes;
+    Asset->AcceptedOptionalLakes = Data->AcceptedOptionalLakes;
+    Asset->MarkPackageDirty();
+
+    if (GEditor)
+    {
+        if (UEditorAssetSubsystem* AssetSubsystem =
+            GEditor->GetEditorSubsystem<UEditorAssetSubsystem>())
+        {
+            if (!AssetSubsystem->SaveLoadedAsset(Asset, false))
+            {
+                UE_LOG(LogTemp, Error, TEXT("Avenor terrain data asset could not be saved: %s"), *Asset->GetPathName());
+                return false;
+            }
+        }
+    }
+    BakedDataStatus = FString::Printf(
+        TEXT("Current: %d cells in %d compressed chunks | %s"),
+        Data->Height.Num(),
+        Asset->Chunks.Num(),
+        *Asset->SettingsHash
+    );
+    return true;
+#else
+    return false;
+#endif
+}
+
+TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData() const
+{
+    const UAvenorTerrainData* Asset = BakedTerrainData.LoadSynchronous();
+    if (!Asset || !Asset->HasValidData())
+    {
+        return nullptr;
+    }
+
+    TSharedPtr<FAvenorStripData> Data = MakeShared<FAvenorStripData>();
+    Data->Bounds = Asset->WorldBounds;
+    Data->Columns = Asset->Columns;
+    Data->Rows = Asset->Rows;
+    Data->CellSize = Asset->CellSize;
+    const int32 TotalCells = Data->Columns * Data->Rows;
+    Data->Height.SetNumZeroed(TotalCells);
+    Data->Resistance.SetNumZeroed(TotalCells);
+    Data->MountainMask.SetNumZeroed(TotalCells);
+    Data->HillMask.SetNumZeroed(TotalCells);
+    Data->DesertMask.SetNumZeroed(TotalCells);
+    Data->PlainsMask.SetNumZeroed(TotalCells);
+    Data->FilledHeight.SetNumZeroed(TotalCells);
+    Data->Accumulation.SetNumZeroed(TotalCells);
+    Data->Slope.SetNumZeroed(TotalCells);
+    Data->ReceiverA.Init(INDEX_NONE, TotalCells);
+    Data->ReceiverB.Init(INDEX_NONE, TotalCells);
+    Data->ReceiverWeightA.SetNumZeroed(TotalCells);
+    Data->FillParent.Init(INDEX_NONE, TotalCells);
+    Data->LakeIndex.Init(INDEX_NONE, TotalCells);
+
+    TSet<FIntPoint> SeenChunkCoordinates;
+    for (const FAvenorTerrainDataChunk& Chunk : Asset->Chunks)
+    {
+        const int32 ExpectedStartX = Chunk.ChunkCoordinate.X * Asset->ChunkCellSize;
+        const int32 ExpectedStartY = Chunk.ChunkCoordinate.Y * Asset->ChunkCellSize;
+        const int32 ExpectedCountX = FMath::Min(
+            Asset->ChunkCellSize, Data->Columns - ExpectedStartX
+        );
+        const int32 ExpectedCountY = FMath::Min(
+            Asset->ChunkCellSize, Data->Rows - ExpectedStartY
+        );
+        if (Chunk.ChunkCoordinate.X < 0
+            || Chunk.ChunkCoordinate.Y < 0
+            || ExpectedCountX <= 0
+            || ExpectedCountY <= 0
+            || SeenChunkCoordinates.Contains(Chunk.ChunkCoordinate)
+            || Chunk.StartCell != FIntPoint(ExpectedStartX, ExpectedStartY)
+            || Chunk.CellCount != FIntPoint(ExpectedCountX, ExpectedCountY)
+            || !UE::Avenor::Strip::BakedData::DecompressChunk(Chunk, *Data))
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Avenor baked terrain chunk (%d,%d) is invalid or corrupt."),
+                Chunk.ChunkCoordinate.X,
+                Chunk.ChunkCoordinate.Y
+            );
+            return nullptr;
+        }
+        SeenChunkCoordinates.Add(Chunk.ChunkCoordinate);
+    }
+
+    Data->Rivers.Reserve(Asset->Rivers.Num());
+    for (const FAvenorBakedRiverReach& Source : Asset->Rivers)
+    {
+        FRiverReach& Target = Data->Rivers.AddDefaulted_GetRef();
+        Target.Points = Source.Points;
+        Target.Width = Source.Width;
+        Target.Depth = Source.Depth;
+        Target.ValleyHalfWidth = Source.ValleyHalfWidth;
+        Target.ValleyDepth = Source.ValleyDepth;
+        Target.CrossSectionExponent = Source.CrossSectionExponent;
+        Target.ChannelSteepness = Source.ChannelSteepness;
+        Target.DrainageArea = Source.DrainageArea;
+        Target.StartLakeIndex = Source.StartLakeIndex;
+        Target.EndLakeIndex = Source.EndLakeIndex;
+        Target.bIsCanyon = Source.bIsCanyon;
+        for (const FVector& Point : Target.Points)
+        {
+            Target.Bounds += FVector2D(Point);
+        }
+    }
+    Data->Lakes.Reserve(Asset->Lakes.Num());
+    for (const FAvenorBakedLakeBasin& Source : Asset->Lakes)
+    {
+        FLakeBasin& Target = Data->Lakes.AddDefaulted_GetRef();
+        Target.Shoreline = Source.Shoreline;
+        Target.ShorelineHeight = Source.ShorelineHeight;
+        Target.SurfaceHeight = Source.SurfaceHeight;
+        Target.MaximumDepth = Source.MaximumDepth;
+        Target.BankBlendWidth = Source.BankBlendWidth;
+        Target.DepthRampWidth = Source.DepthRampWidth;
+        for (const FVector& Point : Target.Shoreline)
+        {
+            Target.Bounds += FVector2D(Point);
+        }
+    }
+    Data->OceanBoundary = Asset->OceanBoundary;
+    Data->RequestedMountainRanges = Asset->RequestedMountainRanges;
+    Data->PlacedMountainRanges = Asset->PlacedMountainRanges;
+    Data->AuthoritativeRiverCells = Asset->AuthoritativeRiverCells;
+    Data->RiverSeedCells = Asset->RiverSeedCells;
+    Data->RiverContinuationCells = Asset->RiverContinuationCells;
+    Data->RejectedShortRiverSystems = Asset->RejectedShortRiverSystems;
+    Data->RiverTerminusLakeCandidates = Asset->RiverTerminusLakeCandidates;
+    Data->AcceptedRiverTerminusLakes = Asset->AcceptedRiverTerminusLakes;
+    Data->AcceptedOptionalLakes = Asset->AcceptedOptionalLakes;
+
+    if (Asset->SettingsHash != BuildSettingsHash())
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Avenor baked terrain settings differ from the generator actor. The baked geography remains authoritative until Generate and Bake Geography is run explicitly.")
+        );
+    }
+    return Data;
 }
 
 bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDialog)
@@ -3214,16 +3749,21 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
     TerrainModifier->SetPriority(0.0);
 
-    FScopedSlowTask Progress(3.0f, FText::FromString(TEXT("Generating strip terrain plan...")));
+    FScopedSlowTask Progress(3.0f, FText::FromString(TEXT("Loading baked strip terrain plan...")));
     Progress.MakeDialog();
-    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Building landforms and erosion")));
+    Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Loading compressed geography chunks")));
     bTerrainPlanReadyForWater = false;
     ClearGeneratedWater();
     ClearGeneratedRefinementSplines();
-    InvalidateData();
     const TSharedPtr<const FAvenorStripData> Data = GetOrCreateData();
     if (!Data)
     {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "No valid baked Avenor terrain data is assigned. Use Generate and Bake Geography first."
+            ))
+        );
         return;
     }
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Registering ordered terrain modifier")));
@@ -3361,9 +3901,8 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         FMessageDialog::Open(
             EAppMsgType::Ok,
             FText::FromString(TEXT(
-                "Generate Terrain must succeed first. No intermediate Mesh "
-                "Partition rebuild is required before generating refinement "
-                "splines."
+                "A valid baked terrain plan must be loaded first. No intermediate "
+                "Mesh Partition rebuild is required before generating refinement splines."
             ))
         );
         return;
@@ -3516,7 +4055,7 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
 void AAvenorStripTerrainGenerator::RegenerateAndRefreshTerrain()
 {
 #if WITH_EDITOR
-    GenerateCompleteWorld();
+    RebuildWorldFromBakedData();
 #endif
 }
 
@@ -3524,6 +4063,50 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
 {
 #if WITH_EDITOR
     ResolveSettings();
+    InvalidateData();
+    bGeneratingGeography = true;
+    const TSharedPtr<const FAvenorStripData> GeneratedData = GenerateData(*this);
+    bGeneratingGeography = false;
+    if (!GeneratedData)
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT("Avenor geography generation failed; the previous baked asset was not changed."))
+        );
+        return;
+    }
+    if (!BakeData(GeneratedData))
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT("Avenor geography was calculated but could not be saved to its terrain data asset."))
+        );
+        return;
+    }
+    {
+        FScopeLock Lock(&DataMutex);
+        CachedData = GeneratedData;
+    }
+    BuildCompleteWorldFromCurrentData();
+    LastBuildStamp = FString::Printf(
+        TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes"),
+        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+        *BakedTerrainData.ToSoftObjectPath().ToString(),
+        *BuildSettingsHash(),
+        BakedTerrainData.LoadSynchronous() ? BakedTerrainData.LoadSynchronous()->Chunks.Num() : 0,
+        CachedData ? CachedData->Rivers.Num() : 0,
+        CachedData ? CachedData->Lakes.Num() : 0
+    );
+#endif
+}
+
+void AAvenorStripTerrainGenerator::BuildCompleteWorldFromCurrentData()
+{
+#if WITH_EDITOR
+    if (!CachedData)
+    {
+        return;
+    }
     bDeferMeshRefresh = true;
     ClearGeneratedWater();
     ClearGeneratedRefinementSplines();
@@ -3544,10 +4127,87 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
     }
     bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     LastBuildStamp = FString::Printf(
-        TEXT("Complete world generated %s | code %s | seed %d | %d rivers | %d lakes | native water modifiers bound"),
+        TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes | native water modifiers bound"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed,
+        CachedData ? CachedData->Rivers.Num() : 0,
+        CachedData ? CachedData->Lakes.Num() : 0
+    );
+#endif
+}
+
+void AAvenorStripTerrainGenerator::RebuildWorldFromBakedData()
+{
+#if WITH_EDITOR
+    ResolveSettings();
+    InvalidateData();
+    if (!GetOrCreateData())
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "No valid baked Avenor terrain data is assigned. Generate and Bake Geography first."
+            ))
+        );
+        return;
+    }
+    if (const UAvenorTerrainData* Asset = BakedTerrainData.Get())
+    {
+        BakedDataStatus = Asset->SettingsHash == BuildSettingsHash()
+            ? FString::Printf(TEXT("Current: %s"), *Asset->SettingsHash)
+            : FString::Printf(
+                TEXT("BAKED TERRAIN IS OUT OF DATE: saved %s, current settings %s"),
+                *Asset->SettingsHash,
+                *BuildSettingsHash()
+            );
+    }
+    BuildCompleteWorldFromCurrentData();
+#endif
+}
+
+void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
+{
+#if WITH_EDITOR
+    ResolveSettings();
+    InvalidateData();
+    if (!GetOrCreateData())
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "No valid baked Avenor terrain data is assigned. Generate and Bake Geography first."
+            ))
+        );
+        return;
+    }
+    if (const UAvenorTerrainData* Asset = BakedTerrainData.Get())
+    {
+        BakedDataStatus = Asset->SettingsHash == BuildSettingsHash()
+            ? FString::Printf(TEXT("Current: %s"), *Asset->SettingsHash)
+            : FString::Printf(
+                TEXT("BAKED TERRAIN IS OUT OF DATE: saved %s, current settings %s"),
+                *Asset->SettingsHash,
+                *BuildSettingsHash()
+            );
+    }
+    bTerrainPlanReadyForWater = true;
+    bDeferMeshRefresh = true;
+    ClearGeneratedWater();
+    ClearGeneratedRefinementSplines();
+    GenerateRefinementSplines();
+    if (bRefinementPlanReadyForWater)
+    {
+        CreateWaterActors(CachedData);
+    }
+    bDeferMeshRefresh = false;
+    if (bRefinementPlanReadyForWater)
+    {
+        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+    }
+    LastBuildStamp = FString::Printf(
+        TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes"),
+        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         CachedData ? CachedData->Rivers.Num() : 0,
         CachedData ? CachedData->Lakes.Num() : 0
     );
@@ -3597,7 +4257,6 @@ void AAvenorStripTerrainGenerator::GenerateFastPreview()
 {
 #if WITH_EDITOR
     ResolveSettings();
-    InvalidateData();
     if (!FastPreviewMesh)
     {
         return;
@@ -3625,7 +4284,9 @@ void AAvenorStripTerrainGenerator::GenerateFastPreview()
     FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating fast local terrain preview...")));
     Progress.MakeDialog();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Calculating terrain and hydrology")));
-    const TSharedPtr<const FAvenorStripData> Data = GetOrCreateData();
+    bGeneratingGeography = true;
+    const TSharedPtr<const FAvenorStripData> Data = GenerateData(*this);
+    bGeneratingGeography = false;
     if (!Data)
     {
         return;
@@ -3742,7 +4403,7 @@ void AAvenorStripTerrainGenerator::GenerateWater()
             EAppMsgType::Ok,
             FText::FromString(TEXT(
                 "A terrain and refinement plan is required before water can be created. "
-                "Use Generate Complete World for the normal one-button workflow."
+                "Use Generate and Bake Geography for the normal one-button workflow."
             ))
         );
         return;
