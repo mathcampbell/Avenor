@@ -25,13 +25,16 @@ struct FSpineAlignmentSample
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     float NaturalTerrainZ = 0.0f;
 
-    /** Natural height sampled at the outside edge of development on the left. */
+    /**
+     * Smoothed, slope-limited ground profile from the road edge to the outside
+     * development edge on the left. Index zero is pinned to RoadDatumZ.
+     */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
-    float NaturalLeftEdgeZ = 0.0f;
+    TArray<float> LeftDevelopmentProfileZ;
 
-    /** Natural height sampled at the outside edge of development on the right. */
+    /** Right-side equivalent; it is solved independently from the left side. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
-    float NaturalRightEdgeZ = 0.0f;
+    TArray<float> RightDevelopmentProfileZ;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     float RoadDatumZ = 0.0f;
@@ -396,7 +399,20 @@ private:
     /** Maximum gentle sideways grade beneath blocks and their side streets. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
         meta = (ClampMin = "0.0", ClampMax = "0.10"))
-    float MaximumDevelopmentCrossGrade = 0.03f;
+    float MaximumDevelopmentCrossGrade = 0.06f;
+
+    /**
+     * Lateral spacing used to sample the natural ground beneath development.
+     * Smaller values retain more rolling cross-slope detail.
+     */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
+        meta = (Units = "cm", ClampMin = "500.0"))
+    float DevelopmentProfileSampleSpacing = 2500.0f;
+
+    /** Longitudinal smoothing applied to each lateral profile sample. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
+        meta = (Units = "cm", ClampMin = "0.0"))
+    float DevelopmentProfileSmoothingDistance = 10000.0f;
 
     /** Vertical reach of the terrain sampling ray above and below the guide. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",

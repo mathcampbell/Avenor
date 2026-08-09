@@ -17,8 +17,8 @@ struct FCorridorSample
 {
     FVector2D Centre = FVector2D::ZeroVector;
     double RoadDatumZ = 0.0;
-    double LeftDevelopmentEdgeZ = 0.0;
-    double RightDevelopmentEdgeZ = 0.0;
+    TArray<double> LeftDevelopmentProfileZ;
+    TArray<double> RightDevelopmentProfileZ;
 };
 
 class FSpineTerrainCorridorOp final
@@ -75,8 +75,8 @@ public:
 
             double BestDistanceSquared = TNumericLimits<double>::Max();
             double TargetRoadZ = WorldPosition.Z;
-            double TargetLeftEdgeZ = WorldPosition.Z;
-            double TargetRightEdgeZ = WorldPosition.Z;
+            int32 BestSegmentIndex = INDEX_NONE;
+            double BestSegmentAlpha = 0.0;
             double SignedLateral = 0.0;
             for (int32 Index = 0; Index + 1 < Samples.Num(); ++Index)
             {
@@ -105,19 +105,11 @@ public:
                         ? FVector2D::CrossProduct(Segment, Offset)
                             / SegmentLength
                         : 0.0;
+                    BestSegmentIndex = Index;
+                    BestSegmentAlpha = Alpha;
                     TargetRoadZ = FMath::Lerp(
                         Samples[Index].RoadDatumZ,
                         Samples[Index + 1].RoadDatumZ,
-                        Alpha
-                    );
-                    TargetLeftEdgeZ = FMath::Lerp(
-                        Samples[Index].LeftDevelopmentEdgeZ,
-                        Samples[Index + 1].LeftDevelopmentEdgeZ,
-                        Alpha
-                    );
-                    TargetRightEdgeZ = FMath::Lerp(
-                        Samples[Index].RightDevelopmentEdgeZ,
-                        Samples[Index + 1].RightDevelopmentEdgeZ,
                         Alpha
                     );
                 }
@@ -134,21 +126,53 @@ public:
                 continue;
             }
 
-            const bool bRightSide = SignedLateral >= 0.0;
-            const double EdgeZ = bRightSide
-                ? TargetRightEdgeZ
-                : TargetLeftEdgeZ;
             const double CrossSectionAlpha = FMath::Clamp(
                 (Distance - FlatHalfWidth) /
                     FMath::Max(1.0, DevelopmentHalfWidth - FlatHalfWidth),
                 0.0,
                 1.0
             );
-            const double TargetDevelopmentZ = FMath::Lerp(
-                TargetRoadZ,
-                EdgeZ,
-                FMath::SmoothStep(0.0, 1.0, CrossSectionAlpha)
-            );
+            double TargetDevelopmentZ = TargetRoadZ;
+            if (BestSegmentIndex != INDEX_NONE && CrossSectionAlpha > 0.0)
+            {
+                const bool bRightSide = SignedLateral >= 0.0;
+                const TArray<double>& ProfileA = bRightSide
+                    ? Samples[BestSegmentIndex].RightDevelopmentProfileZ
+                    : Samples[BestSegmentIndex].LeftDevelopmentProfileZ;
+                const TArray<double>& ProfileB = bRightSide
+                    ? Samples[BestSegmentIndex + 1].RightDevelopmentProfileZ
+                    : Samples[BestSegmentIndex + 1].LeftDevelopmentProfileZ;
+                const int32 ProfileCount = FMath::Min(
+                    ProfileA.Num(),
+                    ProfileB.Num()
+                );
+                if (ProfileCount >= 2)
+                {
+                    const double ProfilePosition = CrossSectionAlpha
+                        * static_cast<double>(ProfileCount - 1);
+                    const int32 ProfileIndex = FMath::Min(
+                        FMath::FloorToInt(ProfilePosition),
+                        ProfileCount - 2
+                    );
+                    const double ProfileAlpha = ProfilePosition
+                        - static_cast<double>(ProfileIndex);
+                    const double HeightA = FMath::Lerp(
+                        ProfileA[ProfileIndex],
+                        ProfileA[ProfileIndex + 1],
+                        ProfileAlpha
+                    );
+                    const double HeightB = FMath::Lerp(
+                        ProfileB[ProfileIndex],
+                        ProfileB[ProfileIndex + 1],
+                        ProfileAlpha
+                    );
+                    TargetDevelopmentZ = FMath::Lerp(
+                        HeightA,
+                        HeightB,
+                        BestSegmentAlpha
+                    );
+                }
+            }
             const double Blend = Distance <= DevelopmentHalfWidth
                 ? 1.0
                 : 1.0 - FMath::SmoothStep(
@@ -237,27 +261,27 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
         FCorridorSample& OpSample = Op->Samples.AddDefaulted_GetRef();
         OpSample.Centre = FVector2D(Location.X, Location.Y);
         OpSample.RoadDatumZ = Sample.RoadDatumZ;
-        const double MaximumEdgeDelta = FMath::Max(
-            0.0f,
-            Spine->MaximumDevelopmentCrossGrade
-        ) * Op->DevelopmentHalfWidth;
-        OpSample.LeftDevelopmentEdgeZ = Sample.RoadDatumZ + FMath::Clamp(
-            static_cast<double>(Sample.NaturalLeftEdgeZ - Sample.RoadDatumZ),
-            -MaximumEdgeDelta,
-            MaximumEdgeDelta
+        OpSample.LeftDevelopmentProfileZ.Reserve(
+            Sample.LeftDevelopmentProfileZ.Num()
         );
-        OpSample.RightDevelopmentEdgeZ = Sample.RoadDatumZ + FMath::Clamp(
-            static_cast<double>(Sample.NaturalRightEdgeZ - Sample.RoadDatumZ),
-            -MaximumEdgeDelta,
-            MaximumEdgeDelta
+        OpSample.RightDevelopmentProfileZ.Reserve(
+            Sample.RightDevelopmentProfileZ.Num()
         );
+        for (const float Height : Sample.LeftDevelopmentProfileZ)
+        {
+            OpSample.LeftDevelopmentProfileZ.Add(Height);
+        }
+        for (const float Height : Sample.RightDevelopmentProfileZ)
+        {
+            OpSample.RightDevelopmentProfileZ.Add(Height);
+        }
     }
     return Op;
 }
 
 FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
-    return FGuid(TEXT("7cd531e1-b2f4-4f31-aac2-27cead9e9468"));
+    return FGuid(TEXT("f6381f56-560a-44dd-bcc1-42bbf6256fbc"));
 }
 #endif
 
@@ -444,6 +468,23 @@ bool ASpineGenerator::SolveTerrainAlignment()
     );
     AlignmentSamples.Reserve(SampleCount);
 
+    const float DevelopmentHalfWidth = GetDevelopmentOuterLateral();
+    const float DevelopmentProfileWidth = FMath::Max(
+        1.0f,
+        DevelopmentHalfWidth - CorridorFlatHalfWidth
+    );
+    const int32 DevelopmentProfileIntervalCount = FMath::Max(
+        1,
+        FMath::CeilToInt(
+            DevelopmentProfileWidth
+            / FMath::Max(500.0f, DevelopmentProfileSampleSpacing)
+        )
+    );
+    const int32 DevelopmentProfileSampleCount =
+        DevelopmentProfileIntervalCount + 1;
+    const float DevelopmentProfileStep = DevelopmentProfileWidth
+        / static_cast<float>(DevelopmentProfileIntervalCount);
+
     FCollisionQueryParams QueryParams(
         SCENE_QUERY_STAT(AvenorSpineTerrainSample),
         true
@@ -527,23 +568,37 @@ bool ASpineGenerator::SolveTerrainAlignment()
             FVector::UpVector,
             BaseForward
         ).GetSafeNormal();
-        const float DevelopmentHalfWidth = GetDevelopmentOuterLateral();
-        bool bEdgeFallback = false;
-        if (!TraceTerrain(
-                BaseLocation - BaseRight * DevelopmentHalfWidth,
-                Sample.NaturalLeftEdgeZ,
-                bEdgeFallback
-            ))
+        Sample.LeftDevelopmentProfileZ.SetNumUninitialized(
+            DevelopmentProfileSampleCount
+        );
+        Sample.RightDevelopmentProfileZ.SetNumUninitialized(
+            DevelopmentProfileSampleCount
+        );
+        for (int32 ProfileIndex = 0;
+             ProfileIndex < DevelopmentProfileSampleCount;
+             ++ProfileIndex)
         {
-            Sample.NaturalLeftEdgeZ = Sample.NaturalTerrainZ;
-        }
-        if (!TraceTerrain(
-                BaseLocation + BaseRight * DevelopmentHalfWidth,
-                Sample.NaturalRightEdgeZ,
-                bEdgeFallback
-            ))
-        {
-            Sample.NaturalRightEdgeZ = Sample.NaturalTerrainZ;
+            const float Lateral = CorridorFlatHalfWidth
+                + DevelopmentProfileStep * ProfileIndex;
+            bool bProfileFallback = false;
+            if (!TraceTerrain(
+                    BaseLocation - BaseRight * Lateral,
+                    Sample.LeftDevelopmentProfileZ[ProfileIndex],
+                    bProfileFallback
+                ))
+            {
+                Sample.LeftDevelopmentProfileZ[ProfileIndex] =
+                    Sample.NaturalTerrainZ;
+            }
+            if (!TraceTerrain(
+                    BaseLocation + BaseRight * Lateral,
+                    Sample.RightDevelopmentProfileZ[ProfileIndex],
+                    bProfileFallback
+                ))
+            {
+                Sample.RightDevelopmentProfileZ[ProfileIndex] =
+                    Sample.NaturalTerrainZ;
+            }
         }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
         ValidHits += Sample.bTerrainHit ? 1 : 0;
@@ -602,8 +657,14 @@ bool ASpineGenerator::SolveTerrainAlignment()
             FilledZ = AlignmentSamples[Right].NaturalTerrainZ;
         }
         AlignmentSamples[Index].NaturalTerrainZ = FilledZ;
-        AlignmentSamples[Index].NaturalLeftEdgeZ = FilledZ;
-        AlignmentSamples[Index].NaturalRightEdgeZ = FilledZ;
+        AlignmentSamples[Index].LeftDevelopmentProfileZ.Init(
+            FilledZ,
+            DevelopmentProfileSampleCount
+        );
+        AlignmentSamples[Index].RightDevelopmentProfileZ.Init(
+            FilledZ,
+            DevelopmentProfileSampleCount
+        );
         AlignmentSamples[Index].RoadDatumZ = FilledZ + RoadDatumOffset;
     }
 
@@ -676,12 +737,124 @@ bool ASpineGenerator::SolveTerrainAlignment()
             );
         }
     }
+    for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
+    {
+        AlignmentSamples[Index].RoadDatumZ = SmoothedHeights[Index];
+    }
+
+    // Smooth every lateral band along the route and across its immediate
+    // neighbours. This retains broad natural side-hill form without copying
+    // individual terrain bumps into roads and buildable parcel ground.
+    TArray<TArray<float>> SmoothedLeftProfiles;
+    TArray<TArray<float>> SmoothedRightProfiles;
+    SmoothedLeftProfiles.SetNum(AlignmentSamples.Num());
+    SmoothedRightProfiles.SetNum(AlignmentSamples.Num());
+    const int32 ProfileSmoothingRadius = FMath::Max(
+        0,
+        FMath::RoundToInt(
+            DevelopmentProfileSmoothingDistance / FMath::Max(1.0f, Step)
+        )
+    );
+    for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
+    {
+        SmoothedLeftProfiles[Index].SetNumUninitialized(
+            DevelopmentProfileSampleCount
+        );
+        SmoothedRightProfiles[Index].SetNumUninitialized(
+            DevelopmentProfileSampleCount
+        );
+        for (int32 ProfileIndex = 0;
+             ProfileIndex < DevelopmentProfileSampleCount;
+             ++ProfileIndex)
+        {
+            double LeftSum = 0.0;
+            double RightSum = 0.0;
+            double TotalWeight = 0.0;
+            const int32 FirstChainage = FMath::Max(
+                0,
+                Index - ProfileSmoothingRadius
+            );
+            const int32 LastChainage = FMath::Min(
+                AlignmentSamples.Num() - 1,
+                Index + ProfileSmoothingRadius
+            );
+            for (int32 Neighbor = FirstChainage;
+                 Neighbor <= LastChainage;
+                 ++Neighbor)
+            {
+                const double ChainageWeight = static_cast<double>(
+                    ProfileSmoothingRadius + 1
+                    - FMath::Abs(Neighbor - Index)
+                );
+                const int32 FirstLateral = FMath::Max(
+                    0,
+                    ProfileIndex - 1
+                );
+                const int32 LastLateral = FMath::Min(
+                    DevelopmentProfileSampleCount - 1,
+                    ProfileIndex + 1
+                );
+                for (int32 LateralNeighbor = FirstLateral;
+                     LateralNeighbor <= LastLateral;
+                     ++LateralNeighbor)
+                {
+                    const double LateralWeight = LateralNeighbor
+                            == ProfileIndex
+                        ? 2.0
+                        : 1.0;
+                    const double Weight = ChainageWeight * LateralWeight;
+                    LeftSum += AlignmentSamples[Neighbor]
+                        .LeftDevelopmentProfileZ[LateralNeighbor] * Weight;
+                    RightSum += AlignmentSamples[Neighbor]
+                        .RightDevelopmentProfileZ[LateralNeighbor] * Weight;
+                    TotalWeight += Weight;
+                }
+            }
+            SmoothedLeftProfiles[Index][ProfileIndex] =
+                static_cast<float>(LeftSum / FMath::Max(1.0, TotalWeight));
+            SmoothedRightProfiles[Index][ProfileIndex] =
+                static_cast<float>(RightSum / FMath::Max(1.0, TotalWeight));
+        }
+    }
+
+    // Pin both road-facing edges to the shared Spine datum, then walk outward
+    // independently on each side. Each band follows its smoothed natural
+    // height as far as the configured gentle cross-grade allows.
+    const float MaximumProfileStep = FMath::Max(
+        0.0f,
+        MaximumDevelopmentCrossGrade
+    ) * DevelopmentProfileStep;
+    for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
+    {
+        FSpineAlignmentSample& Sample = AlignmentSamples[Index];
+        Sample.LeftDevelopmentProfileZ[0] = Sample.RoadDatumZ;
+        Sample.RightDevelopmentProfileZ[0] = Sample.RoadDatumZ;
+        for (int32 ProfileIndex = 1;
+             ProfileIndex < DevelopmentProfileSampleCount;
+             ++ProfileIndex)
+        {
+            Sample.LeftDevelopmentProfileZ[ProfileIndex] = FMath::Clamp(
+                SmoothedLeftProfiles[Index][ProfileIndex],
+                Sample.LeftDevelopmentProfileZ[ProfileIndex - 1]
+                    - MaximumProfileStep,
+                Sample.LeftDevelopmentProfileZ[ProfileIndex - 1]
+                    + MaximumProfileStep
+            );
+            Sample.RightDevelopmentProfileZ[ProfileIndex] = FMath::Clamp(
+                SmoothedRightProfiles[Index][ProfileIndex],
+                Sample.RightDevelopmentProfileZ[ProfileIndex - 1]
+                    - MaximumProfileStep,
+                Sample.RightDevelopmentProfileZ[ProfileIndex - 1]
+                    + MaximumProfileStep
+            );
+        }
+    }
+
     LastMaximumCutDepth = 0.0f;
     LastMaximumFillHeight = 0.0f;
     LastStructureCandidateCount = 0;
     for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
     {
-        AlignmentSamples[Index].RoadDatumZ = SmoothedHeights[Index];
         AlignmentSamples[Index].EarthworkDelta =
             AlignmentSamples[Index].RoadDatumZ
             - AlignmentSamples[Index].NaturalTerrainZ;

@@ -15,8 +15,9 @@
   and exact station, block and infrastructure data for PCG.
 - `ASpineGenerator::SpineTerrainCorridor` grades the road reservation and the
   complete adjoining development footprint on that same Mesh Partition. It
-  gives parcel ground a gentle planned cross-slope, then blends back outside
-  the developed edge without creating overlapping ground.
+  pins adjoining frontages to the road datum, then follows independently
+  sampled, smoothed and slope-limited ground profiles on the two sides before
+  blending back outside the developed edge without creating overlapping ground.
 - PCG proposes the initial block geometry. A future versioned world-registry
   snapshot becomes authoritative once that layout is published.
 - `AParcelGenerator` is legacy terrain-analysis/visualisation code and must

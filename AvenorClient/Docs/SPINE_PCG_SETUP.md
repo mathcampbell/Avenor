@@ -29,13 +29,14 @@ one development row on each side and non-partitioned generation.
 
 The actor also owns `SpineTerrainCorridor`, a Mesh Terrain development-grading
 modifier. It does not create another terrain mesh. **Rebuild Terrain Alignment**
-samples the existing Mesh Terrain every 25 m at the centre and both development
-edges, smooths the result over 250 m, favours cutting over large embankments,
-and enforces the configured maximum road grade. The road reservation exactly
-matches that datum. Parcel ground then slopes gently toward the sampled land
-on each side before blending back outside the development edge. The same solved
-profile drives roads, stations, guideways and piers. The small solved profile is
-saved with the level; the larger disposable PCG placement arrays remain
+samples the existing Mesh Terrain every 25 m along the route and in 25 m bands
+across the complete development footprint. It smooths those lateral profiles,
+favours cutting over large embankments and enforces the configured road and
+cross grades. The road reservation and each adjoining frontage start on the
+shared datum; ground then follows the independently solved left or right
+profile, so one side can climb while the other descends. The same solved road
+profile drives roads, stations, guideways and piers. The solved ground profiles
+are saved with the level; the larger disposable PCG placement arrays remain
 transient.
 
 The binding district arithmetic is:
@@ -130,7 +131,9 @@ the station during editor generation; World Partition streams the baked actor.
    - cut bias: 0.65;
    - maximum grade: 0.04 / 4%;
    - flat half-width: 2,700 cm / 27 m;
-   - maximum development cross-grade: 0.03 / 3%;
+   - maximum development cross-grade: 0.06 / 6%;
+   - lateral profile sampling: 2,500 cm / 25 m;
+   - lateral profile smoothing: 10,000 cm / 100 m along the route;
    - outer blend distance: 12,000 cm / 120 m beyond the last parcel row.
 3. Use **Regenerate Complete Spine** after moving the guide spline or changing
    terrain. This solves the terrain corridor first and regenerates PCG from
