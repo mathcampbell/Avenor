@@ -2,9 +2,6 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#if WITH_EDITORONLY_DATA
-#include "MeshPartitionModifierComponent.h"
-#endif
 #include "SpineGenerator.generated.h"
 
 class UPCGComponent;
@@ -13,6 +10,14 @@ class USceneComponent;
 class USplineComponent;
 class ASpineGenerator;
 class UAvenorTerrainData;
+class UAvenorSpineTerrainModifier;
+
+namespace AvenorSpineEditorBridge
+{
+    /** Registered by AvenorEditor; absent in packaged game targets. */
+    extern AVENOR_API TFunction<bool(ASpineGenerator*)> BindTerrainModifier;
+    extern AVENOR_API TFunction<void(ASpineGenerator*)> ClearTerrainModifier;
+}
 
 /** One sample in the solved road-level vertical alignment. */
 USTRUCT(BlueprintType)
@@ -50,27 +55,6 @@ struct FSpineAlignmentSample
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     bool bTerrainHit = false;
 };
-
-/**
- * Development grading modifier owned by the Spine actor. It changes vertices
- * in the existing Mesh Terrain; it never creates a second terrain surface.
- */
-#if WITH_EDITORONLY_DATA
-UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
-class AVENOR_API UAvenorSpineTerrainModifier
-    : public UE::MeshPartition::UModifierComponent
-{
-    GENERATED_BODY()
-
-public:
-    virtual TArray<FBox> ComputeBounds() const override;
-    virtual TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
-        CreateBackgroundOp(
-            UE::MeshPartition::EBuildType BuildType
-        ) const override;
-    virtual FGuid GetCodeVersionKey() const override;
-};
-#endif
 
 /**
  * A station datum consumed by PCG through Get Actor Property.
@@ -313,9 +297,7 @@ public:
 private:
     static constexpr int32 BlocksPerDistrict = 9;
 
-#if WITH_EDITORONLY_DATA
     friend class UAvenorSpineTerrainModifier;
-#endif
 
     void GetBaseSplineFrameAtChainage(
         float Chainage,
@@ -380,13 +362,6 @@ private:
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor")
     TObjectPtr<USceneComponent> SceneRoot;
-
-#if WITH_EDITORONLY_DATA
-    /** Grades the road reservation, parcels and outer transition together. */
-    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Terrain",
-        meta = (AllowPrivateAccess = "true"))
-    TObjectPtr<UAvenorSpineTerrainModifier> TerrainCorridorModifier;
-#endif
 
     /** Edit this spline directly. Station 0 is an offset along it. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Spine",
