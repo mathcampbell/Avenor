@@ -15,7 +15,8 @@ instanced-mesh components. It owns the editable alignment and supplies PCG with:
 - `GreyboxSegments`;
 - `GuidewayPlacements`;
 - `MonorailPierPlacements`;
-- `MonorailSupportPlacements`.
+- `MonorailSupportPlacements`;
+- `StreetLampPlacements`.
 
 The station and block arrays contain stable IDs and world transforms. The
 greybox array contains disposable box transforms for the complete highway,
@@ -117,9 +118,44 @@ The production station may later wrap a regular Level Instance, or use a
 Packed Level Actor for a static shell plus a separate controller. PCG places
 the station during editor generation; World Partition streams the baked actor.
 
-### 4. Output and generation settings
+### 4. Street-lamp branch
 
-1. Gather the three branches and connect them to **Output**.
+1. Add **Get Actor Property**.
+2. Set Actor Selection to **Self** and Property Name to
+   `StreetLampPlacements`.
+3. Add **Attribute Set To Point** and map the struct's `Transform` attribute to
+   the point property `$Transform`.
+4. Add **Spawn Actor** and assign the reusable street-lamp Blueprint. Preserve
+   the incoming point transform; do not randomise rotation, translation or
+   scale.
+5. Connect this branch to the same final gather/output as the other Spine
+   infrastructure branches.
+
+The C++ data already supplies every placement. Do not add a Spline Sampler,
+Transform Points offset or density node to this branch. The default rules are:
+
+- 5,000 cm / 50 m spacing (half one 100 m parcel);
+- opposite road edges staggered by 2,500 cm / 25 m;
+- pole centre 50 cm beyond the carriageway edge;
+- both edges of both highway carriageways;
+- both edges of every longitudinal local road and cross-street;
+- 500 cm / 5 m clear of local junction approaches;
+- local +X of the Blueprint faces the road.
+
+If the Blueprint's lamp head points along +Y, set **Street Lamp Yaw Offset** on
+`SpineGenerator` to `-90`. Use `180` for -X or `90` for -Y. These settings are
+exposed under **Avenor | Street Lamps**, along with spacing, setback, junction
+clearance and a generation toggle.
+
+Using **Spawn Actor** is appropriate while validating the working Blueprint
+and its real light. At production extent, replace the always-live Blueprint
+lights with instanced lamp meshes plus distance-activated lights around
+occupied areas; tens of thousands of independently active light actors are not
+a viable VR target.
+
+### 5. Output and generation settings
+
+1. Gather the four branches and connect them to **Output**.
 2. Keep the Spine PCG component non-partitioned for the prototype.
 3. Do not enable runtime generation.
 4. Assign `PCG_Spine_Master` to `Infrastructure Graph` on `SpineGenerator`.
@@ -171,8 +207,8 @@ should read the tagged derived splines:
   pass clears existing generated road/block collision so it cannot be sampled
   as natural ground;
 - use `StationRecords` to place authored station variants;
-- run separate subgraphs for pavements, crossings, lights, signs, trees and
-  other dressing.
+- consume `StreetLampPlacements` in a dedicated lighting subgraph, and run
+  separate subgraphs for pavements, crossings, signs, trees and other dressing.
 
 Keep these as subgraphs under `PCG_Spine_Master`; do not build one unmaintainable
 wall of nodes.

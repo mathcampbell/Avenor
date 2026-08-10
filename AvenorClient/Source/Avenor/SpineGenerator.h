@@ -190,6 +190,41 @@ struct FSpineInfrastructurePlacement
 };
 
 /**
+ * Unit-scale placement for a street-lamp Blueprint. Local +X points from the
+ * pole toward the carriageway unless StreetLampYawOffset is used to compensate
+ * for a differently authored asset.
+ */
+USTRUCT(BlueprintType)
+struct FSpineStreetLampPlacement
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    FTransform Transform = FTransform::Identity;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    FName RoadKind;
+
+    /** Stable index within RoadKind; useful for future PCG filtering. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    int32 RoadIndex = 0;
+
+    /** -1/+1 identifies the negative or positive side of the Spine. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    int32 RoadSide = 0;
+
+    /** -1/+1 identifies which edge of that road owns the lamp. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    int32 EdgeSide = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    float Chainage = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Street Lamp")
+    float Lateral = 0.0f;
+};
+
+/**
  * Authoritative editor-time spatial definition for Avenor's developed Spine.
  *
  * This actor plans and exposes data; PCG constructs the visible infrastructure.
@@ -285,6 +320,17 @@ private:
     void RebuildStationAndBlockRecords();
     void RebuildGreyboxSegments();
     void RebuildMonorailPlacements();
+    void RebuildStreetLampPlacements();
+    void AddStreetLampPlacement(
+        FName RoadKind,
+        int32 RoadIndex,
+        int32 RoadSide,
+        int32 EdgeSide,
+        float Chainage,
+        float Lateral,
+        float RoadCentreChainage,
+        float RoadCentreLateral
+    );
     void AddDerivedSplinePoint(
         USplineComponent* Spline,
         float Chainage,
@@ -506,6 +552,32 @@ private:
         meta = (ClampMin = "1.0"))
     float RoadThickness = 20.0f;
 
+    /** Centre-to-centre lamp interval. 5,000 cm is half a 100 m parcel. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
+        meta = (Units = "cm", ClampMin = "500.0"))
+    float StreetLampSpacing = 5000.0f;
+
+    /** Pole-centre distance beyond each carriageway edge. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
+        meta = (Units = "cm", ClampMin = "0.0"))
+    float StreetLampSetback = 50.0f;
+
+    /** Keeps lamps away from the clear-road edge at local junctions. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
+        meta = (Units = "cm", ClampMin = "0.0"))
+    float StreetLampJunctionClearance = 500.0f;
+
+    /**
+     * Yaw correction for the spawned Blueprint. Zero means its local +X faces
+     * the road; use -90 for +Y, 180 for -X, or 90 for -Y.
+     */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
+        meta = (Units = "deg", ClampMin = "-180.0", ClampMax = "180.0"))
+    float StreetLampYawOffset = 0.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps")
+    bool bGenerateStreetLamps = true;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Monorail",
         meta = (ClampMin = "100.0"))
     float MonorailTrackCentreOffset = 620.0f;
@@ -575,6 +647,12 @@ private:
         Category = "Avenor|PCG Data",
         meta = (AllowPrivateAccess = "true"))
     TArray<FSpineInfrastructurePlacement> MonorailSupportPlacements;
+
+    /** Deterministic 50 m lamp points for every generated road edge. */
+    UPROPERTY(Transient, BlueprintReadOnly,
+        Category = "Avenor|PCG Data",
+        meta = (AllowPrivateAccess = "true"))
+    TArray<FSpineStreetLampPlacement> StreetLampPlacements;
 
     /** Cached road-level profile shared by terrain, roads and monorail. */
     UPROPERTY(BlueprintReadOnly,

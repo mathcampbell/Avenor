@@ -115,7 +115,8 @@ independent random terrain.
 
 ### Spine infrastructure graph
 
-- Read `GreyboxSegments`, `BlockRecords` and `StationRecords` from the
+- Read `GreyboxSegments`, `BlockRecords`, `StationRecords` and
+  `StreetLampPlacements` from the
   `SpineGenerator` with `Get Actor Property`.
 - Read the tagged derived highway and twin-guideway splines for production
   mesh generation. Never make opposite-direction trams share one guideway.

@@ -387,6 +387,7 @@ void ASpineGenerator::ClearGeneratedPlanningData()
     GuidewayPlacements.Reset();
     MonorailPierPlacements.Reset();
     MonorailSupportPlacements.Reset();
+    StreetLampPlacements.Reset();
 
     USplineComponent* Splines[] = {
         HighwayPositiveSpline,
@@ -410,17 +411,19 @@ void ASpineGenerator::RebuildLayoutData()
     RebuildStationAndBlockRecords();
     RebuildGreyboxSegments();
     RebuildMonorailPlacements();
+    RebuildStreetLampPlacements();
 
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor Spine: rebuilt %d stations, %d blocks, %d greybox segments, %d guideways, %d piers and %d supports."),
+        TEXT("Avenor Spine: rebuilt %d stations, %d blocks, %d greybox segments, %d guideways, %d piers, %d supports and %d street lamps."),
         StationRecords.Num(),
         BlockRecords.Num(),
         GreyboxSegments.Num(),
         GuidewayPlacements.Num(),
         MonorailPierPlacements.Num(),
-        MonorailSupportPlacements.Num()
+        MonorailSupportPlacements.Num(),
+        StreetLampPlacements.Num()
     );
 }
 
@@ -1816,6 +1819,256 @@ void ASpineGenerator::RebuildGreyboxSegments()
             RoadThickness,
             DistrictsAfterStationZero,
             Side
+        );
+    }
+}
+
+void ASpineGenerator::AddStreetLampPlacement(
+    FName RoadKind,
+    int32 RoadIndex,
+    int32 RoadSide,
+    int32 EdgeSide,
+    float Chainage,
+    float Lateral,
+    float RoadCentreChainage,
+    float RoadCentreLateral
+)
+{
+    const FVector Location = GetSpineLocationAtChainage(Chainage, Lateral);
+    const FVector RoadCentre = GetSpineLocationAtChainage(
+        RoadCentreChainage,
+        RoadCentreLateral
+    );
+    FVector Facing = RoadCentre - Location;
+    Facing.Z = 0.0f;
+    if (!Facing.Normalize())
+    {
+        return;
+    }
+
+    FRotator Rotation = Facing.Rotation();
+    Rotation.Yaw += StreetLampYawOffset;
+
+    FSpineStreetLampPlacement& Placement =
+        StreetLampPlacements.AddDefaulted_GetRef();
+    Placement.RoadKind = RoadKind;
+    Placement.RoadIndex = RoadIndex;
+    Placement.RoadSide = RoadSide;
+    Placement.EdgeSide = EdgeSide;
+    Placement.Chainage = Chainage;
+    Placement.Lateral = Lateral;
+    Placement.Transform = FTransform(
+        Rotation,
+        Location,
+        FVector::OneVector
+    );
+}
+
+void ASpineGenerator::RebuildStreetLampPlacements()
+{
+    StreetLampPlacements.Reset();
+    if (!bGenerateStreetLamps)
+    {
+        return;
+    }
+
+    const float Spacing = FMath::Max(500.0f, StreetLampSpacing);
+    const float Setback = FMath::Max(0.0f, StreetLampSetback);
+    const float JunctionClearance = FMath::Max(
+        0.0f,
+        StreetLampJunctionClearance
+    );
+    const float Start = GetMinimumChainage();
+    const float End = GetMaximumChainage();
+    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
+        + HighwayCarriagewayWidth * 0.5f;
+
+    // Both edges of both highway carriageways. Opposite edges are staggered
+    // by half an interval, while remaining anchored to the global chainage.
+    for (const int32 RoadSide : {-1, 1})
+    {
+        const float RoadCentreLateral = RoadSide * CarriagewayOffset;
+        for (const int32 EdgeSide : {-1, 1})
+        {
+            const float Lateral = RoadCentreLateral
+                + EdgeSide * (HighwayCarriagewayWidth * 0.5f + Setback);
+            const float Phase = EdgeSide > 0 ? Spacing * 0.5f : 0.0f;
+            float Chainage = Phase + Spacing * static_cast<float>(
+                FMath::CeilToInt((Start - Phase) / Spacing)
+            );
+            for (; Chainage <= End + KINDA_SMALL_NUMBER; Chainage += Spacing)
+            {
+                AddStreetLampPlacement(
+                    TEXT("Highway"),
+                    RoadSide,
+                    RoadSide,
+                    EdgeSide,
+                    Chainage,
+                    Lateral,
+                    Chainage,
+                    RoadCentreLateral
+                );
+            }
+        }
+    }
+
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    if (LocalStreetWidth <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    const float InnerLateral = SpineReservationWidth * 0.5f;
+
+    // Longitudinal local roads follow every parcel-row boundary. Generate in
+    // each exact 100 m clear block so lamp points never land in cross-streets.
+    for (const int32 RoadSide : {-1, 1})
+    {
+        for (int32 Boundary = 0;
+             Boundary <= DevelopmentRowsPerSide;
+             ++Boundary)
+        {
+            const float RoadCentreLateral = RoadSide * (
+                InnerLateral
+                + static_cast<float>(Boundary)
+                    * (BlockSize + LocalStreetWidth)
+            );
+            const int32 RoadIndex = RoadSide
+                * (Boundary + 1);
+
+            for (const int32 EdgeSide : {-1, 1})
+            {
+                const float Lateral = RoadCentreLateral
+                    + EdgeSide * (LocalStreetWidth * 0.5f + Setback);
+                const float Stagger = EdgeSide > 0
+                    ? Spacing * 0.5f
+                    : 0.0f;
+
+                for (int32 DistrictIndex = -DistrictsBeforeStationZero;
+                     DistrictIndex < DistrictsAfterStationZero;
+                     ++DistrictIndex)
+                {
+                    const float DistrictStart =
+                        static_cast<float>(DistrictIndex) * StationSpacing;
+                    for (int32 BayIndex = 0;
+                         BayIndex < BlocksPerDistrict;
+                         ++BayIndex)
+                    {
+                        const float ClearStart = DistrictStart
+                            + StationStreetWidth * 0.5f
+                            + BayIndex * (BlockSize + LocalStreetWidth);
+                        const float ClearEnd = ClearStart + BlockSize;
+                        for (float Chainage = ClearStart
+                                 + JunctionClearance + Stagger;
+                             Chainage <= ClearEnd - JunctionClearance
+                                 + KINDA_SMALL_NUMBER;
+                             Chainage += Spacing)
+                        {
+                            AddStreetLampPlacement(
+                                TEXT("LocalLongitudinal"),
+                                RoadIndex,
+                                RoadSide,
+                                EdgeSide,
+                                Chainage,
+                                Lateral,
+                                Chainage,
+                                RoadCentreLateral
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auto AddCrossStreet = [this, Spacing, Setback, JunctionClearance,
+                           LocalStreetWidth, InnerLateral](
+        FName RoadKind,
+        int32 RoadIndex,
+        int32 RoadSide,
+        float RoadCentreChainage,
+        float RoadWidth)
+    {
+        for (const int32 EdgeSide : {-1, 1})
+        {
+            const float Chainage = RoadCentreChainage
+                + EdgeSide * (RoadWidth * 0.5f + Setback);
+            const float Stagger = EdgeSide > 0
+                ? Spacing * 0.5f
+                : 0.0f;
+
+            for (int32 RowIndex = 0;
+                 RowIndex < DevelopmentRowsPerSide;
+                 ++RowIndex)
+            {
+                const float ClearStart = InnerLateral
+                    + LocalStreetWidth * 0.5f
+                    + RowIndex * (BlockSize + LocalStreetWidth);
+                const float ClearEnd = ClearStart + BlockSize;
+                for (float Distance = ClearStart
+                         + JunctionClearance + Stagger;
+                     Distance <= ClearEnd - JunctionClearance
+                         + KINDA_SMALL_NUMBER;
+                     Distance += Spacing)
+                {
+                    const float Lateral = RoadSide * Distance;
+                    AddStreetLampPlacement(
+                        RoadKind,
+                        RoadIndex,
+                        RoadSide,
+                        EdgeSide,
+                        Chainage,
+                        Lateral,
+                        RoadCentreChainage,
+                        Lateral
+                    );
+                }
+            }
+        }
+    };
+
+    // Cross-streets: the station road at every district boundary plus the
+    // eight smaller streets between its nine parcel bays.
+    for (int32 DistrictIndex = -DistrictsBeforeStationZero;
+         DistrictIndex < DistrictsAfterStationZero;
+         ++DistrictIndex)
+    {
+        const float DistrictStart =
+            static_cast<float>(DistrictIndex) * StationSpacing;
+        for (const int32 RoadSide : {-1, 1})
+        {
+            AddCrossStreet(
+                TEXT("StationStreet"),
+                DistrictIndex,
+                RoadSide,
+                DistrictStart,
+                StationStreetWidth
+            );
+            for (int32 StreetIndex = 1;
+                 StreetIndex < BlocksPerDistrict;
+                 ++StreetIndex)
+            {
+                AddCrossStreet(
+                    TEXT("LocalCrossStreet"),
+                    DistrictIndex * BlocksPerDistrict + StreetIndex,
+                    RoadSide,
+                    DistrictStart
+                        + GetInternalStreetCentreOffset(StreetIndex),
+                    LocalStreetWidth
+                );
+            }
+        }
+    }
+
+    const float TerminalChainage = GetMaximumChainage();
+    for (const int32 RoadSide : {-1, 1})
+    {
+        AddCrossStreet(
+            TEXT("StationStreet"),
+            DistrictsAfterStationZero,
+            RoadSide,
+            TerminalChainage,
+            StationStreetWidth
         );
     }
 }
