@@ -138,10 +138,38 @@ struct AVENOR_API FAvenorBakedSpineLayer
     bool HasValidData() const;
 };
 
-/** Per-operation cache; only base-height chunks actually sampled are expanded. */
+/** Values required to build one Mesh Terrain vertex from baked geography. */
+struct AVENOR_API FAvenorTerrainSample
+{
+    float Height = 0.0f;
+    float Slope = 0.0f;
+    float Accumulation = 0.0f;
+    float Mountain = 0.0f;
+    float Hill = 0.0f;
+    float Desert = 0.0f;
+    float Plains = 0.0f;
+};
+
+/** Expanded fields from one independently compressed terrain chunk. */
+struct AVENOR_API FAvenorTerrainSampleChunk
+{
+    FIntPoint StartCell = FIntPoint::ZeroValue;
+    FIntPoint CellCount = FIntPoint::ZeroValue;
+    TArray<float> Height;
+    TArray<float> Mountain;
+    TArray<float> Hill;
+    TArray<float> Desert;
+    TArray<float> Plains;
+    TArray<float> Accumulation;
+    TArray<float> Slope;
+};
+
+/** Per-operation cache; only chunks actually sampled are expanded. */
 struct AVENOR_API FAvenorTerrainHeightChunkCache
 {
-    TMap<FIntPoint, TArray<float>> HeightChunks;
+    TMap<FIntPoint, FAvenorTerrainSampleChunk> Chunks;
+    TArray<FBox2D> RiverBounds;
+    TArray<FBox2D> LakeBounds;
 };
 
 /**
@@ -240,9 +268,24 @@ public:
         FAvenorTerrainHeightChunkCache& Cache
     ) const;
 
+    bool SampleTerrain(
+        const FVector2D& WorldPosition,
+        FAvenorTerrainSample& OutSample,
+        FAvenorTerrainHeightChunkCache& Cache
+    ) const;
+
+    float SampleRiverWeight(
+        const FVector2D& WorldPosition,
+        FAvenorTerrainHeightChunkCache& Cache
+    ) const;
+    float SampleLakeWeight(
+        const FVector2D& WorldPosition,
+        FAvenorTerrainHeightChunkCache& Cache
+    ) const;
+
 private:
-    bool LoadHeightChunk(
+    bool LoadSampleChunk(
         const FIntPoint& ChunkCoordinate,
-        TArray<float>& OutHeights
+        FAvenorTerrainSampleChunk& OutChunk
     ) const;
 };

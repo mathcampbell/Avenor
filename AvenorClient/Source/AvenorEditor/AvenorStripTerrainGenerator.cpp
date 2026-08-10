@@ -35,6 +35,7 @@
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
 #include "UObject/Package.h"
+#include "UObject/StrongObjectPtr.h"
 
 #include <queue>
 #include <vector>
@@ -2738,44 +2739,55 @@ public:
     ) const override
     {
         (void)InstanceInfo;
-        if (!Data)
+        const UAvenorTerrainData* Data = TerrainData.Get();
+        if (!Data || !Data->HasValidData())
         {
             return;
         }
+        FAvenorTerrainHeightChunkCache ChunkCache;
         for (int32 Vertex = 0; Vertex < MeshView.VertexCount(); ++Vertex)
         {
             FVector3d WorldPosition = MeshTransform.TransformPosition(MeshView.GetVertexPos(Vertex));
             const FVector2D XY(WorldPosition.X, WorldPosition.Y);
-            const double SampledHeight = Data->SampleHeight(XY);
+            FAvenorTerrainSample Sample;
+            if (!Data->SampleTerrain(XY, Sample, ChunkCache))
+            {
+                continue;
+            }
+            const double SampledHeight = Sample.Height;
             WorldPosition.Z = BaseWorldZ + SampledHeight;
             MeshView.SetVertexPos(Vertex, MeshTransform.InverseTransformPosition(WorldPosition));
             MeshView.SetVertexAttributeWeight(
                 ElevationChannel,
                 Vertex,
                 static_cast<float>(FMath::Clamp(
-                    (SampledHeight - Data->Bounds.Min.Z) /
-                        FMath::Max(1.0, Data->Bounds.GetSize().Z),
+                    (SampledHeight - Data->WorldBounds.Min.Z) /
+                        FMath::Max(1.0, Data->WorldBounds.GetSize().Z),
                     0.0,
                     1.0
                 ))
             );
-            MeshView.SetVertexAttributeWeight(SlopeChannel, Vertex, Data->SampleChannel(SlopeChannel, XY));
-            MeshView.SetVertexAttributeWeight(WetnessChannel, Vertex, Data->SampleChannel(WetnessChannel, XY));
-            MeshView.SetVertexAttributeWeight(RiverChannel, Vertex, Data->SampleChannel(RiverChannel, XY));
-            MeshView.SetVertexAttributeWeight(LakeChannel, Vertex, Data->SampleChannel(LakeChannel, XY));
-            MeshView.SetVertexAttributeWeight(MountainChannel, Vertex, Data->SampleChannel(MountainChannel, XY));
-            MeshView.SetVertexAttributeWeight(HillChannel, Vertex, Data->SampleChannel(HillChannel, XY));
-            MeshView.SetVertexAttributeWeight(DesertChannel, Vertex, Data->SampleChannel(DesertChannel, XY));
-            MeshView.SetVertexAttributeWeight(PlainsChannel, Vertex, Data->SampleChannel(PlainsChannel, XY));
+            MeshView.SetVertexAttributeWeight(SlopeChannel, Vertex, FMath::Clamp(Sample.Slope / 0.35f, 0.0f, 1.0f));
+            MeshView.SetVertexAttributeWeight(WetnessChannel, Vertex, FMath::Clamp(FMath::Loge(1.0f + Sample.Accumulation) / 6.0f, 0.0f, 1.0f));
+            MeshView.SetVertexAttributeWeight(RiverChannel, Vertex, Data->SampleRiverWeight(XY, ChunkCache));
+            MeshView.SetVertexAttributeWeight(LakeChannel, Vertex, Data->SampleLakeWeight(XY, ChunkCache));
+            MeshView.SetVertexAttributeWeight(MountainChannel, Vertex, FMath::Clamp(Sample.Mountain, 0.0f, 1.0f));
+            MeshView.SetVertexAttributeWeight(HillChannel, Vertex, FMath::Clamp(Sample.Hill, 0.0f, 1.0f));
+            MeshView.SetVertexAttributeWeight(DesertChannel, Vertex, FMath::Clamp(Sample.Desert, 0.0f, 1.0f));
+            MeshView.SetVertexAttributeWeight(PlainsChannel, Vertex, FMath::Clamp(Sample.Plains, 0.0f, 1.0f));
         }
     }
 
-    virtual bool DisableDDCWrite() const override { return false; }
-    static FGuid Version() { return FGuid(TEXT("1b5d8f34-0798-4a24-845a-b4a35ce606e9")); }
+    virtual bool DisableDDCWrite() const override
+    {
+        const UAvenorTerrainData* Data = TerrainData.Get();
+        return !Data || !Data->HasValidData();
+    }
+    static FGuid Version() { return FGuid(TEXT("d8b7519f-8433-4e1c-98f2-6fde3bfe3041")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
-    TSharedPtr<const FAvenorStripData> Data;
+    TStrongObjectPtr<UAvenorTerrainData> TerrainData;
 };
 
 template<typename TWaterActor>
@@ -3030,7 +3042,15 @@ UAvenorStripTerrainModifier::CreateBackgroundOp(UE::MeshPartition::EBuildType Bu
     {
         Op->WorldBounds = Generator->GetGenerationBounds();
         Op->BaseWorldZ = Generator->GetActorLocation().Z;
-        Op->Data = Generator->GetOrCreateData();
+        Op->TerrainData.Reset(Generator->BakedTerrainData.LoadSynchronous());
+        if (!Op->TerrainData.IsValid() || !Op->TerrainData->HasValidData())
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Avenor terrain modifier: no valid Baked Terrain Data is available; provider-only sections will not be written to DDC.")
+            );
+        }
     }
     return Op;
 }

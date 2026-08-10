@@ -783,7 +783,7 @@ bool ASpineGenerator::SolveTerrainAlignment()
         TEXT("Avenor Spine: solved %d terrain-data samples at %.0f cm spacing from %d streamed chunks, %.1f%% maximum road grade; lateral profile rises %.1f m and falls %.1f m; maximum cut %.1f m, fill %.1f m, %d structure candidates."),
         AlignmentSamples.Num(),
         Step,
-        HeightCache.HeightChunks.Num(),
+        HeightCache.Chunks.Num(),
         MaximumRoadGrade * 100.0f,
         MaximumLateralRise / 100.0f,
         MaximumLateralFall / 100.0f,

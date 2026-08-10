@@ -48,9 +48,9 @@ bool UAvenorTerrainData::HasValidData() const
         && Chunks.Num() == ExpectedChunkCount;
 }
 
-bool UAvenorTerrainData::LoadHeightChunk(
+bool UAvenorTerrainData::LoadSampleChunk(
     const FIntPoint& ChunkCoordinate,
-    TArray<float>& OutHeights
+    FAvenorTerrainSampleChunk& OutChunk
 ) const
 {
     const FAvenorTerrainDataChunk* Chunk = Chunks.FindByPredicate(
@@ -69,16 +69,60 @@ bool UAvenorTerrainData::LoadHeightChunk(
     int32 Version = 0;
     Archive << Magic;
     Archive << Version;
-    Archive << OutHeights;
+    if (Archive.GetError() || Magic != TerrainChunkMagic
+        || Version != TerrainChunkPayloadVersion)
+    {
+        return false;
+    }
+
+    TArray<float> DiscardFloat;
+    TArray<int32> DiscardInt;
+    Archive << OutChunk.Height;
+    Archive << DiscardFloat; // Resistance
+    Archive << OutChunk.Mountain;
+    Archive << OutChunk.Hill;
+    Archive << OutChunk.Desert;
+    Archive << OutChunk.Plains;
+    Archive << DiscardFloat; // FilledHeight
+    Archive << OutChunk.Accumulation;
+    Archive << OutChunk.Slope;
+    Archive << DiscardInt;   // ReceiverA
+    Archive << DiscardInt;   // ReceiverB
+    Archive << DiscardFloat; // ReceiverWeightA
+    Archive << DiscardInt;   // FillParent
+    Archive << DiscardInt;   // LakeIndex
+
+    OutChunk.StartCell = Chunk->StartCell;
+    OutChunk.CellCount = Chunk->CellCount;
+    const int32 Expected = Chunk->CellCount.X * Chunk->CellCount.Y;
     return !Archive.GetError()
-        && Magic == TerrainChunkMagic
-        && Version == TerrainChunkPayloadVersion
-        && OutHeights.Num() == Chunk->CellCount.X * Chunk->CellCount.Y;
+        && OutChunk.Height.Num() == Expected
+        && OutChunk.Mountain.Num() == Expected
+        && OutChunk.Hill.Num() == Expected
+        && OutChunk.Desert.Num() == Expected
+        && OutChunk.Plains.Num() == Expected
+        && OutChunk.Accumulation.Num() == Expected
+        && OutChunk.Slope.Num() == Expected;
 }
 
 bool UAvenorTerrainData::SampleBaseHeight(
     const FVector2D& WorldPosition,
     float& OutHeight,
+    FAvenorTerrainHeightChunkCache& Cache
+) const
+{
+    FAvenorTerrainSample Sample;
+    if (!SampleTerrain(WorldPosition, Sample, Cache))
+    {
+        return false;
+    }
+    OutHeight = Sample.Height;
+    return true;
+}
+
+bool UAvenorTerrainData::SampleTerrain(
+    const FVector2D& WorldPosition,
+    FAvenorTerrainSample& OutSample,
     FAvenorTerrainHeightChunkCache& Cache
 ) const
 {
@@ -98,55 +142,156 @@ bool UAvenorTerrainData::SampleBaseHeight(
     const int32 X1 = FMath::Min(X0 + 1, Columns - 1);
     const int32 Y1 = FMath::Min(Y0 + 1, Rows - 1);
 
-    auto ReadCell = [&](int32 X, int32 Y, float& Value)
+    auto ReadCell = [&](int32 X, int32 Y, FAvenorTerrainSample& Value)
     {
         const FIntPoint Coordinate(X / ChunkCellSize, Y / ChunkCellSize);
-        TArray<float>* Heights = Cache.HeightChunks.Find(Coordinate);
-        if (!Heights)
+        FAvenorTerrainSampleChunk* SampleChunk = Cache.Chunks.Find(Coordinate);
+        if (!SampleChunk)
         {
-            TArray<float> Loaded;
-            if (!LoadHeightChunk(Coordinate, Loaded))
+            FAvenorTerrainSampleChunk Loaded;
+            if (!LoadSampleChunk(Coordinate, Loaded))
             {
                 return false;
             }
-            Heights = &Cache.HeightChunks.Add(Coordinate, MoveTemp(Loaded));
+            SampleChunk = &Cache.Chunks.Add(Coordinate, MoveTemp(Loaded));
         }
-        const FAvenorTerrainDataChunk* Chunk = Chunks.FindByPredicate(
-            [&Coordinate](const FAvenorTerrainDataChunk& Candidate)
-            {
-                return Candidate.ChunkCoordinate == Coordinate;
-            }
-        );
-        if (!Chunk)
+        const int32 LocalX = X - SampleChunk->StartCell.X;
+        const int32 LocalY = Y - SampleChunk->StartCell.Y;
+        const int32 LocalIndex = LocalY * SampleChunk->CellCount.X + LocalX;
+        if (!SampleChunk->Height.IsValidIndex(LocalIndex))
         {
             return false;
         }
-        const int32 LocalX = X - Chunk->StartCell.X;
-        const int32 LocalY = Y - Chunk->StartCell.Y;
-        const int32 LocalIndex = LocalY * Chunk->CellCount.X + LocalX;
-        if (!Heights->IsValidIndex(LocalIndex))
-        {
-            return false;
-        }
-        Value = (*Heights)[LocalIndex];
+        Value.Height = SampleChunk->Height[LocalIndex];
+        Value.Mountain = SampleChunk->Mountain[LocalIndex];
+        Value.Hill = SampleChunk->Hill[LocalIndex];
+        Value.Desert = SampleChunk->Desert[LocalIndex];
+        Value.Plains = SampleChunk->Plains[LocalIndex];
+        Value.Accumulation = SampleChunk->Accumulation[LocalIndex];
+        Value.Slope = SampleChunk->Slope[LocalIndex];
         return true;
     };
 
-    float H00 = 0.0f;
-    float H10 = 0.0f;
-    float H01 = 0.0f;
-    float H11 = 0.0f;
-    if (!ReadCell(X0, Y0, H00) || !ReadCell(X1, Y0, H10)
-        || !ReadCell(X0, Y1, H01) || !ReadCell(X1, Y1, H11))
+    FAvenorTerrainSample S00;
+    FAvenorTerrainSample S10;
+    FAvenorTerrainSample S01;
+    FAvenorTerrainSample S11;
+    if (!ReadCell(X0, Y0, S00) || !ReadCell(X1, Y0, S10)
+        || !ReadCell(X0, Y1, S01) || !ReadCell(X1, Y1, S11))
     {
         return false;
     }
     const float AlphaX = static_cast<float>(FMath::Clamp(GridX - X0, 0.0, 1.0));
     const float AlphaY = static_cast<float>(FMath::Clamp(GridY - Y0, 0.0, 1.0));
-    OutHeight = FMath::Lerp(
-        FMath::Lerp(H00, H10, AlphaX),
-        FMath::Lerp(H01, H11, AlphaX),
-        AlphaY
-    );
+    auto Bilinear = [AlphaX, AlphaY](float V00, float V10, float V01, float V11)
+    {
+        return FMath::Lerp(
+            FMath::Lerp(V00, V10, AlphaX),
+            FMath::Lerp(V01, V11, AlphaX),
+            AlphaY
+        );
+    };
+    OutSample.Height = Bilinear(S00.Height, S10.Height, S01.Height, S11.Height);
+    OutSample.Mountain = Bilinear(S00.Mountain, S10.Mountain, S01.Mountain, S11.Mountain);
+    OutSample.Hill = Bilinear(S00.Hill, S10.Hill, S01.Hill, S11.Hill);
+    OutSample.Desert = Bilinear(S00.Desert, S10.Desert, S01.Desert, S11.Desert);
+    OutSample.Plains = Bilinear(S00.Plains, S10.Plains, S01.Plains, S11.Plains);
+    OutSample.Accumulation = Bilinear(S00.Accumulation, S10.Accumulation, S01.Accumulation, S11.Accumulation);
+    OutSample.Slope = Bilinear(S00.Slope, S10.Slope, S01.Slope, S11.Slope);
     return true;
+}
+
+float UAvenorTerrainData::SampleRiverWeight(
+    const FVector2D& WorldPosition,
+    FAvenorTerrainHeightChunkCache& Cache
+) const
+{
+    if (Cache.RiverBounds.Num() != Rivers.Num())
+    {
+        Cache.RiverBounds.Reset(Rivers.Num());
+        for (const FAvenorBakedRiverReach& River : Rivers)
+        {
+            FBox2D Bounds(ForceInit);
+            for (const FVector& Point : River.Points)
+            {
+                Bounds += FVector2D(Point);
+            }
+            Cache.RiverBounds.Add(Bounds.ExpandBy(River.ValleyHalfWidth));
+        }
+    }
+    float Weight = 0.0f;
+    for (int32 RiverIndex = 0; RiverIndex < Rivers.Num(); ++RiverIndex)
+    {
+        if (!Cache.RiverBounds[RiverIndex].IsInside(WorldPosition))
+        {
+            continue;
+        }
+        const FAvenorBakedRiverReach& River = Rivers[RiverIndex];
+        for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
+        {
+            const FVector2D A(River.Points[Index]);
+            const FVector2D B(River.Points[Index + 1]);
+            const FVector2D Segment = B - A;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(WorldPosition - A, Segment)
+                    / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
+            if (Distance <= River.ValleyHalfWidth)
+            {
+                Weight = FMath::Max(
+                    Weight,
+                    static_cast<float>(1.0 - Distance / River.ValleyHalfWidth)
+                );
+            }
+        }
+    }
+    return Weight;
+}
+
+float UAvenorTerrainData::SampleLakeWeight(
+    const FVector2D& WorldPosition,
+    FAvenorTerrainHeightChunkCache& Cache
+) const
+{
+    if (Cache.LakeBounds.Num() != Lakes.Num())
+    {
+        Cache.LakeBounds.Reset(Lakes.Num());
+        for (const FAvenorBakedLakeBasin& Lake : Lakes)
+        {
+            FBox2D Bounds(ForceInit);
+            for (const FVector& Point : Lake.Shoreline)
+            {
+                Bounds += FVector2D(Point);
+            }
+            Cache.LakeBounds.Add(Bounds);
+        }
+    }
+    for (int32 LakeIndex = 0; LakeIndex < Lakes.Num(); ++LakeIndex)
+    {
+        if (!Cache.LakeBounds[LakeIndex].IsInside(WorldPosition))
+        {
+            continue;
+        }
+        const FAvenorBakedLakeBasin& Lake = Lakes[LakeIndex];
+        bool bInside = false;
+        for (int32 Index = 0, Previous = Lake.Shoreline.Num() - 1;
+             Index < Lake.Shoreline.Num(); Previous = Index++)
+        {
+            const FVector& A = Lake.Shoreline[Index];
+            const FVector& B = Lake.Shoreline[Previous];
+            const bool bCrosses = (A.Y > WorldPosition.Y) != (B.Y > WorldPosition.Y);
+            if (bCrosses && WorldPosition.X < (B.X - A.X)
+                    * (WorldPosition.Y - A.Y) / (B.Y - A.Y) + A.X)
+            {
+                bInside = !bInside;
+            }
+        }
+        if (bInside)
+        {
+            return 1.0f;
+        }
+    }
+    return 0.0f;
 }
