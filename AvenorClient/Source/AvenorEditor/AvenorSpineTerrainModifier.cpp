@@ -208,8 +208,8 @@ TArray<FBox> UAvenorSpineTerrainModifier::ComputeBounds() const
 {
     const ASpineGenerator* Spine = Cast<ASpineGenerator>(GetOwner());
     if (!Spine) return {};
-    const FBox Bounds = Spine->GetTerrainCorridorBounds();
-    return Bounds.IsValid ? TArray<FBox>{Bounds} : TArray<FBox>{};
+    const FBox CorridorBounds = Spine->GetTerrainCorridorBounds();
+    return CorridorBounds.IsValid ? TArray<FBox>{CorridorBounds} : TArray<FBox>{};
 }
 
 TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
