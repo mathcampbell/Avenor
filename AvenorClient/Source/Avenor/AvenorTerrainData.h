@@ -89,6 +89,61 @@ struct AVENOR_API FAvenorBakedLakeBasin
     double DepthRampWidth = 7500.0;
 };
 
+/** One world-space sample in the engineered Spine terrain layer. */
+USTRUCT(BlueprintType)
+struct AVENOR_API FAvenorBakedSpineSample
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    FVector2D Centre = FVector2D::ZeroVector;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float Chainage = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float NaturalTerrainZ = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float RoadDatumZ = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    TArray<float> LeftDevelopmentProfileZ;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    TArray<float> RightDevelopmentProfileZ;
+};
+
+/** Independently replaceable engineered layer stored beside base geography. */
+USTRUCT(BlueprintType)
+struct AVENOR_API FAvenorBakedSpineLayer
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    FDateTime GeneratedAtUtc;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float FlatHalfWidth = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float DevelopmentHalfWidth = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    float TransitionHalfWidth = 0.0f;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    TArray<FAvenorBakedSpineSample> Samples;
+
+    bool HasValidData() const;
+};
+
+/** Per-operation cache; only base-height chunks actually sampled are expanded. */
+struct AVENOR_API FAvenorTerrainHeightChunkCache
+{
+    TMap<FIntPoint, TArray<float>> HeightChunks;
+};
+
 /**
  * Durable, engine-independent source geography for an Avenor strip region.
  * Mesh Terrain geometry and Water Body actors are derived output from this
@@ -147,6 +202,9 @@ public:
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Hydrology")
     TArray<FVector> OceanBoundary;
 
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|Layers|Spine")
+    FAvenorBakedSpineLayer SpineLayer;
+
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Statistics")
     int32 RequestedMountainRanges = 0;
 
@@ -175,4 +233,16 @@ public:
     int32 AcceptedOptionalLakes = 0;
 
     bool HasValidData() const;
+
+    bool SampleBaseHeight(
+        const FVector2D& WorldPosition,
+        float& OutHeight,
+        FAvenorTerrainHeightChunkCache& Cache
+    ) const;
+
+private:
+    bool LoadHeightChunk(
+        const FIntPoint& ChunkCoordinate,
+        TArray<float>& OutHeights
+    ) const;
 };

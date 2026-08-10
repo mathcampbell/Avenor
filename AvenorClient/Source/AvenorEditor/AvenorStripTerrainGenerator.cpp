@@ -3242,6 +3242,9 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
     Asset->CellSize = Data->CellSize;
     Asset->ChunkCellSize = FMath::Clamp(BakedChunkCellSize, 16, 512);
     Asset->Chunks.Reset();
+    // Base geography changed, so any engineered layer solved from the old
+    // heights is deliberately invalidated and must be regenerated.
+    Asset->SpineLayer = FAvenorBakedSpineLayer();
 
     const int32 ChunkColumns = FMath::DivideAndRoundUp(Data->Columns, Asset->ChunkCellSize);
     const int32 ChunkRows = FMath::DivideAndRoundUp(Data->Rows, Asset->ChunkCellSize);

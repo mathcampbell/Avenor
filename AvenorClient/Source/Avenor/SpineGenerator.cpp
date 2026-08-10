@@ -1,5 +1,7 @@
 #include "SpineGenerator.h"
 
+#include "AvenorTerrainData.h"
+
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
 #include "Engine/World.h"
@@ -239,31 +241,21 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
         return Op;
     }
 
-    Op->WorldBounds = Spine->GetTerrainCorridorBounds();
-    Op->FlatHalfWidth = FMath::Max(
-        0.0f,
-        Spine->GetDevelopmentProfileStartLateral()
-    );
-    Op->DevelopmentHalfWidth = FMath::Max(
-        Op->FlatHalfWidth + 1.0,
-        static_cast<double>(Spine->GetDevelopmentOuterLateral())
-    );
-    Op->TransitionHalfWidth = Op->DevelopmentHalfWidth + FMath::Max(
-        100.0,
-        static_cast<double>(Spine->CorridorTransitionHalfWidth)
-    );
-    Op->Samples.Reserve(Spine->AlignmentSamples.Num());
-    for (const FSpineAlignmentSample& Sample : Spine->AlignmentSamples)
+    const UAvenorTerrainData* Data = Spine->TerrainData.LoadSynchronous();
+    if (!Data || !Data->SpineLayer.HasValidData())
     {
-        FVector Location;
-        FVector Forward;
-        Spine->GetBaseSplineFrameAtChainage(
-            Sample.Chainage,
-            Location,
-            Forward
-        );
+        return Op;
+    }
+    const FAvenorBakedSpineLayer& Layer = Data->SpineLayer;
+    Op->WorldBounds = Spine->GetTerrainCorridorBounds();
+    Op->FlatHalfWidth = Layer.FlatHalfWidth;
+    Op->DevelopmentHalfWidth = Layer.DevelopmentHalfWidth;
+    Op->TransitionHalfWidth = Layer.TransitionHalfWidth;
+    Op->Samples.Reserve(Layer.Samples.Num());
+    for (const FAvenorBakedSpineSample& Sample : Layer.Samples)
+    {
         FCorridorSample& OpSample = Op->Samples.AddDefaulted_GetRef();
-        OpSample.Centre = FVector2D(Location.X, Location.Y);
+        OpSample.Centre = Sample.Centre;
         OpSample.RoadDatumZ = Sample.RoadDatumZ;
         OpSample.LeftDevelopmentProfileZ.Reserve(
             Sample.LeftDevelopmentProfileZ.Num()
@@ -285,7 +277,7 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(
 
 FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
-    return FGuid(TEXT("3d1e239d-7b66-4b7c-a7ea-822ed9f61287"));
+    return FGuid(TEXT("b77c6f45-74aa-44d8-970f-88008079a204"));
 }
 #endif
 
@@ -376,6 +368,7 @@ void ASpineGenerator::PostLoad()
     if (!HasAnyFlags(RF_ClassDefaultObject))
     {
         ClearGeneratedPlanningData();
+        LoadTerrainAlignmentLayer();
     }
 }
 
@@ -453,15 +446,13 @@ bool ASpineGenerator::SolveTerrainAlignment()
     LastMaximumCutDepth = 0.0f;
     LastMaximumFillHeight = 0.0f;
     LastStructureCandidateCount = 0;
-    UWorld* World = GetWorld();
-    UE::MeshPartition::AMeshPartition* TargetMeshPartition =
-        Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
-    if (!World || !TargetMeshPartition)
+    const UAvenorTerrainData* Data = TerrainData.LoadSynchronous();
+    if (!Data || !Data->HasValidData())
     {
         UE_LOG(
             LogTemp,
             Error,
-            TEXT("Avenor Spine: assign the existing Mesh Partition actor before solving terrain alignment.")
+            TEXT("Avenor Spine: assign the same valid Terrain Data asset used by the terrain generator.")
         );
         return false;
     }
@@ -494,14 +485,7 @@ bool ASpineGenerator::SolveTerrainAlignment()
     const float DevelopmentProfileStep = DevelopmentProfileWidth
         / static_cast<float>(DevelopmentProfileIntervalCount);
 
-    FCollisionQueryParams QueryParams(
-        SCENE_QUERY_STAT(AvenorSpineTerrainSample),
-        true
-    );
-    QueryParams.AddIgnoredActor(this);
-
-    int32 ValidHits = 0;
-    int32 FallbackHits = 0;
+    FAvenorTerrainHeightChunkCache HeightCache;
     for (int32 Index = 0; Index < SampleCount; ++Index)
     {
         const float Chainage = Index == SampleCount - 1
@@ -515,63 +499,20 @@ bool ASpineGenerator::SolveTerrainAlignment()
             BaseForward
         );
 
-        auto TraceTerrain = [&](const FVector& TraceLocation,
-                                float& OutTerrainZ,
-                                bool& bOutUsedFallback)
-        {
-            const FVector TraceStart = TraceLocation
-                + FVector::UpVector * TerrainTraceHalfHeight;
-            const FVector TraceEnd = TraceLocation
-                - FVector::UpVector * TerrainTraceHalfHeight;
-            TArray<FHitResult> Hits;
-            World->LineTraceMultiByChannel(
-                Hits,
-                TraceStart,
-                TraceEnd,
-                TerrainTraceChannel,
-                QueryParams
-            );
-
-            const FHitResult* ChosenHit = nullptr;
-            for (const FHitResult& Hit : Hits)
-            {
-                for (AActor* Candidate = Hit.GetActor();
-                     Candidate;
-                     Candidate = Candidate->GetAttachParentActor())
-                {
-                    if (Candidate == TargetMeshPartition)
-                    {
-                        ChosenHit = &Hit;
-                        break;
-                    }
-                }
-                if (ChosenHit)
-                {
-                    break;
-                }
-            }
-            bOutUsedFallback = !ChosenHit && Hits.Num() > 0;
-            if (bOutUsedFallback)
-            {
-                // Generated partition collision may be owned by proxy actors.
-                ChosenHit = &Hits[0];
-            }
-            OutTerrainZ = ChosenHit
-                ? static_cast<float>(ChosenHit->ImpactPoint.Z)
-                : TraceLocation.Z;
-            return ChosenHit != nullptr;
-        };
-
         FSpineAlignmentSample& Sample =
             AlignmentSamples.AddDefaulted_GetRef();
         Sample.Chainage = Chainage;
-        bool bCentreFallback = false;
-        Sample.bTerrainHit = TraceTerrain(
-            BaseLocation,
-            Sample.NaturalTerrainZ,
-            bCentreFallback
+        Sample.bTerrainHit = Data->SampleBaseHeight(
+            FVector2D(BaseLocation), Sample.NaturalTerrainZ, HeightCache
         );
-        FallbackHits += bCentreFallback ? 1 : 0;
+        if (!Sample.bTerrainHit)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("Avenor Spine: guide sample at %.0f cm is outside or unreadable in Terrain Data."),
+                Chainage);
+            AlignmentSamples.Reset();
+            return false;
+        }
 
         const FVector BaseRight = FVector::CrossProduct(
             FVector::UpVector,
@@ -589,92 +530,28 @@ bool ASpineGenerator::SolveTerrainAlignment()
         {
             const float Lateral = DevelopmentProfileStart
                 + DevelopmentProfileStep * ProfileIndex;
-            bool bProfileFallback = false;
-            if (!TraceTerrain(
-                    BaseLocation - BaseRight * Lateral,
-                    Sample.LeftDevelopmentProfileZ[ProfileIndex],
-                    bProfileFallback
-                ))
+            if (!Data->SampleBaseHeight(
+                    FVector2D(BaseLocation - BaseRight * Lateral),
+                    Sample.LeftDevelopmentProfileZ[ProfileIndex], HeightCache))
             {
-                Sample.LeftDevelopmentProfileZ[ProfileIndex] =
-                    Sample.NaturalTerrainZ;
+                UE_LOG(LogTemp, Error,
+                    TEXT("Avenor Spine: left development sample at %.0f cm is outside or unreadable in Terrain Data."),
+                    Chainage);
+                AlignmentSamples.Reset();
+                return false;
             }
-            if (!TraceTerrain(
-                    BaseLocation + BaseRight * Lateral,
-                    Sample.RightDevelopmentProfileZ[ProfileIndex],
-                    bProfileFallback
-                ))
+            if (!Data->SampleBaseHeight(
+                    FVector2D(BaseLocation + BaseRight * Lateral),
+                    Sample.RightDevelopmentProfileZ[ProfileIndex], HeightCache))
             {
-                Sample.RightDevelopmentProfileZ[ProfileIndex] =
-                    Sample.NaturalTerrainZ;
+                UE_LOG(LogTemp, Error,
+                    TEXT("Avenor Spine: right development sample at %.0f cm is outside or unreadable in Terrain Data."),
+                    Chainage);
+                AlignmentSamples.Reset();
+                return false;
             }
         }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
-        ValidHits += Sample.bTerrainHit ? 1 : 0;
-    }
-
-    if (ValidHits == 0)
-    {
-        AlignmentSamples.Reset();
-        UE_LOG(
-            LogTemp,
-            Error,
-            TEXT("Avenor Spine: terrain sampling found no collision. Enable collision on Mesh Terrain and rebuild it first.")
-        );
-        return false;
-    }
-
-    // Fill isolated misses by interpolating the nearest valid terrain samples.
-    for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
-    {
-        if (AlignmentSamples[Index].bTerrainHit)
-        {
-            continue;
-        }
-        int32 Left = Index - 1;
-        while (Left >= 0 && !AlignmentSamples[Left].bTerrainHit)
-        {
-            --Left;
-        }
-        int32 Right = Index + 1;
-        while (Right < AlignmentSamples.Num()
-            && !AlignmentSamples[Right].bTerrainHit)
-        {
-            ++Right;
-        }
-
-        float FilledZ = AlignmentSamples[Index].NaturalTerrainZ;
-        if (Left >= 0 && Right < AlignmentSamples.Num())
-        {
-            const float Alpha = FMath::GetRangePct(
-                AlignmentSamples[Left].Chainage,
-                AlignmentSamples[Right].Chainage,
-                AlignmentSamples[Index].Chainage
-            );
-            FilledZ = FMath::Lerp(
-                AlignmentSamples[Left].NaturalTerrainZ,
-                AlignmentSamples[Right].NaturalTerrainZ,
-                Alpha
-            );
-        }
-        else if (Left >= 0)
-        {
-            FilledZ = AlignmentSamples[Left].NaturalTerrainZ;
-        }
-        else if (Right < AlignmentSamples.Num())
-        {
-            FilledZ = AlignmentSamples[Right].NaturalTerrainZ;
-        }
-        AlignmentSamples[Index].NaturalTerrainZ = FilledZ;
-        AlignmentSamples[Index].LeftDevelopmentProfileZ.Init(
-            FilledZ,
-            DevelopmentProfileSampleCount
-        );
-        AlignmentSamples[Index].RightDevelopmentProfileZ.Init(
-            FilledZ,
-            DevelopmentProfileSampleCount
-        );
-        AlignmentSamples[Index].RoadDatumZ = FilledZ + RoadDatumOffset;
     }
 
     TArray<float> SmoothedHeights;
@@ -903,11 +780,10 @@ bool ASpineGenerator::SolveTerrainAlignment()
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor Spine: solved %d terrain samples at %.0f cm spacing (%d direct/proxy hits, %d proxy fallbacks), %.1f%% maximum road grade; lateral profile rises %.1f m and falls %.1f m; maximum cut %.1f m, fill %.1f m, %d structure candidates."),
+        TEXT("Avenor Spine: solved %d terrain-data samples at %.0f cm spacing from %d streamed chunks, %.1f%% maximum road grade; lateral profile rises %.1f m and falls %.1f m; maximum cut %.1f m, fill %.1f m, %d structure candidates."),
         AlignmentSamples.Num(),
         Step,
-        ValidHits - FallbackHits,
-        FallbackHits,
+        HeightCache.HeightChunks.Num(),
         MaximumRoadGrade * 100.0f,
         MaximumLateralRise / 100.0f,
         MaximumLateralFall / 100.0f,
@@ -916,6 +792,59 @@ bool ASpineGenerator::SolveTerrainAlignment()
         LastStructureCandidateCount
     );
     return true;
+}
+
+bool ASpineGenerator::StoreTerrainAlignmentLayer()
+{
+    UAvenorTerrainData* Data = TerrainData.LoadSynchronous();
+    if (!Data || AlignmentSamples.Num() < 2)
+    {
+        return false;
+    }
+    Data->Modify();
+    FAvenorBakedSpineLayer& Layer = Data->SpineLayer;
+    Layer.GeneratedAtUtc = FDateTime::UtcNow();
+    Layer.FlatHalfWidth = GetDevelopmentProfileStartLateral();
+    Layer.DevelopmentHalfWidth = GetDevelopmentOuterLateral();
+    Layer.TransitionHalfWidth = Layer.DevelopmentHalfWidth
+        + FMath::Max(100.0f, CorridorTransitionHalfWidth);
+    Layer.Samples.Reset(AlignmentSamples.Num());
+    for (const FSpineAlignmentSample& Source : AlignmentSamples)
+    {
+        FVector Location;
+        FVector Forward;
+        GetBaseSplineFrameAtChainage(Source.Chainage, Location, Forward);
+        FAvenorBakedSpineSample& Target = Layer.Samples.AddDefaulted_GetRef();
+        Target.Centre = FVector2D(Location);
+        Target.Chainage = Source.Chainage;
+        Target.NaturalTerrainZ = Source.NaturalTerrainZ;
+        Target.RoadDatumZ = Source.RoadDatumZ;
+        Target.LeftDevelopmentProfileZ = Source.LeftDevelopmentProfileZ;
+        Target.RightDevelopmentProfileZ = Source.RightDevelopmentProfileZ;
+    }
+    Data->MarkPackageDirty();
+    return Layer.HasValidData();
+}
+
+void ASpineGenerator::LoadTerrainAlignmentLayer()
+{
+    const UAvenorTerrainData* Data = TerrainData.LoadSynchronous();
+    if (!Data || !Data->SpineLayer.HasValidData())
+    {
+        return;
+    }
+    AlignmentSamples.Reset(Data->SpineLayer.Samples.Num());
+    for (const FAvenorBakedSpineSample& Source : Data->SpineLayer.Samples)
+    {
+        FSpineAlignmentSample& Target = AlignmentSamples.AddDefaulted_GetRef();
+        Target.Chainage = Source.Chainage;
+        Target.NaturalTerrainZ = Source.NaturalTerrainZ;
+        Target.RoadDatumZ = Source.RoadDatumZ;
+        Target.EarthworkDelta = Source.RoadDatumZ - Source.NaturalTerrainZ;
+        Target.LeftDevelopmentProfileZ = Source.LeftDevelopmentProfileZ;
+        Target.RightDevelopmentProfileZ = Source.RightDevelopmentProfileZ;
+        Target.bTerrainHit = true;
+    }
 }
 
 bool ASpineGenerator::BindTerrainModifier()
@@ -963,15 +892,15 @@ void ASpineGenerator::RebuildTerrainAlignment()
 {
 #if WITH_EDITOR
     Modify();
-    // Generated block and road collision sits above Mesh Terrain and must not
-    // be mistaken for natural ground by the alignment traces. The complete
-    // regeneration path recreates it immediately after grading.
-    if (InfrastructurePCG)
-    {
-        InfrastructurePCG->CleanupLocal(true);
-    }
     if (!SolveTerrainAlignment())
     {
+        return;
+    }
+    if (!StoreTerrainAlignmentLayer())
+    {
+        AlignmentSamples.Reset();
+        UE_LOG(LogTemp, Error,
+            TEXT("Avenor Spine: could not store the solved Spine layer in Terrain Data."));
         return;
     }
     if (!BindTerrainModifier())
@@ -1016,6 +945,12 @@ void ASpineGenerator::ClearTerrainAlignment()
         TerrainCorridorModifier->PostEditChange();
     }
     AlignmentSamples.Reset();
+    if (UAvenorTerrainData* Data = TerrainData.LoadSynchronous())
+    {
+        Data->Modify();
+        Data->SpineLayer = FAvenorBakedSpineLayer();
+        Data->MarkPackageDirty();
+    }
     LastMaximumCutDepth = 0.0f;
     LastMaximumFillHeight = 0.0f;
     LastStructureCandidateCount = 0;
@@ -1248,32 +1183,22 @@ float ASpineGenerator::EvaluateRoadDatumZ(float Chainage) const
 
 FBox ASpineGenerator::GetTerrainCorridorBounds() const
 {
-    if (AlignmentSamples.Num() < 2)
+    const UAvenorTerrainData* Data = TerrainData.LoadSynchronous();
+    if (!Data || !Data->SpineLayer.HasValidData())
     {
         return FBox(ForceInit);
     }
 
     FBox Bounds(ForceInit);
-    for (const FSpineAlignmentSample& Sample : AlignmentSamples)
+    for (const FAvenorBakedSpineSample& Sample : Data->SpineLayer.Samples)
     {
-        FVector Location;
-        FVector Forward;
-        GetBaseSplineFrameAtChainage(
-            Sample.Chainage,
-            Location,
-            Forward
-        );
-        Location.Z = Sample.RoadDatumZ;
-        Bounds += Location;
+        Bounds += FVector(Sample.Centre, Sample.RoadDatumZ);
     }
-    const float HorizontalExtent = FMath::Max(
-        CorridorFlatHalfWidth + 1.0f,
-        GetDevelopmentOuterLateral() + CorridorTransitionHalfWidth
-    );
+    const float HorizontalExtent = Data->SpineLayer.TransitionHalfWidth;
     const FVector Expansion(
         HorizontalExtent,
         HorizontalExtent,
-        TerrainTraceHalfHeight
+        1000000.0f
     );
     return Bounds.ExpandBy(Expansion);
 }

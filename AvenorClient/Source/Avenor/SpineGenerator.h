@@ -12,6 +12,7 @@ class UPCGGraphInterface;
 class USceneComponent;
 class USplineComponent;
 class ASpineGenerator;
+class UAvenorTerrainData;
 
 /** One sample in the solved road-level vertical alignment. */
 USTRUCT(BlueprintType)
@@ -280,10 +281,7 @@ public:
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|PCG")
     void RegenerateInfrastructure();
 
-    /**
-     * Sample the existing terrain, solve a smooth maximum-grade road datum,
-     * and grade the complete adjoining development area into Mesh Terrain.
-     */
+    /** Sample shared terrain data, store the Spine layer, then refresh grading. */
     UFUNCTION(CallInEditor, BlueprintCallable, Category = "Avenor|Terrain",
         meta = (DisplayName = "Rebuild Terrain Alignment"))
     void RebuildTerrainAlignment();
@@ -366,6 +364,8 @@ private:
     float GetDevelopmentProfileStartLateral() const;
     FString FormatSignedId(const TCHAR* Prefix, int32 Index) const;
     bool SolveTerrainAlignment();
+    bool StoreTerrainAlignmentLayer();
+    void LoadTerrainAlignmentLayer();
     bool BindTerrainModifier();
     float EvaluateRoadDatumZ(float Chainage) const;
     float EvaluateDevelopmentSurfaceZ(
@@ -426,6 +426,11 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain")
     TObjectPtr<AActor> MeshPartitionActor;
 
+    /** Shared authoritative asset also assigned to the terrain generator. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
+        meta = (DisplayName = "Baked Terrain Data"))
+    TSoftObjectPtr<UAvenorTerrainData> TerrainData;
+
     /** Natural-terrain samples are averaged across this longitudinal window. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain",
         meta = (Units = "cm", ClampMin = "2500.0"))
@@ -479,14 +484,6 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
         meta = (Units = "cm", ClampMin = "0.0"))
     float DevelopmentProfileSmoothingDistance = 10000.0f;
-
-    /** Vertical reach of the terrain sampling ray above and below the guide. */
-    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
-        meta = (Units = "cm", ClampMin = "10000.0"))
-    float TerrainTraceHalfHeight = 1000000.0f;
-
-    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced")
-    TEnumAsByte<ECollisionChannel> TerrainTraceChannel = ECC_Visibility;
 
     /** Runs after broad terrain but before native water modifiers (priority 10). */
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced")
