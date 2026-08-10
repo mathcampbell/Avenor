@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#if WITH_EDITOR
+#if WITH_EDITORONLY_DATA
 #include "MeshPartitionModifierComponent.h"
 #endif
 #include "SpineGenerator.generated.h"
@@ -55,7 +55,7 @@ struct FSpineAlignmentSample
  * Development grading modifier owned by the Spine actor. It changes vertices
  * in the existing Mesh Terrain; it never creates a second terrain surface.
  */
-#if WITH_EDITOR
+#if WITH_EDITORONLY_DATA
 UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
 class AVENOR_API UAvenorSpineTerrainModifier
     : public UE::MeshPartition::UModifierComponent
@@ -313,7 +313,7 @@ public:
 private:
     static constexpr int32 BlocksPerDistrict = 9;
 
-#if WITH_EDITOR
+#if WITH_EDITORONLY_DATA
     friend class UAvenorSpineTerrainModifier;
 #endif
 
