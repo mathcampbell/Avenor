@@ -1060,6 +1060,13 @@ void ASpineGenerator::ResetToPrototypeDefaults()
     DistrictsAfterStationZero = 1;
     DevelopmentRowsPerSide = 1;
     AlignmentSampleLength = 2500.0f;
+    SpineReservationWidth = 5400.0f;
+    HighwayCarriagewayWidth = 800.0f;
+    SpinePavementWidth = 500.0f;
+    LocalCarriagewayWidth = 700.0f;
+    StationCarriagewayWidth = 1000.0f;
+    RoadThickness = 20.0f;
+    PavementKerbHeight = 15.0f;
     if (TerrainCorridorModifier)
     {
         TerrainCorridorModifier->SetAffectedMeshPartition(nullptr);
@@ -1096,6 +1103,31 @@ float ASpineGenerator::GetResolvedLocalStreetWidth() const
         - BlocksPerDistrict * BlockSize
         - StationStreetWidth;
     return FMath::Max(0.0f, Remaining / (BlocksPerDistrict - 1));
+}
+
+float ASpineGenerator::GetResolvedLocalPavementWidth() const
+{
+    return FMath::Max(
+        0.0f,
+        (GetResolvedLocalStreetWidth() - LocalCarriagewayWidth) * 0.5f
+    );
+}
+
+float ASpineGenerator::GetResolvedStationPavementWidth() const
+{
+    return FMath::Max(
+        0.0f,
+        (StationStreetWidth - StationCarriagewayWidth) * 0.5f
+    );
+}
+
+float ASpineGenerator::GetSpineCentralPublicRealmWidth() const
+{
+    return FMath::Max(
+        0.0f,
+        SpineReservationWidth
+            - 2.0f * (HighwayCarriagewayWidth + SpinePavementWidth)
+    );
 }
 
 void ASpineGenerator::GetBaseSplineFrameAtChainage(
@@ -1465,8 +1497,7 @@ void ASpineGenerator::RebuildDerivedSplines()
         }
     }
 
-    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
-        + HighwayCarriagewayWidth * 0.5f;
+    const float CarriagewayOffset = GetSpineCarriagewayCentreOffset();
     const float Start = GetMinimumChainage();
     const float End = GetMaximumChainage();
     const float Step = FMath::Max(100.0f, AlignmentSampleLength);
@@ -1548,6 +1579,17 @@ float ASpineGenerator::GetInternalStreetCentreOffset(int32 StreetIndex) const
         + (static_cast<float>(StreetIndex) - 0.5f) * LocalStreetWidth;
 }
 
+float ASpineGenerator::GetSpineCarriagewayCentreOffset() const
+{
+    return GetSpineCentralPublicRealmWidth() * 0.5f
+        + HighwayCarriagewayWidth * 0.5f;
+}
+
+float ASpineGenerator::GetSpineOuterKerbLateral() const
+{
+    return SpineReservationWidth * 0.5f - SpinePavementWidth;
+}
+
 float ASpineGenerator::GetDevelopmentOuterLateral() const
 {
     const float LocalStreetWidth = GetResolvedLocalStreetWidth();
@@ -1557,13 +1599,12 @@ float ASpineGenerator::GetDevelopmentOuterLateral() const
 
 float ASpineGenerator::GetDevelopmentProfileStartLateral() const
 {
-    // Keep the full Spine reservation and the road-facing half of the first
-    // local street on the common datum. The parcel frontage then meets that
-    // street exactly before the ground is allowed to bank farther outward.
+    // The central public realm, carriageways and five-metre boulevard
+    // pavements fill the complete Spine reservation. The first parcel begins
+    // directly at its outer edge, with no frontage road or exposed gap.
     return FMath::Max(
         CorridorFlatHalfWidth,
         SpineReservationWidth * 0.5f
-            + GetResolvedLocalStreetWidth() * 0.5f
     );
 }
 
@@ -1621,7 +1662,6 @@ void ASpineGenerator::RebuildStationAndBlockRecords()
                  ++RowIndex)
             {
                 const float RowCentre = SpineReservationWidth * 0.5f
-                    + LocalStreetWidth * 0.5f
                     + BlockSize * 0.5f
                     + RowIndex * (BlockSize + LocalStreetWidth);
                 for (const int32 Side : {-1, 1})
@@ -1699,8 +1739,9 @@ void ASpineGenerator::RebuildGreyboxSegments()
     const float Start = GetMinimumChainage();
     const float End = GetMaximumChainage();
     const float Step = FMath::Max(200.0f, AlignmentSampleLength);
-    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
-        + HighwayCarriagewayWidth * 0.5f;
+    const float CarriagewayOffset = GetSpineCarriagewayCentreOffset();
+    const float SpineHalfWidth = SpineReservationWidth * 0.5f;
+    const float PavementThickness = RoadThickness + PavementKerbHeight;
 
     for (float Chainage = Start; Chainage < End; Chainage += Step)
     {
@@ -1708,6 +1749,20 @@ void ASpineGenerator::RebuildGreyboxSegments()
         const int32 DistrictIndex = FMath::FloorToInt(
             Chainage / StationSpacing
         );
+
+        AddGreyboxSpan(
+            TEXT("SpinePublicRealm"),
+            Chainage,
+            Next,
+            0.0f,
+            0.0f,
+            PavementThickness * 0.5f,
+            GetSpineCentralPublicRealmWidth(),
+            PavementThickness,
+            DistrictIndex,
+            0
+        );
+
         for (const int32 Side : {-1, 1})
         {
             AddGreyboxSpan(
@@ -1722,12 +1777,72 @@ void ASpineGenerator::RebuildGreyboxSegments()
                 DistrictIndex,
                 Side
             );
+
+            AddGreyboxSpan(
+                TEXT("SpinePavement"),
+                Chainage,
+                Next,
+                Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
+                Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
+                PavementThickness * 0.5f,
+                SpinePavementWidth,
+                PavementThickness,
+                DistrictIndex,
+                Side
+            );
         }
     }
 
     const float LocalStreetWidth = GetResolvedLocalStreetWidth();
+    const float LocalPavementWidth = GetResolvedLocalPavementWidth();
+    const float StationPavementWidth = GetResolvedStationPavementWidth();
     const float InnerLateral = SpineReservationWidth * 0.5f;
     const float OuterLateral = GetDevelopmentOuterLateral();
+
+    auto AddCrossStreetGreybox = [this, PavementThickness](
+        FName RoadKind,
+        FName PavementKind,
+        float RoadCentreChainage,
+        float StartLateral,
+        float EndLateral,
+        float CarriagewayWidth,
+        float PavementWidth,
+        int32 DistrictIndex,
+        int32 Side)
+    {
+        AddGreyboxSpan(
+            RoadKind,
+            RoadCentreChainage,
+            RoadCentreChainage,
+            StartLateral,
+            EndLateral,
+            RoadThickness * 0.5f,
+            CarriagewayWidth,
+            RoadThickness,
+            DistrictIndex,
+            Side
+        );
+
+        for (const int32 EdgeSide : {-1, 1})
+        {
+            const float PavementChainage = RoadCentreChainage
+                + EdgeSide * (CarriagewayWidth * 0.5f
+                    + PavementWidth * 0.5f);
+            AddGreyboxSpan(
+                PavementKind,
+                PavementChainage,
+                PavementChainage,
+                StartLateral,
+                EndLateral,
+                PavementThickness * 0.5f,
+                PavementWidth,
+                PavementThickness,
+                DistrictIndex,
+                Side
+            );
+        }
+    };
+
     for (int32 DistrictIndex = -DistrictsBeforeStationZero;
          DistrictIndex < DistrictsAfterStationZero;
          ++DistrictIndex)
@@ -1736,15 +1851,14 @@ void ASpineGenerator::RebuildGreyboxSegments()
             static_cast<float>(DistrictIndex) * StationSpacing;
         for (const int32 Side : {-1, 1})
         {
-            AddGreyboxSpan(
+            AddCrossStreetGreybox(
                 TEXT("StationStreet"),
+                TEXT("StationPavement"),
                 DistrictStart,
-                DistrictStart,
-                Side * InnerLateral,
+                Side * GetSpineOuterKerbLateral(),
                 Side * OuterLateral,
-                RoadThickness * 0.5f,
-                StationStreetWidth,
-                RoadThickness,
+                StationCarriagewayWidth,
+                StationPavementWidth,
                 DistrictIndex,
                 Side
             );
@@ -1754,28 +1868,31 @@ void ASpineGenerator::RebuildGreyboxSegments()
             {
                 const float StreetChainage = DistrictStart
                     + GetInternalStreetCentreOffset(StreetIndex);
-                AddGreyboxSpan(
+                AddCrossStreetGreybox(
                     TEXT("LocalStreet"),
+                    TEXT("LocalPavement"),
                     StreetChainage,
-                    StreetChainage,
-                    Side * InnerLateral,
+                    Side * GetSpineOuterKerbLateral(),
                     Side * OuterLateral,
-                    RoadThickness * 0.5f,
-                    LocalStreetWidth,
-                    RoadThickness,
+                    LocalCarriagewayWidth,
+                    LocalPavementWidth,
                     DistrictIndex,
                     Side
                 );
             }
 
-            for (int32 Boundary = 0;
+            // The Spine serves the first row directly. The first parallel
+            // local street therefore sits beyond that 100 m block, followed
+            // by one at the outer edge of every additional generated row.
+            for (int32 Boundary = 1;
                  Boundary <= DevelopmentRowsPerSide;
                  ++Boundary)
             {
                 const float Lateral = Side * (
                     InnerLateral
-                    + static_cast<float>(Boundary)
-                        * (BlockSize + LocalStreetWidth)
+                    + static_cast<float>(Boundary) * BlockSize
+                    + (static_cast<float>(Boundary) - 0.5f)
+                        * LocalStreetWidth
                 );
                 for (float Chainage = DistrictStart;
                      Chainage < DistrictStart + StationSpacing;
@@ -1792,11 +1909,30 @@ void ASpineGenerator::RebuildGreyboxSegments()
                         Lateral,
                         Lateral,
                         RoadThickness * 0.5f,
-                        LocalStreetWidth,
+                        LocalCarriagewayWidth,
                         RoadThickness,
                         DistrictIndex,
                         Side
                     );
+
+                    for (const int32 EdgeSide : {-1, 1})
+                    {
+                        const float PavementLateral = Lateral
+                            + EdgeSide * (LocalCarriagewayWidth * 0.5f
+                                + LocalPavementWidth * 0.5f);
+                        AddGreyboxSpan(
+                            TEXT("LocalPavement"),
+                            Chainage,
+                            Next,
+                            PavementLateral,
+                            PavementLateral,
+                            PavementThickness * 0.5f,
+                            LocalPavementWidth,
+                            PavementThickness,
+                            DistrictIndex,
+                            Side
+                        );
+                    }
                 }
             }
         }
@@ -1808,15 +1944,14 @@ void ASpineGenerator::RebuildGreyboxSegments()
     const float TerminalChainage = GetMaximumChainage();
     for (const int32 Side : {-1, 1})
     {
-        AddGreyboxSpan(
+        AddCrossStreetGreybox(
             TEXT("StationStreet"),
+            TEXT("StationPavement"),
             TerminalChainage,
-            TerminalChainage,
-            Side * InnerLateral,
+            Side * GetSpineOuterKerbLateral(),
             Side * OuterLateral,
-            RoadThickness * 0.5f,
-            StationStreetWidth,
-            RoadThickness,
+            StationCarriagewayWidth,
+            StationPavementWidth,
             DistrictsAfterStationZero,
             Side
         );
@@ -1834,7 +1969,8 @@ void ASpineGenerator::AddStreetLampPlacement(
     float RoadCentreLateral
 )
 {
-    const FVector Location = GetSpineLocationAtChainage(Chainage, Lateral);
+    FVector Location = GetSpineLocationAtChainage(Chainage, Lateral);
+    Location.Z += RoadThickness + PavementKerbHeight;
     const FVector RoadCentre = GetSpineLocationAtChainage(
         RoadCentreChainage,
         RoadCentreLateral
@@ -1880,23 +2016,60 @@ void ASpineGenerator::RebuildStreetLampPlacements()
     );
     const float Start = GetMinimumChainage();
     const float End = GetMaximumChainage();
-    const float CarriagewayOffset = HighwayMedianWidth * 0.5f
-        + HighwayCarriagewayWidth * 0.5f;
+    const float CarriagewayOffset = GetSpineCarriagewayCentreOffset();
+    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
 
-    // Both edges of both highway carriageways. Opposite edges are staggered
-    // by half an interval, while remaining anchored to the global chainage.
+    auto IsSpineJunction = [this, LocalStreetWidth, JunctionClearance](
+        float Chainage)
+    {
+        for (int32 DistrictIndex = -DistrictsBeforeStationZero;
+             DistrictIndex <= DistrictsAfterStationZero;
+             ++DistrictIndex)
+        {
+            const float DistrictStart =
+                static_cast<float>(DistrictIndex) * StationSpacing;
+            if (FMath::Abs(Chainage - DistrictStart)
+                <= StationStreetWidth * 0.5f + JunctionClearance)
+            {
+                return true;
+            }
+
+            if (DistrictIndex == DistrictsAfterStationZero)
+            {
+                continue;
+            }
+            for (int32 StreetIndex = 1;
+                 StreetIndex < BlocksPerDistrict;
+                 ++StreetIndex)
+            {
+                const float StreetChainage = DistrictStart
+                    + GetInternalStreetCentreOffset(StreetIndex);
+                if (FMath::Abs(Chainage - StreetChainage)
+                    <= LocalStreetWidth * 0.5f + JunctionClearance)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // Only the parcel-facing edge of each Spine carriageway needs a separate
+    // lamp line; the paved monorail realm already occupies the inner edge.
+    // The two boulevard sides are staggered by half an interval.
     for (const int32 RoadSide : {-1, 1})
     {
         const float RoadCentreLateral = RoadSide * CarriagewayOffset;
-        for (const int32 EdgeSide : {-1, 1})
+        const int32 EdgeSide = RoadSide;
+        const float Lateral = RoadCentreLateral
+            + EdgeSide * (HighwayCarriagewayWidth * 0.5f + Setback);
+        const float Phase = RoadSide > 0 ? Spacing * 0.5f : 0.0f;
+        float Chainage = Phase + Spacing * static_cast<float>(
+            FMath::CeilToInt((Start - Phase) / Spacing)
+        );
+        for (; Chainage <= End + KINDA_SMALL_NUMBER; Chainage += Spacing)
         {
-            const float Lateral = RoadCentreLateral
-                + EdgeSide * (HighwayCarriagewayWidth * 0.5f + Setback);
-            const float Phase = EdgeSide > 0 ? Spacing * 0.5f : 0.0f;
-            float Chainage = Phase + Spacing * static_cast<float>(
-                FMath::CeilToInt((Start - Phase) / Spacing)
-            );
-            for (; Chainage <= End + KINDA_SMALL_NUMBER; Chainage += Spacing)
+            if (!IsSpineJunction(Chainage))
             {
                 AddStreetLampPlacement(
                     TEXT("Highway"),
@@ -1912,7 +2085,6 @@ void ASpineGenerator::RebuildStreetLampPlacements()
         }
     }
 
-    const float LocalStreetWidth = GetResolvedLocalStreetWidth();
     if (LocalStreetWidth <= KINDA_SMALL_NUMBER)
     {
         return;
@@ -1920,18 +2092,20 @@ void ASpineGenerator::RebuildStreetLampPlacements()
 
     const float InnerLateral = SpineReservationWidth * 0.5f;
 
-    // Longitudinal local roads follow every parcel-row boundary. Generate in
-    // each exact 100 m clear block so lamp points never land in cross-streets.
+    // Longitudinal local roads begin after the first parcel row; there is no
+    // duplicate frontage road beside the Spine. Generate inside each exact
+    // 100 m bay so lamp points never land in cross-streets.
     for (const int32 RoadSide : {-1, 1})
     {
-        for (int32 Boundary = 0;
+        for (int32 Boundary = 1;
              Boundary <= DevelopmentRowsPerSide;
              ++Boundary)
         {
             const float RoadCentreLateral = RoadSide * (
                 InnerLateral
-                + static_cast<float>(Boundary)
-                    * (BlockSize + LocalStreetWidth)
+                + static_cast<float>(Boundary) * BlockSize
+                + (static_cast<float>(Boundary) - 0.5f)
+                    * LocalStreetWidth
             );
             const int32 RoadIndex = RoadSide
                 * (Boundary + 1);
@@ -1939,7 +2113,7 @@ void ASpineGenerator::RebuildStreetLampPlacements()
             for (const int32 EdgeSide : {-1, 1})
             {
                 const float Lateral = RoadCentreLateral
-                    + EdgeSide * (LocalStreetWidth * 0.5f + Setback);
+                    + EdgeSide * (LocalCarriagewayWidth * 0.5f + Setback);
                 const float Stagger = EdgeSide > 0
                     ? Spacing * 0.5f
                     : 0.0f;
@@ -2002,7 +2176,6 @@ void ASpineGenerator::RebuildStreetLampPlacements()
                  ++RowIndex)
             {
                 const float ClearStart = InnerLateral
-                    + LocalStreetWidth * 0.5f
                     + RowIndex * (BlockSize + LocalStreetWidth);
                 const float ClearEnd = ClearStart + BlockSize;
                 for (float Distance = ClearStart
@@ -2042,7 +2215,7 @@ void ASpineGenerator::RebuildStreetLampPlacements()
                 DistrictIndex,
                 RoadSide,
                 DistrictStart,
-                StationStreetWidth
+                StationCarriagewayWidth
             );
             for (int32 StreetIndex = 1;
                  StreetIndex < BlocksPerDistrict;
@@ -2054,7 +2227,7 @@ void ASpineGenerator::RebuildStreetLampPlacements()
                     RoadSide,
                     DistrictStart
                         + GetInternalStreetCentreOffset(StreetIndex),
-                    LocalStreetWidth
+                    LocalCarriagewayWidth
                 );
             }
         }
@@ -2068,7 +2241,7 @@ void ASpineGenerator::RebuildStreetLampPlacements()
             DistrictsAfterStationZero,
             RoadSide,
             TerminalChainage,
-            StationStreetWidth
+            StationCarriagewayWidth
         );
     }
 }

@@ -19,9 +19,10 @@ instanced-mesh components. It owns the editable alignment and supplies PCG with:
 - `StreetLampPlacements`.
 
 The station and block arrays contain stable IDs and world transforms. The
-greybox array contains disposable box transforms for the complete highway,
-twin guideways and local street grid. These arrays are flat reflected structs,
-so PCG 5.8 can read them with stock `Get Actor Property` nodes.
+greybox array contains disposable box transforms for the complete Spine public
+realm, carriageways, pavements, twin guideways and local street grid. These
+arrays are flat reflected structs, so PCG 5.8 can read them with stock
+`Get Actor Property` nodes.
 
 Generated arrays are transient and rebuilding is deliberately button-driven.
 Moving, selecting or editing the actor does not rebuild or serialize the
@@ -54,6 +55,22 @@ Roads are outside the guaranteed 100 × 100 m block dimensions. The configured
 public-realm bay is tagged `PublicRealm`; the other eight bays are tagged
 `Development`.
 
+The 54 m Spine reservation is continuous paved infrastructure:
+
+| Cross-section element | Width |
+|---|---:|
+| Central monorail/public realm | 2,800 cm / 28 m |
+| Carriageway on each side | 800 cm / 8 m |
+| Boulevard pavement on each side | 500 cm / 5 m |
+| Total | 5,400 cm / 54 m |
+
+The first parcel row begins directly at the outer edge of each boulevard
+pavement. There is no frontage road between it and the Spine. The first
+parallel local street is beyond that 100 m block. Each ordinary 13 m street
+reserve is divided into 3 m pavement, 7 m carriageway and 3 m pavement; each
+20 m station street is divided into 5 m pavement, 10 m carriageway and 5 m
+pavement.
+
 ## Create the first functional graph
 
 Create `/Game/Avenor/PCG/Spine/PCG_Spine_Master`.
@@ -76,11 +93,17 @@ central road datum.
    entry.
 5. Preserve the incoming point transform and scale. Do not randomise rotation
    or scale: each point already represents an exact road or guideway span.
-6. For clearer colours, split on the `Kind` attribute before the spawner:
+6. Split on the `Kind` attribute before the spawner:
    - `Highway`;
+   - `SpinePublicRealm`;
+   - `SpinePavement`;
    - `LocalStreet`;
-   - `StationStreet`.
-7. Use one material per branch, then gather the outputs.
+   - `LocalPavement`;
+   - `StationStreet`;
+   - `StationPavement`.
+7. Use the road material for the three carriageway kinds, the pavement
+   material for all pavement kinds, and a distinct temporary public-realm
+   material for `SpinePublicRealm`; then gather the outputs.
 
 This branch is the replacement functional greybox. It is intentionally crude
 in appearance, but its station cadence, independent guideways, clear block
@@ -135,9 +158,9 @@ The C++ data already supplies every placement. Do not add a Spline Sampler,
 Transform Points offset or density node to this branch. The default rules are:
 
 - 5,000 cm / 50 m spacing (half one 100 m parcel);
-- opposite road edges staggered by 2,500 cm / 25 m;
-- pole centre 50 cm beyond the carriageway edge;
-- both edges of both highway carriageways;
+- opposite sides/edges staggered by 2,500 cm / 25 m;
+- pole centre 50 cm into the pavement behind the kerb;
+- only the parcel-facing edge of each Spine carriageway;
 - both edges of every longitudinal local road and cross-street;
 - 500 cm / 5 m clear of local junction approaches;
 - local +X of the Blueprint faces the road.
@@ -171,7 +194,7 @@ a viable VR target.
    - smoothing: 25,000 cm / 250 m;
    - cut bias: 0.65;
    - maximum grade: 0.04 / 4%;
-   - flat half-width: 2,700 cm / 27 m;
+   - flat half-width: 2,700 cm / 27 m (the complete Spine reservation);
    - maximum development cross-grade: 0.06 / 6%;
    - lateral profile sampling: 2,500 cm / 25 m;
    - lateral profile smoothing: 10,000 cm / 100 m along the route;

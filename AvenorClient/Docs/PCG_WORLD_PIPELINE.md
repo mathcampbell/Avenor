@@ -125,7 +125,8 @@ independent random terrain.
 - Generate highway, guideway meshes and supports along the derived splines.
 - Exclude supports from water, roads and station footprints.
 - Place reusable station actors/instances at `StationRecords` transforms.
-- Generate blocks and local roads from the exact 1,024 m district records.
+- Generate the continuous 54 m Spine cross-section, then blocks and local
+  road/pavement reservations from the exact 1,024 m district records.
 - Keep signage, lighting and street furniture in separately controllable
   subgraphs and density/LOD groups.
 

@@ -261,6 +261,15 @@ public:
     float GetResolvedLocalStreetWidth() const;
 
     UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    float GetResolvedLocalPavementWidth() const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    float GetResolvedStationPavementWidth() const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
+    float GetSpineCentralPublicRealmWidth() const;
+
+    UFUNCTION(BlueprintPure, Category = "Avenor|Spine")
     USplineComponent* GetGuideSpline() const { return GuideSpline; }
 
     /** Rebuild deterministic PCG inputs without generating visible content. */
@@ -351,6 +360,8 @@ private:
     );
     float GetBlockCentreOffset(int32 BayIndex) const;
     float GetInternalStreetCentreOffset(int32 StreetIndex) const;
+    float GetSpineCarriagewayCentreOffset() const;
+    float GetSpineOuterKerbLateral() const;
     float GetDevelopmentOuterLateral() const;
     float GetDevelopmentProfileStartLateral() const;
     FString FormatSignedId(const TCHAR* Prefix, int32 Index) const;
@@ -540,24 +551,41 @@ private:
         meta = (ClampMin = "1000.0"))
     float SpineReservationWidth = 5400.0f;
 
+    /** Two traffic lanes on each side of the central monorail public realm. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Spine Road",
-        meta = (ClampMin = "300.0"))
-    float HighwayCarriagewayWidth = 700.0f;
+        meta = (Units = "cm", ClampMin = "600.0"))
+    float HighwayCarriagewayWidth = 800.0f;
 
+    /** Wide boulevard pavement between each carriageway and its parcels. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Spine Road",
-        meta = (ClampMin = "800.0"))
-    float HighwayMedianWidth = 1600.0f;
+        meta = (Units = "cm", ClampMin = "200.0"))
+    float SpinePavementWidth = 500.0f;
+
+    /** Traffic surface within each resolved 13 m ordinary street reserve. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Local Roads",
+        meta = (Units = "cm", ClampMin = "500.0"))
+    float LocalCarriagewayWidth = 700.0f;
+
+    /** Traffic surface within each 20 m station cross-street reserve. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Local Roads",
+        meta = (Units = "cm", ClampMin = "600.0"))
+    float StationCarriagewayWidth = 1000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Spine Road",
         meta = (ClampMin = "1.0"))
     float RoadThickness = 20.0f;
+
+    /** Raised pavement surface above the carriageway surface. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Spine Road",
+        meta = (Units = "cm", ClampMin = "0.0", ClampMax = "30.0"))
+    float PavementKerbHeight = 15.0f;
 
     /** Centre-to-centre lamp interval. 5,000 cm is half a 100 m parcel. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
         meta = (Units = "cm", ClampMin = "500.0"))
     float StreetLampSpacing = 5000.0f;
 
-    /** Pole-centre distance beyond each carriageway edge. */
+    /** Pole-centre distance into the pavement behind the kerb. */
     UPROPERTY(EditAnywhere, Category = "Avenor|Street Lamps",
         meta = (Units = "cm", ClampMin = "0.0"))
     float StreetLampSetback = 50.0f;
@@ -648,7 +676,7 @@ private:
         meta = (AllowPrivateAccess = "true"))
     TArray<FSpineInfrastructurePlacement> MonorailSupportPlacements;
 
-    /** Deterministic 50 m lamp points for every generated road edge. */
+    /** Deterministic 50 m lamp points placed within generated pavements. */
     UPROPERTY(Transient, BlueprintReadOnly,
         Category = "Avenor|PCG Data",
         meta = (AllowPrivateAccess = "true"))
