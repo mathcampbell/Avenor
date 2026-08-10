@@ -1,0 +1,63 @@
+<?xml version="1.0" ?>
+<catalog>
+	<Version app="modo" build="634443" xml_file_format="1">1501</Version>
+	<useRootPath>0</useRootPath>
+	<PtagAsID>0</PtagAsID>
+	<Material ID="Unreal_Material" ptag="Street_Lampost_Black" type="unrealShader">
+		<property name="Emissive Color" value="0.0, 0.0, 0.0"/>
+		<property name="Normal" value="0.0"/>
+		<property name="Bump" value="0.0"/>
+		<property name="Specular" value="0.5"/>
+		<property name="Ambient Occlusion" value="0.0"/>
+		<property name="Clearcoat Roughness" value="0.0"/>
+		<property name="Base Color" value="0.010022825561463833, 0.010022825561463833, 0.010022825561463833"/>
+		<property name="Clearcoat Amount" value="0.0"/>
+		<property name="Opacity" value="1.0"/>
+		<property name="Subsurface Color" value="0.0"/>
+		<property name="Roughness" value="0.5"/>
+		<property name="Metallic" value="0.0"/>
+	</Material>
+	<Material ID="Unreal_Material_2" ptag="Street_Lampost_Light" type="unrealShader">
+		<property name="Emissive Color" value="0.8111392259597778, 1.0, 0.9678811430931091"/>
+		<property name="Normal" value="0.0"/>
+		<property name="Bump" value="0.0"/>
+		<property name="Specular" value="0.5"/>
+		<property name="Ambient Occlusion" value="0.0"/>
+		<property name="Clearcoat Roughness" value="0.0"/>
+		<property name="Base Color" value="0.16161426901817322, 0.1835443079471588, 0.18158675730228424"/>
+		<property name="Clearcoat Amount" value="0.0"/>
+		<property name="Opacity" value="1.0"/>
+		<property name="Subsurface Color" value="0.0"/>
+		<property name="Roughness" value="0.5"/>
+		<property name="Metallic" value="0.0"/>
+	</Material>
+	<Material ID="Unreal_Material_3" ptag="Street_Lampost_Main" type="unrealShader">
+		<property name="Emissive Color" value="0.0, 0.0, 0.0"/>
+		<property name="Normal" value="0.0"/>
+		<property name="Bump" value="0.0"/>
+		<property name="Specular" value="0.5"/>
+		<property name="Ambient Occlusion" value="0.0"/>
+		<property name="Clearcoat Roughness" value="0.0"/>
+		<property name="Base Color" value="1.0, 1.0, 1.0"/>
+		<property name="Clearcoat Amount" value="0.0"/>
+		<property name="Opacity" value="1.0"/>
+		<property name="Subsurface Color" value="0.0"/>
+		<property name="Roughness" value="0.5"/>
+		<property name="Metallic" value="0.0"/>
+	</Material>
+	<Material ID="Unreal_Material_4" ptag="Street_Lampost_LED" type="unrealShader">
+		<property name="Emissive Color" value="0.3024512529373169, 0.8092576861381531, 1.0"/>
+		<property name="Normal" value="0.0"/>
+		<property name="Bump" value="0.0"/>
+		<property name="Specular" value="0.8"/>
+		<property name="Ambient Occlusion" value="0.0"/>
+		<property name="Clearcoat Roughness" value="0.0"/>
+		<property name="Base Color" value="0.029467454180121422, 0.08709438890218735, 0.10759493708610535"/>
+		<property name="Clearcoat Amount" value="0.0"/>
+		<property name="Opacity" value="1.0"/>
+		<property name="Subsurface Color" value="0.0"/>
+		<property name="Roughness" value="0.1"/>
+		<property name="Metallic" value="0.0"/>
+	</Material>
+	<ImageFiles/>
+</catalog>
