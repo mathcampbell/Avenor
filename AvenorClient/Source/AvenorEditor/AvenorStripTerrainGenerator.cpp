@@ -503,6 +503,7 @@ struct FLakeBasin
     double ShorelineHeight = 0.0;
     double SurfaceHeight = 0.0;
     double MaximumDepth = 500.0;
+    double ModifierBedDepth = 3000.0;
     double BankBlendWidth = 24000.0;
     double DepthRampWidth = 7500.0;
     FBox2D Bounds = FBox2D(ForceInit);
