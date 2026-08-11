@@ -2158,6 +2158,7 @@ static void ExtractRivers(
         River.Points = SimplifyFeaturePolyline(
             River.Points, SimplificationTolerance, false
         );
+        EnforceDownhill(River.Points);
         AddLevelLakeJunctionPads(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
@@ -2819,7 +2820,14 @@ static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVe
     Spline.SetClosedLoop(bClosed, false);
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
-        Spline.SetSplinePointType(Index, ESplinePointType::Curve, false);
+        // Open river paths use clamped tangents to prevent cubic Z overshoot
+        // between valid downhill samples. Closed lake/ocean shores retain
+        // ordinary smooth curve tangents.
+        Spline.SetSplinePointType(
+            Index,
+            bClosed ? ESplinePointType::Curve : ESplinePointType::CurveClamped,
+            false
+        );
     }
     Spline.UpdateSpline();
 }
@@ -3296,6 +3304,7 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
         Target.Points = Source.Points;
         Target.Width = Source.Width;
         Target.Depth = Source.Depth;
+        Target.BankWidth = WaterTerrain.RiverBankWidth;
         Target.ValleyHalfWidth = Source.ValleyHalfWidth;
         Target.ValleyDepth = Source.ValleyDepth;
         Target.CrossSectionExponent = Source.CrossSectionExponent;

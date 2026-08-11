@@ -120,6 +120,59 @@ bool UAvenorTerrainData::SampleBaseHeight(
     return true;
 }
 
+bool UAvenorTerrainData::SampleFinalHeight(
+    const FVector2D& WorldPosition,
+    float& OutHeight,
+    FAvenorTerrainHeightChunkCache& Cache
+) const
+{
+    if (!SampleBaseHeight(WorldPosition, OutHeight, Cache))
+    {
+        return false;
+    }
+
+    // Water Body modifiers carve after the broad terrain modifier. Mirror
+    // their authoritative spline datum here so non-mesh consumers (notably
+    // the Spine parcel checker) do not continue to see the pre-carve ground.
+    for (const FAvenorBakedRiverReach& River : Rivers)
+    {
+        for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
+        {
+            const FVector& A3 = River.Points[Index];
+            const FVector& B3 = River.Points[Index + 1];
+            const FVector2D A(A3);
+            const FVector2D B(B3);
+            const FVector2D Segment = B - A;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(WorldPosition - A, Segment)
+                    / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
+            const double CarveHalfWidth = FMath::Max(
+                River.Width * 0.5 + 100.0,
+                River.Width * 0.5 + River.BankWidth
+            );
+            if (Distance >= CarveHalfWidth)
+            {
+                continue;
+            }
+            const double WaterZ = FMath::Lerp(A3.Z, B3.Z, Alpha);
+            const double CrossAlpha = FMath::Clamp(
+                Distance / CarveHalfWidth, 0.0, 1.0
+            );
+            const double BedZ = WaterZ - River.Depth;
+            const float CarvedZ = static_cast<float>(FMath::Lerp(
+                BedZ,
+                static_cast<double>(OutHeight),
+                FMath::SmoothStep(0.0, 1.0, CrossAlpha)
+            ));
+            OutHeight = FMath::Min(OutHeight, CarvedZ);
+        }
+    }
+    return true;
+}
+
 bool UAvenorTerrainData::SampleTerrain(
     const FVector2D& WorldPosition,
     FAvenorTerrainSample& OutSample,

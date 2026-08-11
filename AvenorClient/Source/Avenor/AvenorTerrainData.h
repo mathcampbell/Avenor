@@ -40,6 +40,10 @@ struct AVENOR_API FAvenorBakedRiverReach
     UPROPERTY(VisibleAnywhere, Category = "River")
     double Depth = 250.0;
 
+    /** Native Water Body bank blend width beyond the channel edge. */
+    UPROPERTY(VisibleAnywhere, Category = "River")
+    double BankWidth = 12000.0;
+
     UPROPERTY(VisibleAnywhere, Category = "River")
     double ValleyHalfWidth = 15000.0;
 
@@ -112,6 +116,9 @@ struct AVENOR_API FAvenorBakedSpineSample
 
     UPROPERTY(VisibleAnywhere, Category = "Spine")
     TArray<float> RightDevelopmentProfileZ;
+
+    UPROPERTY(VisibleAnywhere, Category = "Spine")
+    bool bDevelopmentSuitable = true;
 };
 
 /** Independently replaceable engineered layer stored beside base geography. */
@@ -263,6 +270,13 @@ public:
     bool HasValidData() const;
 
     bool SampleBaseHeight(
+        const FVector2D& WorldPosition,
+        float& OutHeight,
+        FAvenorTerrainHeightChunkCache& Cache
+    ) const;
+
+    /** Samples the visible post-water ground used for development checks. */
+    bool SampleFinalHeight(
         const FVector2D& WorldPosition,
         float& OutHeight,
         FAvenorTerrainHeightChunkCache& Cache

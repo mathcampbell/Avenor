@@ -54,6 +54,10 @@ struct FSpineAlignmentSample
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
     bool bTerrainHit = false;
+
+    /** False where final post-water ground requires bespoke structures. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Alignment")
+    bool bDevelopmentSuitable = true;
 };
 
 /**
@@ -354,6 +358,7 @@ private:
         float Chainage,
         float Lateral
     ) const;
+    bool IsDevelopmentSuitableAtChainage(float Chainage) const;
     FTransform GetDevelopmentSurfaceTransformAtChainage(
         float Chainage,
         float Lateral
@@ -468,6 +473,11 @@ private:
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
         meta = (Units = "cm", ClampMin = "100.0"))
     float EarthworkWarningThreshold = 1000.0f;
+
+    /** River/ravine cut deeper than this suppresses parcels and side roads. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Advanced",
+        meta = (Units = "cm", ClampMin = "100.0"))
+    float MaximumDevelopmentCarveDepth = 1000.0f;
 
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Terrain|Status")
     float LastMaximumCutDepth = 0.0f;

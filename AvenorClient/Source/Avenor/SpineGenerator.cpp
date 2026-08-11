@@ -239,6 +239,11 @@ bool ASpineGenerator::SolveTerrainAlignment()
             AlignmentSamples.Reset();
             return false;
         }
+        float FinalCentreZ = Sample.NaturalTerrainZ;
+        Sample.bDevelopmentSuitable = Data->SampleFinalHeight(
+            FVector2D(BaseLocation), FinalCentreZ, HeightCache
+        ) && Sample.NaturalTerrainZ - FinalCentreZ
+            <= MaximumDevelopmentCarveDepth;
 
         const FVector BaseRight = FVector::CrossProduct(
             FVector::UpVector,
@@ -276,6 +281,18 @@ bool ASpineGenerator::SolveTerrainAlignment()
                 AlignmentSamples.Reset();
                 return false;
             }
+            float FinalLeftZ = Sample.LeftDevelopmentProfileZ[ProfileIndex];
+            float FinalRightZ = Sample.RightDevelopmentProfileZ[ProfileIndex];
+            Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
+                FVector2D(BaseLocation - BaseRight * Lateral),
+                FinalLeftZ, HeightCache
+            ) && Sample.LeftDevelopmentProfileZ[ProfileIndex] - FinalLeftZ
+                <= MaximumDevelopmentCarveDepth;
+            Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
+                FVector2D(BaseLocation + BaseRight * Lateral),
+                FinalRightZ, HeightCache
+            ) && Sample.RightDevelopmentProfileZ[ProfileIndex] - FinalRightZ
+                <= MaximumDevelopmentCarveDepth;
         }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
     }
@@ -547,6 +564,7 @@ bool ASpineGenerator::StoreTerrainAlignmentLayer()
         Target.RoadDatumZ = Source.RoadDatumZ;
         Target.LeftDevelopmentProfileZ = Source.LeftDevelopmentProfileZ;
         Target.RightDevelopmentProfileZ = Source.RightDevelopmentProfileZ;
+        Target.bDevelopmentSuitable = Source.bDevelopmentSuitable;
     }
     Data->MarkPackageDirty();
     return Layer.HasValidData();
@@ -569,6 +587,7 @@ void ASpineGenerator::LoadTerrainAlignmentLayer()
         Target.EarthworkDelta = Source.RoadDatumZ - Source.NaturalTerrainZ;
         Target.LeftDevelopmentProfileZ = Source.LeftDevelopmentProfileZ;
         Target.RightDevelopmentProfileZ = Source.RightDevelopmentProfileZ;
+        Target.bDevelopmentSuitable = Source.bDevelopmentSuitable;
         Target.bTerrainHit = true;
     }
 }
@@ -973,6 +992,29 @@ float ASpineGenerator::EvaluateDevelopmentSurfaceZ(
     return RoadZ;
 }
 
+bool ASpineGenerator::IsDevelopmentSuitableAtChainage(float Chainage) const
+{
+    if (AlignmentSamples.IsEmpty())
+    {
+        return true;
+    }
+    if (Chainage <= AlignmentSamples[0].Chainage)
+    {
+        return AlignmentSamples[0].bDevelopmentSuitable;
+    }
+    for (int32 Index = 1; Index < AlignmentSamples.Num(); ++Index)
+    {
+        if (Chainage <= AlignmentSamples[Index].Chainage)
+        {
+            // A gap is unsuitable until both bracketing final-terrain samples
+            // are clear; this prevents clipped parcel or road fragments.
+            return AlignmentSamples[Index - 1].bDevelopmentSuitable
+                && AlignmentSamples[Index].bDevelopmentSuitable;
+        }
+    }
+    return AlignmentSamples.Last().bDevelopmentSuitable;
+}
+
 FTransform ASpineGenerator::GetDevelopmentSurfaceTransformAtChainage(
     float Chainage,
     float Lateral
@@ -1268,6 +1310,14 @@ void ASpineGenerator::RebuildStationAndBlockRecords()
         {
             const float Chainage = DistrictStart
                 + GetBlockCentreOffset(BayIndex);
+            const bool bBaySuitable =
+                IsDevelopmentSuitableAtChainage(Chainage - BlockSize * 0.5f)
+                && IsDevelopmentSuitableAtChainage(Chainage)
+                && IsDevelopmentSuitableAtChainage(Chainage + BlockSize * 0.5f);
+            if (!bBaySuitable)
+            {
+                continue;
+            }
             for (int32 RowIndex = 0;
                  RowIndex < DevelopmentRowsPerSide;
                  ++RowIndex)
@@ -1389,18 +1439,21 @@ void ASpineGenerator::RebuildGreyboxSegments()
                 Side
             );
 
-            AddGreyboxSpan(
-                TEXT("SpinePavement"),
-                Chainage,
-                Next,
-                Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
-                Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
-                PavementThickness * 0.5f,
-                SpinePavementWidth,
-                PavementThickness,
-                DistrictIndex,
-                Side
-            );
+            if (IsDevelopmentSuitableAtChainage((Chainage + Next) * 0.5f))
+            {
+                AddGreyboxSpan(
+                    TEXT("SpinePavement"),
+                    Chainage,
+                    Next,
+                    Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
+                    Side * (SpineHalfWidth - SpinePavementWidth * 0.5f),
+                    PavementThickness * 0.5f,
+                    SpinePavementWidth,
+                    PavementThickness,
+                    DistrictIndex,
+                    Side
+                );
+            }
         }
     }
 
@@ -1421,6 +1474,10 @@ void ASpineGenerator::RebuildGreyboxSegments()
         int32 DistrictIndex,
         int32 Side)
     {
+        if (!IsDevelopmentSuitableAtChainage(RoadCentreChainage))
+        {
+            return;
+        }
         AddGreyboxSpan(
             RoadKind,
             RoadCentreChainage,
@@ -1513,6 +1570,11 @@ void ASpineGenerator::RebuildGreyboxSegments()
                         Chainage + Step,
                         DistrictStart + StationSpacing
                     );
+                    if (!IsDevelopmentSuitableAtChainage(
+                            (Chainage + Next) * 0.5f))
+                    {
+                        continue;
+                    }
                     AddGreyboxSpan(
                         TEXT("LocalStreet"),
                         Chainage,
@@ -1580,6 +1642,12 @@ void ASpineGenerator::AddStreetLampPlacement(
     float RoadCentreLateral
 )
 {
+    if (!IsDevelopmentSuitableAtChainage(Chainage))
+    {
+        // The highway/monorail bridge alignment remains continuous, but its
+        // ordinary roadside furniture waits for the bespoke bridge design.
+        return;
+    }
     FVector Location = GetSpineLocationAtChainage(Chainage, Lateral);
     Location.Z += RoadThickness + PavementKerbHeight;
     const FVector RoadCentre = GetSpineLocationAtChainage(
