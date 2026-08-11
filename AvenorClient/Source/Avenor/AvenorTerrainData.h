@@ -287,6 +287,12 @@ public:
         bool* bOutWaterAffected = nullptr
     ) const;
 
+    /** Returns the water surface only when the point is over actual water. */
+    bool SampleWaterSurface(
+        const FVector2D& WorldPosition,
+        float& OutSurfaceHeight
+    ) const;
+
     bool SampleTerrain(
         const FVector2D& WorldPosition,
         FAvenorTerrainSample& OutSample,

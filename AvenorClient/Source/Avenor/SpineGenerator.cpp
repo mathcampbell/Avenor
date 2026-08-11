@@ -220,6 +220,10 @@ bool ASpineGenerator::SolveTerrainAlignment()
         / static_cast<float>(DevelopmentProfileIntervalCount);
 
     FAvenorTerrainHeightChunkCache HeightCache;
+    TArray<bool> ActualWaterSamples;
+    TArray<float> WaterSurfaceHeights;
+    ActualWaterSamples.Reserve(SampleCount);
+    WaterSurfaceHeights.Reserve(SampleCount);
     for (int32 Index = 0; Index < SampleCount; ++Index)
     {
         const float Chainage = Index == SampleCount - 1
@@ -248,11 +252,15 @@ bool ASpineGenerator::SolveTerrainAlignment()
             return false;
         }
         float FinalCentreZ = Sample.NaturalTerrainZ;
-        bool bCentreWaterAffected = false;
+        float WaterSurfaceZ = 0.0f;
+        const bool bActualWater = Data->SampleWaterSurface(
+            FVector2D(BaseLocation), WaterSurfaceZ
+        );
+        ActualWaterSamples.Add(bActualWater);
+        WaterSurfaceHeights.Add(WaterSurfaceZ);
         Sample.bDevelopmentSuitable = Data->SampleFinalHeight(
-            FVector2D(BaseLocation), FinalCentreZ, HeightCache,
-            &bCentreWaterAffected
-        ) && !bCentreWaterAffected
+            FVector2D(BaseLocation), FinalCentreZ, HeightCache
+        )
             && Sample.NaturalTerrainZ - FinalCentreZ
                 <= MaximumDevelopmentCarveDepth;
 
@@ -294,18 +302,25 @@ bool ASpineGenerator::SolveTerrainAlignment()
             }
             float FinalLeftZ = Sample.LeftDevelopmentProfileZ[ProfileIndex];
             float FinalRightZ = Sample.RightDevelopmentProfileZ[ProfileIndex];
-            bool bLeftWaterAffected = false;
-            bool bRightWaterAffected = false;
+            float LateralWaterSurfaceZ = 0.0f;
+            const bool bLeftActualWater = Data->SampleWaterSurface(
+                FVector2D(BaseLocation - BaseRight * Lateral),
+                LateralWaterSurfaceZ
+            );
+            const bool bRightActualWater = Data->SampleWaterSurface(
+                FVector2D(BaseLocation + BaseRight * Lateral),
+                LateralWaterSurfaceZ
+            );
             Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
                 FVector2D(BaseLocation - BaseRight * Lateral),
-                FinalLeftZ, HeightCache, &bLeftWaterAffected
-            ) && !bLeftWaterAffected
+                FinalLeftZ, HeightCache
+            ) && !bLeftActualWater
                 && Sample.LeftDevelopmentProfileZ[ProfileIndex] - FinalLeftZ
                     <= MaximumDevelopmentCarveDepth;
             Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
                 FVector2D(BaseLocation + BaseRight * Lateral),
-                FinalRightZ, HeightCache, &bRightWaterAffected
-            ) && !bRightWaterAffected
+                FinalRightZ, HeightCache
+            ) && !bRightActualWater
                 && Sample.RightDevelopmentProfileZ[ProfileIndex] - FinalRightZ
                     <= MaximumDevelopmentCarveDepth;
             // Retained roadside geometry follows the same post-water surface
@@ -388,6 +403,51 @@ bool ASpineGenerator::SolveTerrainAlignment()
     for (int32 Index = 0; Index < AlignmentSamples.Num(); ++Index)
     {
         AlignmentSamples[Index].RoadDatumZ = SmoothedHeights[Index];
+    }
+
+    // Actual water, rather than the much wider shoreline carve/blend, defines
+    // bridge spans. Extend each crossing onto dry ground by the editable
+    // setback, hold the transport datum level, and omit development there.
+    const int32 SetbackSamples = FMath::Max(
+        0,
+        FMath::CeilToInt(BridgeApproachSetback / FMath::Max(1.0f, Step))
+    );
+    for (int32 WaterStart = 0; WaterStart < ActualWaterSamples.Num();)
+    {
+        if (!ActualWaterSamples[WaterStart])
+        {
+            ++WaterStart;
+            continue;
+        }
+        int32 WaterEnd = WaterStart;
+        while (WaterEnd + 1 < ActualWaterSamples.Num()
+            && ActualWaterSamples[WaterEnd + 1])
+        {
+            ++WaterEnd;
+        }
+
+        const int32 SpanStart = FMath::Max(0, WaterStart - SetbackSamples);
+        const int32 SpanEnd = FMath::Min(
+            AlignmentSamples.Num() - 1,
+            WaterEnd + SetbackSamples
+        );
+        float DeckZ = FMath::Max(
+            AlignmentSamples[SpanStart].RoadDatumZ,
+            AlignmentSamples[SpanEnd].RoadDatumZ
+        );
+        for (int32 Index = WaterStart; Index <= WaterEnd; ++Index)
+        {
+            DeckZ = FMath::Max(
+                DeckZ,
+                WaterSurfaceHeights[Index] + BridgeMinimumClearance
+            );
+        }
+        for (int32 Index = SpanStart; Index <= SpanEnd; ++Index)
+        {
+            AlignmentSamples[Index].RoadDatumZ = DeckZ;
+            AlignmentSamples[Index].bDevelopmentSuitable = false;
+        }
+        WaterStart = WaterEnd + 1;
     }
 
     // Smooth every lateral band along the route and across its immediate

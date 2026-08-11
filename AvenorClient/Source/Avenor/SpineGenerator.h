@@ -479,6 +479,16 @@ private:
         meta = (Units = "cm", ClampMin = "100.0"))
     float MaximumDevelopmentCarveDepth = 1000.0f;
 
+    /** Dry-land distance on each side of water held as part of a bridge span. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Bridges",
+        meta = (Units = "cm", ClampMin = "0.0"))
+    float BridgeApproachSetback = 5000.0f;
+
+    /** Minimum highway/monorail datum above the highest crossed water surface. */
+    UPROPERTY(EditAnywhere, Category = "Avenor|Terrain|Bridges",
+        meta = (Units = "cm", ClampMin = "0.0"))
+    float BridgeMinimumClearance = 1000.0f;
+
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Terrain|Status")
     float LastMaximumCutDepth = 0.0f;
 

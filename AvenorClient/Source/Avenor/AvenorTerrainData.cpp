@@ -262,6 +262,74 @@ bool UAvenorTerrainData::SampleFinalHeight(
     return true;
 }
 
+bool UAvenorTerrainData::SampleWaterSurface(
+    const FVector2D& WorldPosition,
+    float& OutSurfaceHeight
+) const
+{
+    bool bFoundWater = false;
+    OutSurfaceHeight = -TNumericLimits<float>::Max();
+
+    for (const FAvenorBakedRiverReach& River : Rivers)
+    {
+        const double WaterHalfWidth = FMath::Max(0.0, River.Width * 0.5);
+        for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
+        {
+            const FVector& A3 = River.Points[Index];
+            const FVector& B3 = River.Points[Index + 1];
+            const FVector2D A(A3);
+            const FVector2D B(B3);
+            const FVector2D Segment = B - A;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(
+                    WorldPosition - A, Segment) / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            if ((WorldPosition - (A + Segment * Alpha)).Size()
+                <= WaterHalfWidth)
+            {
+                OutSurfaceHeight = FMath::Max(
+                    OutSurfaceHeight,
+                    static_cast<float>(FMath::Lerp(A3.Z, B3.Z, Alpha))
+                );
+                bFoundWater = true;
+            }
+        }
+    }
+
+    for (const FAvenorBakedLakeBasin& Lake : Lakes)
+    {
+        if (Lake.Shoreline.Num() < 3)
+        {
+            continue;
+        }
+        bool bInside = false;
+        for (int32 Index = 0, Previous = Lake.Shoreline.Num() - 1;
+             Index < Lake.Shoreline.Num(); Previous = Index++)
+        {
+            const FVector2D A(Lake.Shoreline[Previous]);
+            const FVector2D B(Lake.Shoreline[Index]);
+            const bool bCrosses = (A.Y > WorldPosition.Y)
+                != (B.Y > WorldPosition.Y);
+            if (bCrosses && WorldPosition.X < (B.X - A.X)
+                    * (WorldPosition.Y - A.Y) / (B.Y - A.Y) + A.X)
+            {
+                bInside = !bInside;
+            }
+        }
+        if (bInside)
+        {
+            OutSurfaceHeight = FMath::Max(
+                OutSurfaceHeight,
+                static_cast<float>(Lake.SurfaceHeight)
+            );
+            bFoundWater = true;
+        }
+    }
+
+    return bFoundWater;
+}
+
 bool UAvenorTerrainData::SampleTerrain(
     const FVector2D& WorldPosition,
     FAvenorTerrainSample& OutSample,
