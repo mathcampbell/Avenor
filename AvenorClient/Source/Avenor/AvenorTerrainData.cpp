@@ -123,9 +123,14 @@ bool UAvenorTerrainData::SampleBaseHeight(
 bool UAvenorTerrainData::SampleFinalHeight(
     const FVector2D& WorldPosition,
     float& OutHeight,
-    FAvenorTerrainHeightChunkCache& Cache
+    FAvenorTerrainHeightChunkCache& Cache,
+    bool* bOutWaterAffected
 ) const
 {
+    if (bOutWaterAffected)
+    {
+        *bOutWaterAffected = false;
+    }
     if (!SampleBaseHeight(WorldPosition, OutHeight, Cache))
     {
         return false;
@@ -157,6 +162,10 @@ bool UAvenorTerrainData::SampleFinalHeight(
             {
                 continue;
             }
+            if (bOutWaterAffected)
+            {
+                *bOutWaterAffected = true;
+            }
             const double WaterZ = FMath::Lerp(A3.Z, B3.Z, Alpha);
             const double CrossAlpha = FMath::Clamp(
                 Distance / CarveHalfWidth, 0.0, 1.0
@@ -168,6 +177,86 @@ bool UAvenorTerrainData::SampleFinalHeight(
                 FMath::SmoothStep(0.0, 1.0, CrossAlpha)
             ));
             OutHeight = FMath::Min(OutHeight, CarvedZ);
+        }
+    }
+
+    // Lake modifiers are polygonal rather than spline based. Use the signed
+    // distance to their shoreline so consumers see both the lake bed and the
+    // exterior bank blend that the native Mesh Partition modifier creates.
+    for (const FAvenorBakedLakeBasin& Lake : Lakes)
+    {
+        if (Lake.Shoreline.Num() < 3)
+        {
+            continue;
+        }
+
+        bool bInside = false;
+        double DistanceToShore = TNumericLimits<double>::Max();
+        for (int32 Index = 0, Previous = Lake.Shoreline.Num() - 1;
+             Index < Lake.Shoreline.Num(); Previous = Index++)
+        {
+            const FVector2D A(Lake.Shoreline[Previous]);
+            const FVector2D B(Lake.Shoreline[Index]);
+            const FVector2D Segment = B - A;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(
+                    WorldPosition - A, Segment) / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            DistanceToShore = FMath::Min(
+                DistanceToShore,
+                (WorldPosition - (A + Segment * Alpha)).Size()
+            );
+
+            const bool bCrosses = (A.Y > WorldPosition.Y)
+                != (B.Y > WorldPosition.Y);
+            if (bCrosses && WorldPosition.X < (B.X - A.X)
+                    * (WorldPosition.Y - A.Y) / (B.Y - A.Y) + A.X)
+            {
+                bInside = !bInside;
+            }
+        }
+
+        const double BankWidth = FMath::Max(0.0, Lake.BankBlendWidth);
+        if (!bInside && DistanceToShore >= BankWidth)
+        {
+            continue;
+        }
+        if (bOutWaterAffected)
+        {
+            *bOutWaterAffected = true;
+        }
+
+        if (bInside)
+        {
+            const double RampWidth = FMath::Max(1.0, Lake.DepthRampWidth);
+            const double DepthAlpha = FMath::SmoothStep(
+                0.0, 1.0,
+                FMath::Clamp(DistanceToShore / RampWidth, 0.0, 1.0)
+            );
+            const double BedDepth = FMath::Max(
+                0.0,
+                Lake.ModifierBedDepth > 0.0
+                    ? Lake.ModifierBedDepth
+                    : Lake.MaximumDepth
+            );
+            const float LakeGroundZ = static_cast<float>(
+                Lake.SurfaceHeight - BedDepth * DepthAlpha
+            );
+            OutHeight = FMath::Min(OutHeight, LakeGroundZ);
+        }
+        else if (BankWidth > UE_DOUBLE_SMALL_NUMBER)
+        {
+            const double BankAlpha = FMath::SmoothStep(
+                0.0, 1.0,
+                FMath::Clamp(DistanceToShore / BankWidth, 0.0, 1.0)
+            );
+            const float BankZ = static_cast<float>(FMath::Lerp(
+                Lake.SurfaceHeight,
+                static_cast<double>(OutHeight),
+                BankAlpha
+            ));
+            OutHeight = FMath::Min(OutHeight, BankZ);
         }
     }
     return true;

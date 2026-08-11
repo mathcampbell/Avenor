@@ -3322,6 +3322,7 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
         Target.ShorelineHeight = Source.ShorelineHeight;
         Target.SurfaceHeight = Source.SurfaceHeight;
         Target.MaximumDepth = Source.MaximumDepth;
+        Target.ModifierBedDepth = WaterTerrain.LakeBedDepth;
         Target.BankBlendWidth = Source.BankBlendWidth;
         Target.DepthRampWidth = Source.DepthRampWidth;
     }
@@ -3450,6 +3451,7 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData()
         Target.ShorelineHeight = Source.ShorelineHeight;
         Target.SurfaceHeight = Source.SurfaceHeight;
         Target.MaximumDepth = Source.MaximumDepth;
+        Target.ModifierBedDepth = Source.ModifierBedDepth;
         Target.BankBlendWidth = Source.BankBlendWidth;
         Target.DepthRampWidth = Source.DepthRampWidth;
         for (const FVector& Point : Target.Shoreline)

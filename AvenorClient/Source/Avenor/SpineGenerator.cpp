@@ -185,7 +185,12 @@ bool ASpineGenerator::SolveTerrainAlignment()
 
     const float Start = GetMinimumChainage();
     const float End = GetMaximumChainage();
-    const float Step = FMath::Max(2500.0f, AlignmentSampleLength);
+    // Ten-metre samples keep local roads close to rolling ground between the
+    // coarser user-configured alignment stations.
+    const float Step = FMath::Min(
+        1000.0f,
+        FMath::Max(100.0f, AlignmentSampleLength)
+    );
     const int32 SampleCount = FMath::Max(
         2,
         FMath::CeilToInt((End - Start) / Step) + 1
@@ -203,7 +208,10 @@ bool ASpineGenerator::SolveTerrainAlignment()
         1,
         FMath::CeilToInt(
             DevelopmentProfileWidth
-            / FMath::Max(500.0f, DevelopmentProfileSampleSpacing)
+            / FMath::Min(
+                1000.0f,
+                FMath::Max(500.0f, DevelopmentProfileSampleSpacing)
+            )
         )
     );
     const int32 DevelopmentProfileSampleCount =
@@ -240,10 +248,13 @@ bool ASpineGenerator::SolveTerrainAlignment()
             return false;
         }
         float FinalCentreZ = Sample.NaturalTerrainZ;
+        bool bCentreWaterAffected = false;
         Sample.bDevelopmentSuitable = Data->SampleFinalHeight(
-            FVector2D(BaseLocation), FinalCentreZ, HeightCache
-        ) && Sample.NaturalTerrainZ - FinalCentreZ
-            <= MaximumDevelopmentCarveDepth;
+            FVector2D(BaseLocation), FinalCentreZ, HeightCache,
+            &bCentreWaterAffected
+        ) && !bCentreWaterAffected
+            && Sample.NaturalTerrainZ - FinalCentreZ
+                <= MaximumDevelopmentCarveDepth;
 
         const FVector BaseRight = FVector::CrossProduct(
             FVector::UpVector,
@@ -283,16 +294,24 @@ bool ASpineGenerator::SolveTerrainAlignment()
             }
             float FinalLeftZ = Sample.LeftDevelopmentProfileZ[ProfileIndex];
             float FinalRightZ = Sample.RightDevelopmentProfileZ[ProfileIndex];
+            bool bLeftWaterAffected = false;
+            bool bRightWaterAffected = false;
             Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
                 FVector2D(BaseLocation - BaseRight * Lateral),
-                FinalLeftZ, HeightCache
-            ) && Sample.LeftDevelopmentProfileZ[ProfileIndex] - FinalLeftZ
-                <= MaximumDevelopmentCarveDepth;
+                FinalLeftZ, HeightCache, &bLeftWaterAffected
+            ) && !bLeftWaterAffected
+                && Sample.LeftDevelopmentProfileZ[ProfileIndex] - FinalLeftZ
+                    <= MaximumDevelopmentCarveDepth;
             Sample.bDevelopmentSuitable &= Data->SampleFinalHeight(
                 FVector2D(BaseLocation + BaseRight * Lateral),
-                FinalRightZ, HeightCache
-            ) && Sample.RightDevelopmentProfileZ[ProfileIndex] - FinalRightZ
-                <= MaximumDevelopmentCarveDepth;
+                FinalRightZ, HeightCache, &bRightWaterAffected
+            ) && !bRightWaterAffected
+                && Sample.RightDevelopmentProfileZ[ProfileIndex] - FinalRightZ
+                    <= MaximumDevelopmentCarveDepth;
+            // Retained roadside geometry follows the same post-water surface
+            // that decided suitability. Unsuitable bays are omitted later.
+            Sample.LeftDevelopmentProfileZ[ProfileIndex] = FinalLeftZ;
+            Sample.RightDevelopmentProfileZ[ProfileIndex] = FinalRightZ;
         }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
     }

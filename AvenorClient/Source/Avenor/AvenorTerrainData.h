@@ -86,6 +86,10 @@ struct AVENOR_API FAvenorBakedLakeBasin
     UPROPERTY(VisibleAnywhere, Category = "Lake")
     double MaximumDepth = 500.0;
 
+    /** Exact bed depth requested from the native Lake Modifier. */
+    UPROPERTY(VisibleAnywhere, Category = "Lake")
+    double ModifierBedDepth = 3000.0;
+
     UPROPERTY(VisibleAnywhere, Category = "Lake")
     double BankBlendWidth = 24000.0;
 
@@ -279,7 +283,8 @@ public:
     bool SampleFinalHeight(
         const FVector2D& WorldPosition,
         float& OutHeight,
-        FAvenorTerrainHeightChunkCache& Cache
+        FAvenorTerrainHeightChunkCache& Cache,
+        bool* bOutWaterAffected = nullptr
     ) const;
 
     bool SampleTerrain(
