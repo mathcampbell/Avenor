@@ -45,7 +45,8 @@ void AProceduralTerrainGenerator::ConfigurePCGComponent(
 
     Component->Seed = WorldSeed;
     Component->bIsComponentPartitioned = true;
-    Component->bRegenerateInEditor = false;
+    Component->GenerationTrigger =
+        EPCGComponentGenerationTrigger::GenerateOnDemand;
     if (Graph)
     {
         Component->SetGraphLocal(Graph);

@@ -80,7 +80,8 @@ ASpineGenerator::ASpineGenerator()
         TEXT("InfrastructurePCG")
     );
     InfrastructurePCG->bIsComponentPartitioned = false;
-    InfrastructurePCG->bRegenerateInEditor = false;
+    InfrastructurePCG->GenerationTrigger =
+        EPCGComponentGenerationTrigger::GenerateOnDemand;
 }
 
 void ASpineGenerator::PostLoad()
@@ -672,7 +673,8 @@ void ASpineGenerator::ResetToPrototypeDefaults()
     {
         InfrastructurePCG->CleanupLocal(true);
         InfrastructurePCG->bIsComponentPartitioned = false;
-        InfrastructurePCG->bRegenerateInEditor = false;
+        InfrastructurePCG->GenerationTrigger =
+            EPCGComponentGenerationTrigger::GenerateOnDemand;
     }
 
     bPartitionedGeneration = false;
