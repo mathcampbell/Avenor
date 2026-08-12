@@ -408,6 +408,10 @@ bool ASpineGenerator::SolveTerrainAlignment()
     // Actual water, rather than the much wider shoreline carve/blend, defines
     // bridge spans. Extend each crossing onto dry ground by the editable
     // setback, hold the transport datum level, and omit development there.
+    //
+    // This pass runs after the ordinary grade solver, so it must also build
+    // grade-limited approaches. Writing the deck samples alone would create a
+    // step between the flat deck and the first unmodified land sample.
     const int32 SetbackSamples = FMath::Max(
         0,
         FMath::CeilToInt(BridgeApproachSetback / FMath::Max(1.0f, Step))
@@ -447,6 +451,38 @@ bool ASpineGenerator::SolveTerrainAlignment()
             AlignmentSamples[Index].RoadDatumZ = DeckZ;
             AlignmentSamples[Index].bDevelopmentSuitable = false;
         }
+
+        auto BuildBridgeApproach = [&](int32 FirstIndex, int32 Direction)
+        {
+            float PreviousZ = DeckZ;
+            int32 PreviousIndex = Direction < 0 ? SpanStart : SpanEnd;
+            for (int32 Index = FirstIndex;
+                 AlignmentSamples.IsValidIndex(Index);
+                 Index += Direction)
+            {
+                const float Distance = FMath::Abs(
+                    AlignmentSamples[Index].Chainage
+                    - AlignmentSamples[PreviousIndex].Chainage
+                );
+                const float MaximumDelta = MaximumRoadGrade * Distance;
+                const float OriginalZ = AlignmentSamples[Index].RoadDatumZ;
+                const float LimitedZ = FMath::Clamp(
+                    OriginalZ,
+                    PreviousZ - MaximumDelta,
+                    PreviousZ + MaximumDelta
+                );
+                if (FMath::IsNearlyEqual(LimitedZ, OriginalZ, 0.1f))
+                {
+                    break;
+                }
+                AlignmentSamples[Index].RoadDatumZ = LimitedZ;
+                AlignmentSamples[Index].bDevelopmentSuitable = false;
+                PreviousZ = LimitedZ;
+                PreviousIndex = Index;
+            }
+        };
+        BuildBridgeApproach(SpanStart - 1, -1);
+        BuildBridgeApproach(SpanEnd + 1, 1);
         WaterStart = WaterEnd + 1;
     }
 
@@ -1290,6 +1326,19 @@ void ASpineGenerator::RebuildDerivedSplines()
     {
         if (Spline)
         {
+            // The solved datum is piecewise linear and already grade-limited.
+            // Cubic spline tangents can overshoot between valid samples and
+            // make the rendered/PCG highway steeper than MaximumRoadGrade.
+            for (int32 PointIndex = 0;
+                 PointIndex < Spline->GetNumberOfSplinePoints();
+                 ++PointIndex)
+            {
+                Spline->SetSplinePointType(
+                    PointIndex,
+                    ESplinePointType::Linear,
+                    false
+                );
+            }
             Spline->UpdateSpline();
         }
     }
@@ -1557,36 +1606,51 @@ void ASpineGenerator::RebuildGreyboxSegments()
         {
             return;
         }
-        AddGreyboxSpan(
-            RoadKind,
-            RoadCentreChainage,
-            RoadCentreChainage,
-            StartLateral,
-            EndLateral,
-            RoadThickness * 0.5f,
-            CarriagewayWidth,
-            RoadThickness,
-            DistrictIndex,
-            Side
+        // A cross street can span a complete 100 m block. Emit short pieces
+        // so its centreline and pavements follow the sampled lateral terrain
+        // profile instead of forming one chord between the two end heights.
+        const float SegmentLength = FMath::Min(
+            1000.0f,
+            FMath::Max(200.0f, DevelopmentProfileSampleSpacing)
         );
-
-        for (const int32 EdgeSide : {-1, 1})
+        const float Direction = EndLateral >= StartLateral ? 1.0f : -1.0f;
+        for (float Lateral = StartLateral;
+             Direction * Lateral < Direction * EndLateral;
+             Lateral += Direction * SegmentLength)
         {
-            const float PavementChainage = RoadCentreChainage
-                + EdgeSide * (CarriagewayWidth * 0.5f
-                    + PavementWidth * 0.5f);
+            const float NextLateral = Direction > 0.0f
+                ? FMath::Min(Lateral + SegmentLength, EndLateral)
+                : FMath::Max(Lateral - SegmentLength, EndLateral);
             AddGreyboxSpan(
-                PavementKind,
-                PavementChainage,
-                PavementChainage,
-                StartLateral,
-                EndLateral,
-                PavementThickness * 0.5f,
-                PavementWidth,
-                PavementThickness,
+                RoadKind,
+                RoadCentreChainage,
+                RoadCentreChainage,
+                Lateral,
+                NextLateral,
+                RoadThickness * 0.5f,
+                CarriagewayWidth,
+                RoadThickness,
                 DistrictIndex,
                 Side
             );
+            for (const int32 EdgeSide : {-1, 1})
+            {
+                const float PavementChainage = RoadCentreChainage
+                    + EdgeSide * (CarriagewayWidth * 0.5f
+                        + PavementWidth * 0.5f);
+                AddGreyboxSpan(
+                    PavementKind,
+                    PavementChainage,
+                    PavementChainage,
+                    Lateral,
+                    NextLateral,
+                    PavementThickness * 0.5f,
+                    PavementWidth,
+                    PavementThickness,
+                    DistrictIndex,
+                    Side
+                );
+            }
         }
     };
 

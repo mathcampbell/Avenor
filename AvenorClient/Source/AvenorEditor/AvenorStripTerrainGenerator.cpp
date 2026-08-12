@@ -2822,11 +2822,13 @@ static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVe
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
         // Open river paths use clamped tangents to prevent cubic Z overshoot
-        // between valid downhill samples. Closed lake/ocean shores retain
-        // ordinary smooth curve tangents.
+        // between valid downhill samples. Closed water polygons must remain
+        // inside the same straight-edged boundary stored in Terrain Data;
+        // curved lake tangents can bulge outside that polygon, making visible
+        // water that the Spine's authoritative water test cannot detect.
         Spline.SetSplinePointType(
             Index,
-            bClosed ? ESplinePointType::Curve : ESplinePointType::CurveClamped,
+            bClosed ? ESplinePointType::Linear : ESplinePointType::CurveClamped,
             false
         );
     }
