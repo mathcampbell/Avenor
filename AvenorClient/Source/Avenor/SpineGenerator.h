@@ -12,11 +12,21 @@ class ASpineGenerator;
 class UAvenorTerrainData;
 class UAvenorSpineTerrainModifier;
 
+struct FAvenorGeneratedWaterFootprint
+{
+    bool bClosed = false;
+    TArray<FVector> Points;
+    float HalfWidth = 0.0f;
+};
+
 namespace AvenorSpineEditorBridge
 {
     /** Registered by AvenorEditor; absent in packaged game targets. */
     extern AVENOR_API TFunction<bool(ASpineGenerator*)> BindTerrainModifier;
     extern AVENOR_API TFunction<void(ASpineGenerator*)> ClearTerrainModifier;
+    extern AVENOR_API TFunction<bool(
+        ASpineGenerator*, TArray<FAvenorGeneratedWaterFootprint>&
+    )> CollectGeneratedWater;
 }
 
 /** One sample in the solved road-level vertical alignment. */

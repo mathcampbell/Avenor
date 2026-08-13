@@ -4,6 +4,11 @@
 #include "SpineGenerator.h"
 #include "MeshPartition.h"
 #include "MeshPartitionMeshView.h"
+#include "EngineUtils.h"
+#include "WaterBodyLakeActor.h"
+#include "WaterBodyRiverActor.h"
+#include "WaterSplineComponent.h"
+#include "WaterSplineMetadata.h"
 
 namespace UE::Avenor::Spine
 {
@@ -246,9 +251,81 @@ FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 
 namespace
 {
+static const FName GeneratedWaterTag(TEXT("AvenorStripWater"));
+
 UAvenorSpineTerrainModifier* FindModifier(ASpineGenerator* Spine)
 {
     return Spine ? Spine->FindComponentByClass<UAvenorSpineTerrainModifier>() : nullptr;
+}
+
+bool CollectGeneratedWater(
+    ASpineGenerator* Spine,
+    TArray<FAvenorGeneratedWaterFootprint>& OutFootprints
+)
+{
+    OutFootprints.Reset();
+    UWorld* World = Spine ? Spine->GetWorld() : nullptr;
+    if (!World)
+    {
+        return false;
+    }
+    constexpr float SampleSpacing = 500.0f;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!Actor || !Actor->Tags.Contains(GeneratedWaterTag))
+        {
+            continue;
+        }
+        AWaterBodyLake* Lake = Cast<AWaterBodyLake>(Actor);
+        AWaterBodyRiver* River = Cast<AWaterBodyRiver>(Actor);
+        UWaterSplineComponent* Spline = Lake
+            ? Lake->GetWaterBodyComponent()->GetWaterSpline()
+            : River
+                ? River->GetWaterBodyComponent()->GetWaterSpline()
+                : nullptr;
+        if (!Spline || Spline->GetNumberOfSplinePoints() < 2)
+        {
+            continue;
+        }
+        FAvenorGeneratedWaterFootprint& Footprint =
+            OutFootprints.AddDefaulted_GetRef();
+        Footprint.bClosed = Lake != nullptr;
+        Footprint.HalfWidth = River ? 400.0f : 0.0f;
+        const float Length = Spline->GetSplineLength();
+        const int32 IntervalCount = FMath::Max(
+            Footprint.bClosed ? 3 : 1,
+            FMath::CeilToInt(Length / SampleSpacing)
+        );
+        const int32 PointCount = Footprint.bClosed
+            ? IntervalCount
+            : IntervalCount + 1;
+        Footprint.Points.Reserve(PointCount);
+        for (int32 Index = 0; Index < PointCount; ++Index)
+        {
+            const float Distance = Length
+                * static_cast<float>(Index)
+                / static_cast<float>(IntervalCount);
+            Footprint.Points.Add(Spline->GetLocationAtDistanceAlongSpline(
+                Distance, ESplineCoordinateSpace::World
+            ));
+        }
+        if (River)
+        {
+            if (const UWaterSplineMetadata* Metadata = Cast<UWaterSplineMetadata>(
+                    Spline->GetSplinePointsMetadata()))
+            {
+                if (!Metadata->RiverWidth.Points.IsEmpty())
+                {
+                    Footprint.HalfWidth = FMath::Max(
+                        0.0f,
+                        Metadata->RiverWidth.Points[0].OutVal * 0.5f
+                    );
+                }
+            }
+        }
+    }
+    return !OutFootprints.IsEmpty();
 }
 }
 
@@ -316,10 +393,13 @@ void RegisterAvenorSpineTerrainModifierBridge()
         UAvenorSpineTerrainModifier::BindToSpine;
     AvenorSpineEditorBridge::ClearTerrainModifier =
         UAvenorSpineTerrainModifier::ClearFromSpine;
+    AvenorSpineEditorBridge::CollectGeneratedWater =
+        CollectGeneratedWater;
 }
 
 void UnregisterAvenorSpineTerrainModifierBridge()
 {
     AvenorSpineEditorBridge::BindTerrainModifier = nullptr;
     AvenorSpineEditorBridge::ClearTerrainModifier = nullptr;
+    AvenorSpineEditorBridge::CollectGeneratedWater = nullptr;
 }

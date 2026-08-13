@@ -13,6 +13,72 @@ TFunction<bool(ASpineGenerator*)>
     AvenorSpineEditorBridge::BindTerrainModifier;
 TFunction<void(ASpineGenerator*)>
     AvenorSpineEditorBridge::ClearTerrainModifier;
+TFunction<bool(ASpineGenerator*, TArray<FAvenorGeneratedWaterFootprint>&)>
+    AvenorSpineEditorBridge::CollectGeneratedWater;
+
+namespace
+{
+bool SampleGeneratedWater(
+    const TArray<FAvenorGeneratedWaterFootprint>& Footprints,
+    const FVector2D& Position,
+    float& OutSurfaceZ
+)
+{
+    bool bFound = false;
+    OutSurfaceZ = -TNumericLimits<float>::Max();
+    for (const FAvenorGeneratedWaterFootprint& Water : Footprints)
+    {
+        if (Water.Points.Num() < (Water.bClosed ? 3 : 2))
+        {
+            continue;
+        }
+        if (Water.bClosed)
+        {
+            bool bInside = false;
+            for (int32 Index = 0, Previous = Water.Points.Num() - 1;
+                 Index < Water.Points.Num(); Previous = Index++)
+            {
+                const FVector& A = Water.Points[Previous];
+                const FVector& B = Water.Points[Index];
+                const bool bCrosses = (A.Y > Position.Y) != (B.Y > Position.Y);
+                if (bCrosses && Position.X < (B.X - A.X)
+                        * (Position.Y - A.Y) / (B.Y - A.Y) + A.X)
+                {
+                    bInside = !bInside;
+                }
+            }
+            if (bInside)
+            {
+                OutSurfaceZ = FMath::Max(OutSurfaceZ, Water.Points[0].Z);
+                bFound = true;
+            }
+            continue;
+        }
+        for (int32 Index = 0; Index + 1 < Water.Points.Num(); ++Index)
+        {
+            const FVector& A3 = Water.Points[Index];
+            const FVector& B3 = Water.Points[Index + 1];
+            const FVector2D A(A3);
+            const FVector2D B(B3);
+            const FVector2D Segment = B - A;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(
+                    Position - A, Segment) / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            if ((Position - (A + Segment * Alpha)).Size() <= Water.HalfWidth)
+            {
+                OutSurfaceZ = FMath::Max(
+                    OutSurfaceZ,
+                    static_cast<float>(FMath::Lerp(A3.Z, B3.Z, Alpha))
+                );
+                bFound = true;
+            }
+        }
+    }
+    return bFound;
+}
+}
 
 
 namespace AvenorSpineTags
@@ -222,6 +288,19 @@ bool ASpineGenerator::SolveTerrainAlignment()
     FAvenorTerrainHeightChunkCache HeightCache;
     TArray<bool> ActualWaterSamples;
     TArray<float> WaterSurfaceHeights;
+    TArray<FAvenorGeneratedWaterFootprint> GeneratedWater;
+    const bool bUseGeneratedWater =
+        AvenorSpineEditorBridge::CollectGeneratedWater
+        && AvenorSpineEditorBridge::CollectGeneratedWater(
+            this, GeneratedWater
+        );
+    const auto SampleAuthoritativeWater = [&](const FVector2D& Position,
+                                               float& OutSurfaceZ)
+    {
+        return bUseGeneratedWater
+            ? SampleGeneratedWater(GeneratedWater, Position, OutSurfaceZ)
+            : Data->SampleWaterSurface(Position, OutSurfaceZ);
+    };
     ActualWaterSamples.Reserve(SampleCount);
     WaterSurfaceHeights.Reserve(SampleCount);
     for (int32 Index = 0; Index < SampleCount; ++Index)
@@ -253,7 +332,7 @@ bool ASpineGenerator::SolveTerrainAlignment()
         }
         float FinalCentreZ = Sample.NaturalTerrainZ;
         float WaterSurfaceZ = 0.0f;
-        const bool bActualWater = Data->SampleWaterSurface(
+        const bool bActualWater = SampleAuthoritativeWater(
             FVector2D(BaseLocation), WaterSurfaceZ
         );
         ActualWaterSamples.Add(bActualWater);
@@ -303,11 +382,11 @@ bool ASpineGenerator::SolveTerrainAlignment()
             float FinalLeftZ = Sample.LeftDevelopmentProfileZ[ProfileIndex];
             float FinalRightZ = Sample.RightDevelopmentProfileZ[ProfileIndex];
             float LateralWaterSurfaceZ = 0.0f;
-            const bool bLeftActualWater = Data->SampleWaterSurface(
+            const bool bLeftActualWater = SampleAuthoritativeWater(
                 FVector2D(BaseLocation - BaseRight * Lateral),
                 LateralWaterSurfaceZ
             );
-            const bool bRightActualWater = Data->SampleWaterSurface(
+            const bool bRightActualWater = SampleAuthoritativeWater(
                 FVector2D(BaseLocation + BaseRight * Lateral),
                 LateralWaterSurfaceZ
             );
@@ -329,6 +408,46 @@ bool ASpineGenerator::SolveTerrainAlignment()
             Sample.RightDevelopmentProfileZ[ProfileIndex] = FinalRightZ;
         }
         Sample.RoadDatumZ = Sample.NaturalTerrainZ + RoadDatumOffset;
+    }
+
+    // A water crossing is an interval property, not merely a station
+    // property. Probe between the normal alignment samples so a narrow or
+    // oblique lake crossing cannot be missed even when both 10 m endpoints
+    // happen to lie outside the shoreline.
+    constexpr int32 WaterIntervalSubdivisions = 4;
+    for (int32 Index = 0; Index + 1 < AlignmentSamples.Num(); ++Index)
+    {
+        for (int32 Subdivision = 1;
+             Subdivision < WaterIntervalSubdivisions;
+             ++Subdivision)
+        {
+            const float Alpha = static_cast<float>(Subdivision)
+                / WaterIntervalSubdivisions;
+            const float ProbeChainage = FMath::Lerp(
+                AlignmentSamples[Index].Chainage,
+                AlignmentSamples[Index + 1].Chainage,
+                Alpha
+            );
+            FVector ProbeLocation;
+            FVector ProbeForward;
+            GetBaseSplineFrameAtChainage(
+                ProbeChainage, ProbeLocation, ProbeForward
+            );
+            float ProbeSurfaceZ = 0.0f;
+            if (!SampleAuthoritativeWater(
+                    FVector2D(ProbeLocation), ProbeSurfaceZ))
+            {
+                continue;
+            }
+            WaterSurfaceHeights[Index] = ActualWaterSamples[Index]
+                ? FMath::Max(WaterSurfaceHeights[Index], ProbeSurfaceZ)
+                : ProbeSurfaceZ;
+            WaterSurfaceHeights[Index + 1] = ActualWaterSamples[Index + 1]
+                ? FMath::Max(WaterSurfaceHeights[Index + 1], ProbeSurfaceZ)
+                : ProbeSurfaceZ;
+            ActualWaterSamples[Index] = true;
+            ActualWaterSamples[Index + 1] = true;
+        }
     }
 
     TArray<float> SmoothedHeights;

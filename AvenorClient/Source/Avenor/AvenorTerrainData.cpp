@@ -6,6 +6,83 @@ namespace
 {
 constexpr uint32 TerrainChunkMagic = 0x41564431; // AVD1
 constexpr int32 TerrainChunkPayloadVersion = 1;
+
+// Lake actors use explicit closed Catmull-Rom/Hermite tangents. Sample the
+// same curve here so terrain carving, water tests and Spine bridge detection
+// all use the visible shoreline rather than its straight control polygon.
+static FVector2D EvaluateLakeBoundary(
+    const TArray<FVector>& Shoreline,
+    int32 SegmentIndex,
+    double Alpha
+)
+{
+    const int32 Count = Shoreline.Num();
+    const int32 AIndex = SegmentIndex;
+    const int32 BIndex = (SegmentIndex + 1) % Count;
+    const FVector2D A(Shoreline[AIndex]);
+    const FVector2D B(Shoreline[BIndex]);
+    const FVector2D TangentA = (
+        FVector2D(Shoreline[(AIndex + 1) % Count])
+        - FVector2D(Shoreline[(AIndex - 1 + Count) % Count])
+    ) * 0.5;
+    const FVector2D TangentB = (
+        FVector2D(Shoreline[(BIndex + 1) % Count])
+        - FVector2D(Shoreline[(BIndex - 1 + Count) % Count])
+    ) * 0.5;
+    const double A2 = Alpha * Alpha;
+    const double A3 = A2 * Alpha;
+    return A * (2.0 * A3 - 3.0 * A2 + 1.0)
+        + TangentA * (A3 - 2.0 * A2 + Alpha)
+        + B * (-2.0 * A3 + 3.0 * A2)
+        + TangentB * (A3 - A2);
+}
+
+static void QueryLakeBoundary(
+    const TArray<FVector>& Shoreline,
+    const FVector2D& Position,
+    bool& bOutInside,
+    double& OutDistance
+)
+{
+    bOutInside = false;
+    OutDistance = TNumericLimits<double>::Max();
+    if (Shoreline.Num() < 3)
+    {
+        return;
+    }
+    constexpr int32 Subdivisions = 8;
+    FVector2D Previous(Shoreline[0]);
+    for (int32 SegmentIndex = 0; SegmentIndex < Shoreline.Num(); ++SegmentIndex)
+    {
+        for (int32 Step = 1; Step <= Subdivisions; ++Step)
+        {
+            const FVector2D Current = EvaluateLakeBoundary(
+                Shoreline,
+                SegmentIndex,
+                static_cast<double>(Step) / Subdivisions
+            );
+            const FVector2D Segment = Current - Previous;
+            const double LengthSquared = Segment.SizeSquared();
+            const double Projection = LengthSquared > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(FVector2D::DotProduct(
+                    Position - Previous, Segment) / LengthSquared, 0.0, 1.0)
+                : 0.0;
+            OutDistance = FMath::Min(
+                OutDistance,
+                (Position - (Previous + Segment * Projection)).Size()
+            );
+            const bool bCrosses = (Previous.Y > Position.Y)
+                != (Current.Y > Position.Y);
+            if (bCrosses && Position.X < (Current.X - Previous.X)
+                    * (Position.Y - Previous.Y)
+                    / (Current.Y - Previous.Y) + Previous.X)
+            {
+                bOutInside = !bOutInside;
+            }
+            Previous = Current;
+        }
+    }
+}
 }
 
 bool FAvenorBakedSpineLayer::HasValidData() const
@@ -191,31 +268,10 @@ bool UAvenorTerrainData::SampleFinalHeight(
         }
 
         bool bInside = false;
-        double DistanceToShore = TNumericLimits<double>::Max();
-        for (int32 Index = 0, Previous = Lake.Shoreline.Num() - 1;
-             Index < Lake.Shoreline.Num(); Previous = Index++)
-        {
-            const FVector2D A(Lake.Shoreline[Previous]);
-            const FVector2D B(Lake.Shoreline[Index]);
-            const FVector2D Segment = B - A;
-            const double LengthSquared = Segment.SizeSquared();
-            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
-                ? FMath::Clamp(FVector2D::DotProduct(
-                    WorldPosition - A, Segment) / LengthSquared, 0.0, 1.0)
-                : 0.0;
-            DistanceToShore = FMath::Min(
-                DistanceToShore,
-                (WorldPosition - (A + Segment * Alpha)).Size()
-            );
-
-            const bool bCrosses = (A.Y > WorldPosition.Y)
-                != (B.Y > WorldPosition.Y);
-            if (bCrosses && WorldPosition.X < (B.X - A.X)
-                    * (WorldPosition.Y - A.Y) / (B.Y - A.Y) + A.X)
-            {
-                bInside = !bInside;
-            }
-        }
+        double DistanceToShore = 0.0;
+        QueryLakeBoundary(
+            Lake.Shoreline, WorldPosition, bInside, DistanceToShore
+        );
 
         const double BankWidth = FMath::Max(0.0, Lake.BankBlendWidth);
         if (!bInside && DistanceToShore >= BankWidth)
@@ -304,19 +360,10 @@ bool UAvenorTerrainData::SampleWaterSurface(
             continue;
         }
         bool bInside = false;
-        for (int32 Index = 0, Previous = Lake.Shoreline.Num() - 1;
-             Index < Lake.Shoreline.Num(); Previous = Index++)
-        {
-            const FVector2D A(Lake.Shoreline[Previous]);
-            const FVector2D B(Lake.Shoreline[Index]);
-            const bool bCrosses = (A.Y > WorldPosition.Y)
-                != (B.Y > WorldPosition.Y);
-            if (bCrosses && WorldPosition.X < (B.X - A.X)
-                    * (WorldPosition.Y - A.Y) / (B.Y - A.Y) + A.X)
-            {
-                bInside = !bInside;
-            }
-        }
+        double IgnoredDistance = 0.0;
+        QueryLakeBoundary(
+            Lake.Shoreline, WorldPosition, bInside, IgnoredDistance
+        );
         if (bInside)
         {
             OutSurfaceHeight = FMath::Max(
