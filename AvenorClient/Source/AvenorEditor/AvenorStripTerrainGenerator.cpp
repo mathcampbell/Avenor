@@ -3167,6 +3167,25 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     HeadwaterValleyHalfWidth = FMath::Max(10000.0, WaterTerrain.RiverBankWidth);
     MainValleyHalfWidth = FMath::Max(80000.0, WaterTerrain.RiverBankWidth * 3.0);
 
+    RefinementEdgeLengthHeadwater = FMath::Max(
+        100.0, Refinement.HeadwaterEdgeLength
+    );
+    RefinementEdgeLengthMainRiver = FMath::Max(
+        100.0, Refinement.MainRiverEdgeLength
+    );
+    RefinementEdgeLengthCanyon = FMath::Max(
+        100.0, Refinement.CanyonEdgeLength
+    );
+    RefinementEdgeLengthLakeShore = FMath::Max(
+        100.0, Refinement.LakeShoreEdgeLength
+    );
+    RefinementCoverageMargin = FMath::Max(
+        0.0, Refinement.CoverageMargin
+    );
+    RefinementMaxTessellationLevel = FMath::Clamp(
+        Refinement.MaximumTessellationLevel, 1, 6
+    );
+
     bGenerateLakes = Hydrology.bLakes;
     MaximumLakeCount = Hydrology.MaximumLakes;
     MinimumLakeDepth = Hydrology.MinimumLakeDepression;

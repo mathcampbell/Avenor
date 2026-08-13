@@ -132,6 +132,31 @@ struct FAvenorWaterTerrainSettings
     FName LakeShoreWeight = TEXT("LakeShore");
 };
 
+/** Controls local remeshing around water without changing hydrology. */
+USTRUCT(BlueprintType)
+struct FAvenorTerrainRefinementSettings
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (Units = "cm", ClampMin = "100.0", ToolTip = "Target edge length around narrow headwater channels. Three metres retains several vertices across the default channel without production-scale triangle counts."))
+    double HeadwaterEdgeLength = 300.0;
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (Units = "cm", ClampMin = "100.0", ToolTip = "Target edge length around broad main-river channels."))
+    double MainRiverEdgeLength = 500.0;
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (Units = "cm", ClampMin = "100.0", ToolTip = "Target edge length for canyon walls and rims."))
+    double CanyonEdgeLength = 300.0;
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (Units = "cm", ClampMin = "100.0", ToolTip = "Target edge length around lake shorelines."))
+    double LakeShoreEdgeLength = 400.0;
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (Units = "cm", ClampMin = "0.0", ToolTip = "Extra refined ground beyond the visible channel or shoreline. Keep this modest because its area dominates triangle count."))
+    double CoverageMargin = 2000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Refinement", meta = (ClampMin = "1", ClampMax = "6", ToolTip = "Maximum local subdivision depth. Four is the production default; use three for quick iteration builds."))
+    int32 MaximumTessellationLevel = 4;
+};
+
 UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
 class AVENOREDITOR_API UAvenorStripTerrainModifier : public UE::MeshPartition::UModifierComponent
 {
@@ -219,6 +244,9 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Water", meta = (ShowOnlyInnerProperties))
     FAvenorWaterTerrainSettings WaterTerrain;
 
+    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (ShowOnlyInnerProperties))
+    FAvenorTerrainRefinementSettings Refinement;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Preview", meta = (Units = "cm"))
     FVector2D PreviewCentreOffset = FVector2D::ZeroVector;
 
@@ -287,13 +315,13 @@ public:
     double MainRiverWidth = 12000.0;
     double MaximumRiverDepth = 1800.0;
     double RiverChannelSteepness = 2.2;
-    double RefinementEdgeLengthHeadwater = 150.0;
-    double RefinementEdgeLengthMainRiver = 200.0;
-    double RefinementEdgeLengthCanyon = 100.0;
-    double RefinementEdgeLengthLakeShore = 150.0;
-    double RefinementCoverageMargin = 2500.0;
+    double RefinementEdgeLengthHeadwater = 300.0;
+    double RefinementEdgeLengthMainRiver = 500.0;
+    double RefinementEdgeLengthCanyon = 300.0;
+    double RefinementEdgeLengthLakeShore = 400.0;
+    double RefinementCoverageMargin = 2000.0;
     double RefinementMaximumCanyonRadius = 30000.0;
-    int32 RefinementMaxTessellationLevel = 6;
+    int32 RefinementMaxTessellationLevel = 4;
     double HeadwaterValleyHalfWidth = 10000.0;
     double MainValleyHalfWidth = 80000.0;
     double MaximumValleyDepth = 14000.0;
