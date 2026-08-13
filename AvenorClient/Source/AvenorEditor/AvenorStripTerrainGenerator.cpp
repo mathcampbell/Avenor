@@ -2815,29 +2815,53 @@ static TWaterActor* SpawnWaterActor(
     return Actor;
 }
 
-static void ConfigureExactSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, bool bClosed)
+static void ConfigureWaterSpline(
+    UWaterSplineComponent& Spline,
+    const TArray<FVector>& Points,
+    bool bClosed
+)
 {
     Spline.SetSplinePoints(Points, ESplineCoordinateSpace::World, false);
     Spline.SetClosedLoop(bClosed, false);
     for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
     {
-        // Open river paths use clamped tangents to prevent cubic Z overshoot
-        // between valid downhill samples. Closed water polygons must remain
-        // inside the same straight-edged boundary stored in Terrain Data;
-        // curved lake tangents can bulge outside that polygon, making visible
-        // water that the Spine's authoritative water test cannot detect.
-        Spline.SetSplinePointType(
-            Index,
-            bClosed ? ESplinePointType::Linear : ESplinePointType::CurveClamped,
-            false
-        );
+        Spline.SetSplinePointType(Index, ESplinePointType::Curve, false);
     }
     Spline.UpdateSpline();
 }
 
 static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
 {
-    ConfigureExactSpline(Spline, Points, false);
+    ConfigureWaterSpline(Spline, Points, false);
+
+    // Ordinary Curve points restore the smooth plan-view meanders that
+    // CurveClamped visibly faceted. Replace only their vertical tangents with
+    // zero-slope Hermite tangents: Z then transitions monotonically between
+    // the already downhill-constrained samples and cannot overshoot into the
+    // unexplained humps that originally prompted CurveClamped.
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        const int32 PreviousIndex = FMath::Max(0, Index - 1);
+        const int32 NextIndex = FMath::Min(Points.Num() - 1, Index + 1);
+        FVector Tangent = (Points[NextIndex] - Points[PreviousIndex]) * 0.5;
+        if (Index == 0 && Points.Num() > 1)
+        {
+            Tangent = Points[1] - Points[0];
+        }
+        else if (Index + 1 == Points.Num() && Points.Num() > 1)
+        {
+            Tangent = Points[Index] - Points[Index - 1];
+        }
+        Tangent.Z = 0.0;
+        Spline.SetTangentsAtSplinePoint(
+            Index,
+            Tangent,
+            Tangent,
+            ESplineCoordinateSpace::World,
+            false
+        );
+    }
+    Spline.UpdateSpline();
     UWaterSplineMetadata* Metadata = Cast<UWaterSplineMetadata>(Spline.GetSplinePointsMetadata());
     if (Metadata)
     {
@@ -3684,7 +3708,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         if (AWaterBodyOcean* Ocean = SpawnWaterActor<AWaterBodyOcean>(
             *World, TEXT("Avenor_Strip_Ocean"), OwnerTag))
         {
-            ConfigureExactSpline(*Ocean->GetWaterBodyComponent()->GetWaterSpline(), ToWorldPoints(Data->OceanBoundary), true);
+            ConfigureWaterSpline(*Ocean->GetWaterBodyComponent()->GetWaterSpline(), ToWorldPoints(Data->OceanBoundary), true);
             Ocean->PostEditChange();
         }
     }
@@ -3704,7 +3728,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             FString::Printf(TEXT("Avenor_Strip_Lake_%02d"), Index + 1),
             OwnerTag))
         {
-            ConfigureExactSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
+            ConfigureWaterSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
             Lake->GetWaterBodyComponent()->GetWaterSpline()->K2_SynchronizeAndBroadcastDataChange();
             ConfigureWaterTerrainSettings(
                 *Lake, true, WaterTerrain.LakeBedDepth,

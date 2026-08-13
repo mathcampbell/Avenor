@@ -241,7 +241,7 @@ UAvenorSpineTerrainModifier::CreateBackgroundOp(UE::MeshPartition::EBuildType Bu
 
 FGuid UAvenorSpineTerrainModifier::GetCodeVersionKey() const
 {
-    return FGuid(TEXT("d9170dcb-1be1-44bc-a468-130352abc150"));
+    return FGuid(TEXT("3f5c6a2e-e38b-4b55-97f0-b40ca65c1ee9"));
 }
 
 namespace
@@ -276,7 +276,12 @@ bool UAvenorSpineTerrainModifier::BindToSpine(ASpineGenerator* Spine)
         Modifier->SetAffectedMeshPartition(nullptr);
         return false;
     }
-    Modifier->SetPriorityLayer(Layers.Last());
+    // Shape the engineered corridor after the broad terrain operation but
+    // before the final-layer refinement and native water modifiers. Putting
+    // this modifier in Layers.Last() allowed it to run after lake carving and
+    // refill the lake bed; rivers happened to work only because their higher
+    // sub-priority carved the corridor again afterwards.
+    Modifier->SetPriorityLayer(Layers[0]);
     Modifier->SetPriority(Spine->TerrainModifierPriority);
     Modifier->PostEditChange();
     Partition->Modify();
