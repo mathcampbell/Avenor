@@ -5,7 +5,7 @@
 namespace
 {
 constexpr uint32 TerrainChunkMagic = 0x41564431; // AVD1
-constexpr int32 TerrainChunkPayloadVersion = 1;
+constexpr int32 TerrainChunkPayloadVersion = 2;
 
 // Lake actors use explicit closed Catmull-Rom/Hermite tangents. Sample the
 // same curve here so terrain carving, water tests and Spine bridge detection
@@ -163,6 +163,9 @@ bool UAvenorTerrainData::LoadSampleChunk(
     Archive << DiscardFloat; // FilledHeight
     Archive << OutChunk.Accumulation;
     Archive << OutChunk.Slope;
+    Archive << OutChunk.Temperature;
+    Archive << OutChunk.Moisture;
+    Archive << OutChunk.Biome;
     Archive << DiscardInt;   // ReceiverA
     Archive << DiscardInt;   // ReceiverB
     Archive << DiscardFloat; // ReceiverWeightA
@@ -179,7 +182,10 @@ bool UAvenorTerrainData::LoadSampleChunk(
         && OutChunk.Desert.Num() == Expected
         && OutChunk.Plains.Num() == Expected
         && OutChunk.Accumulation.Num() == Expected
-        && OutChunk.Slope.Num() == Expected;
+        && OutChunk.Slope.Num() == Expected
+        && OutChunk.Temperature.Num() == Expected
+        && OutChunk.Moisture.Num() == Expected
+        && OutChunk.Biome.Num() == Expected;
 }
 
 bool UAvenorTerrainData::SampleBaseHeight(
@@ -426,6 +432,11 @@ bool UAvenorTerrainData::SampleTerrain(
         Value.Plains = SampleChunk->Plains[LocalIndex];
         Value.Accumulation = SampleChunk->Accumulation[LocalIndex];
         Value.Slope = SampleChunk->Slope[LocalIndex];
+        Value.Temperature = SampleChunk->Temperature[LocalIndex];
+        Value.Moisture = SampleChunk->Moisture[LocalIndex];
+        Value.Biome = static_cast<EAvenorBiomeClass>(
+            SampleChunk->Biome[LocalIndex]
+        );
         return true;
     };
 
@@ -455,7 +466,37 @@ bool UAvenorTerrainData::SampleTerrain(
     OutSample.Plains = Bilinear(S00.Plains, S10.Plains, S01.Plains, S11.Plains);
     OutSample.Accumulation = Bilinear(S00.Accumulation, S10.Accumulation, S01.Accumulation, S11.Accumulation);
     OutSample.Slope = Bilinear(S00.Slope, S10.Slope, S01.Slope, S11.Slope);
+    OutSample.Temperature = Bilinear(
+        S00.Temperature, S10.Temperature, S01.Temperature, S11.Temperature
+    );
+    OutSample.Moisture = Bilinear(
+        S00.Moisture, S10.Moisture, S01.Moisture, S11.Moisture
+    );
+    const bool bRight = AlphaX >= 0.5f;
+    const bool bTop = AlphaY >= 0.5f;
+    OutSample.Biome = bTop
+        ? (bRight ? S11.Biome : S01.Biome)
+        : (bRight ? S10.Biome : S00.Biome);
     return true;
+}
+
+FColor UAvenorTerrainData::GetBiomeColour(EAvenorBiomeClass Biome)
+{
+    switch (Biome)
+    {
+    case EAvenorBiomeClass::ColdDry:         return FColor(126, 145, 151);
+    case EAvenorBiomeClass::ColdMoist:       return FColor(35, 82, 67);
+    case EAvenorBiomeClass::TemperateDry:    return FColor(174, 164, 83);
+    case EAvenorBiomeClass::TemperateMoist:  return FColor(60, 122, 57);
+    case EAvenorBiomeClass::WarmDry:         return FColor(176, 125, 68);
+    case EAvenorBiomeClass::WarmMoist:       return FColor(39, 139, 73);
+    case EAvenorBiomeClass::HotDry:          return FColor(219, 181, 92);
+    case EAvenorBiomeClass::HotWet:          return FColor(18, 105, 58);
+    case EAvenorBiomeClass::AlpineTundra:    return FColor(151, 157, 137);
+    case EAvenorBiomeClass::SnowIce:         return FColor(232, 244, 248);
+    case EAvenorBiomeClass::Wetland:         return FColor(52, 116, 113);
+    default:                                 return FColor::Magenta;
+    }
 }
 
 float UAvenorTerrainData::SampleRiverWeight(

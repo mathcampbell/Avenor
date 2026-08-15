@@ -5,6 +5,52 @@
 
 #include "AvenorTerrainData.generated.h"
 
+class UTexture2D;
+
+/** Stable IDs and colours used by generated PCG Biome source textures. */
+UENUM(BlueprintType)
+enum class EAvenorBiomeClass : uint8
+{
+    ColdDry,
+    ColdMoist,
+    TemperateDry,
+    TemperateMoist,
+    WarmDry,
+    WarmMoist,
+    HotDry,
+    HotWet,
+    AlpineTundra,
+    SnowIce,
+    Wetland
+};
+
+/** One independently loadable macro-climate source tile. */
+USTRUCT(BlueprintType)
+struct AVENOR_API FAvenorClimateTileReference
+{
+    GENERATED_BODY()
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    int32 TileIndex = 0;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    FBox2D WorldBounds = FBox2D(ForceInit);
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    FIntPoint StartCell = FIntPoint::ZeroValue;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    FIntPoint CellCount = FIntPoint::ZeroValue;
+
+    /** Exact biome-ID colours for BP_PCGBiomeTexture. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> BiomeTexture;
+
+    /** R = temperature, G = available moisture. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> ClimateFilterTexture;
+};
+
 USTRUCT(BlueprintType)
 struct AVENOR_API FAvenorTerrainDataChunk
 {
@@ -159,6 +205,9 @@ struct AVENOR_API FAvenorTerrainSample
     float Hill = 0.0f;
     float Desert = 0.0f;
     float Plains = 0.0f;
+    float Temperature = 0.5f;
+    float Moisture = 0.5f;
+    EAvenorBiomeClass Biome = EAvenorBiomeClass::TemperateMoist;
 };
 
 /** Expanded fields from one independently compressed terrain chunk. */
@@ -173,6 +222,9 @@ struct AVENOR_API FAvenorTerrainSampleChunk
     TArray<float> Plains;
     TArray<float> Accumulation;
     TArray<float> Slope;
+    TArray<float> Temperature;
+    TArray<float> Moisture;
+    TArray<uint8> Biome;
 };
 
 /** Per-operation cache; only chunks actually sampled are expanded. */
@@ -194,13 +246,13 @@ class AVENOR_API UAvenorTerrainData : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
-    static constexpr int32 CurrentFormatVersion = 1;
+    static constexpr int32 CurrentFormatVersion = 2;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     int32 FormatVersion = CurrentFormatVersion;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
-    int32 GeneratorAlgorithmVersion = 1;
+    int32 GeneratorAlgorithmVersion = 2;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     FString SettingsHash;
@@ -240,6 +292,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Hydrology")
     TArray<FVector> OceanBoundary;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Climate")
+    TArray<FAvenorClimateTileReference> ClimateTiles;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Layers|Spine")
     FAvenorBakedSpineLayer SpineLayer;
@@ -307,6 +362,10 @@ public:
         const FVector2D& WorldPosition,
         FAvenorTerrainHeightChunkCache& Cache
     ) const;
+
+    /** The exact palette used by generated biome-ID textures. */
+    UFUNCTION(BlueprintPure, Category = "Avenor|Climate")
+    static FColor GetBiomeColour(EAvenorBiomeClass Biome);
 
 private:
     bool LoadSampleChunk(

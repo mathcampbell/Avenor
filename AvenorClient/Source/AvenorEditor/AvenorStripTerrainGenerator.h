@@ -45,6 +45,41 @@ struct FAvenorLandformSettings
     double HillSize = 220000.0;
 };
 
+/**
+ * Low-frequency climate controls. Climate is evaluated on the existing
+ * analysis grid and baked beside the geography, so enabling it does not add
+ * another high-resolution world simulation.
+ */
+USTRUCT(BlueprintType)
+struct FAvenorClimateSettings
+{
+    GENERATED_BODY()
+
+    UPROPERTY(EditAnywhere, Category = "Climate")
+    bool bEnabled = true;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "0 is cold and 1 is hot. Elevation cools this regional baseline automatically."))
+    double Temperature = 0.5;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Regional precipitation before terrain drainage and proximity to generated water are applied."))
+    double Moisture = 0.5;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls slow regional variation. Adjacent control points remain constrained so climate cannot jump directly from cold to hot."))
+    double RegionalVariation = 0.55;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "100000.0", ToolTip = "Spacing of the smooth climate control points and length of each exported PCG source tile. Five kilometres is the recommended default."))
+    double RegionSpacing = 500000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "10000.0", ToolTip = "Distance over which rivers and lakes increase local habitat moisture."))
+    double WaterInfluenceDistance = 100000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double WaterMoistureBoost = 0.35;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ToolTip = "Compresses a wider climate range into a short proof-of-concept map. Leave disabled for geographically gentler transitions."))
+    bool bShowcaseClimateCompression = false;
+};
+
 /** Erosion is deliberately one coherent process, rather than a panel of unrelated coefficients. */
 USTRUCT(BlueprintType)
 struct FAvenorErosionSettings
@@ -235,6 +270,9 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (ShowOnlyInnerProperties))
     FAvenorLandformSettings Landforms;
 
+    UPROPERTY(EditAnywhere, Category = "Avenor|Climate", meta = (ShowOnlyInnerProperties))
+    FAvenorClimateSettings Climate;
+
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (ShowOnlyInnerProperties))
     FAvenorErosionSettings Erosion;
 
@@ -286,6 +324,14 @@ public:
     double HillZoneWeight = 1.0;
     double DesertZoneWeight = 0.0;
     double PlainsZoneWeight = 1.25;
+    bool bGenerateClimate = true;
+    double ClimateTemperature = 0.5;
+    double ClimateMoisture = 0.5;
+    double ClimateRegionalVariation = 0.55;
+    double ClimateRegionSpacing = 500000.0;
+    double ClimateWaterInfluenceDistance = 100000.0;
+    double ClimateWaterMoistureBoost = 0.35;
+    bool bShowcaseClimateCompression = false;
     bool bGenerateMountains = true;
     double MountainRelief = 300000.0;
     double MountainRangesPer100Km = 3.0;
