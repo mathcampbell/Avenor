@@ -23,7 +23,11 @@ enum class EAvenorBiomeClass : uint8
     SnowIce,
     Wetland,
     /** A locally wet pocket inside an otherwise arid warm/hot region. */
-    Oasis
+    Oasis,
+    Riverbed,
+    Riverbank,
+    Lakebed,
+    Lakeshore
 };
 
 /** One independently loadable macro-climate source tile. */
@@ -44,13 +48,25 @@ struct AVENOR_API FAvenorClimateTileReference
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     FIntPoint CellCount = FIntPoint::ZeroValue;
 
-    /** Exact biome-ID colours for BP_PCGBiomeTexture. */
+    /** Regional climate biome IDs; local terrain does not overwrite them. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
-    TSoftObjectPtr<UTexture2D> BiomeTexture;
+    TSoftObjectPtr<UTexture2D> BaseBiomeTexture;
 
-    /** R = temperature, G = available moisture. */
+    /** Snow/alpine/wetland/oasis and water-surface biome overlays. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> LocalBiomeTexture;
+
+    /** R/G = macro temperature/moisture; B/A = local values. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     TSoftObjectPtr<UTexture2D> ClimateFilterTexture;
+
+    /** R = elevation, G = slope, B = flow, A = exposed rock. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> TerrainFilterTexture;
+
+    /** R = riverbed, G = riverbank, B = lakebed, A = lakeshore. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> WaterSurfaceTexture;
 };
 
 USTRUCT(BlueprintType)
@@ -207,6 +223,8 @@ struct AVENOR_API FAvenorTerrainSample
     float Hill = 0.0f;
     float Desert = 0.0f;
     float Plains = 0.0f;
+    float MacroTemperature = 0.5f;
+    float MacroMoisture = 0.5f;
     float Temperature = 0.5f;
     float Moisture = 0.5f;
     EAvenorBiomeClass Biome = EAvenorBiomeClass::TemperateMoist;
@@ -224,6 +242,8 @@ struct AVENOR_API FAvenorTerrainSampleChunk
     TArray<float> Plains;
     TArray<float> Accumulation;
     TArray<float> Slope;
+    TArray<float> MacroTemperature;
+    TArray<float> MacroMoisture;
     TArray<float> Temperature;
     TArray<float> Moisture;
     TArray<uint8> Biome;
@@ -248,13 +268,13 @@ class AVENOR_API UAvenorTerrainData : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
-    static constexpr int32 CurrentFormatVersion = 3;
+    static constexpr int32 CurrentFormatVersion = 4;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     int32 FormatVersion = CurrentFormatVersion;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
-    int32 GeneratorAlgorithmVersion = 3;
+    int32 GeneratorAlgorithmVersion = 4;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     FString SettingsHash;
