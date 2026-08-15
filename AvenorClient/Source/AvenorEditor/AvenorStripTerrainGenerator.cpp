@@ -602,8 +602,8 @@ struct FAvenorStripData
 namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431; // AVD1
-static constexpr int32 ChunkPayloadVersion = 4;
-static constexpr int32 GeneratorAlgorithmVersion = 4;
+static constexpr int32 ChunkPayloadVersion = 5;
+static constexpr int32 GeneratorAlgorithmVersion = 5;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -651,29 +651,6 @@ static void ExtractIntChunk(
     }
 }
 
-static void ExtractByteChunk(
-    const TArray<uint8>& Source,
-    const FAvenorStripData& Data,
-    int32 StartX,
-    int32 StartY,
-    int32 CountX,
-    int32 CountY,
-    TArray<uint8>& Output
-)
-{
-    Output.SetNumUninitialized(CountX * CountY);
-    const bool bHasSource = Source.Num() == Data.Columns * Data.Rows;
-    for (int32 LocalY = 0; LocalY < CountY; ++LocalY)
-    {
-        for (int32 LocalX = 0; LocalX < CountX; ++LocalX)
-        {
-            const int32 LocalIndex = LocalY * CountX + LocalX;
-            const int32 SourceIndex = Data.Index(StartX + LocalX, StartY + LocalY);
-            Output[LocalIndex] = bHasSource ? Source[SourceIndex] : 0;
-        }
-    }
-}
-
 static bool CompressChunk(
     const FAvenorStripData& Data,
     int32 StartX,
@@ -699,7 +676,6 @@ static bool CompressChunk(
 
     TArray<float> FloatValues;
     TArray<int32> IntValues;
-    TArray<uint8> ByteValues;
     auto WriteFloat = [&](const TArray<double>& Source)
     {
         ExtractFloatChunk(Source, Data, StartX, StartY, CountX, CountY, FloatValues);
@@ -720,14 +696,6 @@ static bool CompressChunk(
     WriteFloat(Data.FilledHeight);
     WriteFloat(Data.Accumulation);
     WriteFloat(Data.Slope);
-    WriteFloat(Data.MacroTemperature);
-    WriteFloat(Data.MacroMoisture);
-    WriteFloat(Data.Temperature);
-    WriteFloat(Data.Moisture);
-    ExtractByteChunk(
-        Data.Biome, Data, StartX, StartY, CountX, CountY, ByteValues
-    );
-    Archive << ByteValues;
     WriteInt(Data.ReceiverA);
     WriteInt(Data.ReceiverB);
     WriteFloat(Data.ReceiverWeightA);
@@ -735,7 +703,7 @@ static bool CompressChunk(
     WriteInt(Data.LakeIndex);
 
     Chunk.UncompressedBytes = static_cast<int64>(CountX) * CountY
-        * (18 * sizeof(uint32) + sizeof(uint8));
+        * 14 * sizeof(uint32);
     Archive.Flush();
     return !Archive.GetError() && !Chunk.CompressedPayload.IsEmpty();
 }
@@ -794,33 +762,6 @@ static bool CopyIntChunkToGrid(
     return true;
 }
 
-static bool CopyByteChunkToGrid(
-    FArchive& Archive,
-    TArray<uint8>& Destination,
-    const FAvenorTerrainDataChunk& Chunk,
-    const FAvenorStripData& Data
-)
-{
-    TArray<uint8> Values;
-    Archive << Values;
-    const int32 Expected = Chunk.CellCount.X * Chunk.CellCount.Y;
-    if (Values.Num() != Expected)
-    {
-        return false;
-    }
-    for (int32 LocalY = 0; LocalY < Chunk.CellCount.Y; ++LocalY)
-    {
-        for (int32 LocalX = 0; LocalX < Chunk.CellCount.X; ++LocalX)
-        {
-            Destination[Data.Index(
-                Chunk.StartCell.X + LocalX,
-                Chunk.StartCell.Y + LocalY
-            )] = Values[LocalY * Chunk.CellCount.X + LocalX];
-        }
-    }
-    return true;
-}
-
 static bool DecompressChunk(
     const FAvenorTerrainDataChunk& Chunk,
     FAvenorStripData& Data
@@ -856,11 +797,6 @@ static bool DecompressChunk(
         && CopyFloatChunkToGrid(Archive, Data.FilledHeight, Chunk, Data)
         && CopyFloatChunkToGrid(Archive, Data.Accumulation, Chunk, Data)
         && CopyFloatChunkToGrid(Archive, Data.Slope, Chunk, Data)
-        && CopyFloatChunkToGrid(Archive, Data.MacroTemperature, Chunk, Data)
-        && CopyFloatChunkToGrid(Archive, Data.MacroMoisture, Chunk, Data)
-        && CopyFloatChunkToGrid(Archive, Data.Temperature, Chunk, Data)
-        && CopyFloatChunkToGrid(Archive, Data.Moisture, Chunk, Data)
-        && CopyByteChunkToGrid(Archive, Data.Biome, Chunk, Data)
         && CopyIntChunkToGrid(Archive, Data.ReceiverA, Chunk, Data)
         && CopyIntChunkToGrid(Archive, Data.ReceiverB, Chunk, Data)
         && CopyFloatChunkToGrid(Archive, Data.ReceiverWeightA, Chunk, Data)
@@ -4520,12 +4456,9 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData()
     Data->FilledHeight.SetNumZeroed(TotalCells);
     Data->Accumulation.SetNumZeroed(TotalCells);
     Data->Slope.SetNumZeroed(TotalCells);
-    Data->MacroTemperature.SetNumZeroed(TotalCells);
-    Data->MacroMoisture.SetNumZeroed(TotalCells);
-    Data->Temperature.SetNumZeroed(TotalCells);
-    Data->Moisture.SetNumZeroed(TotalCells);
-    Data->Runoff.Init(1.0, TotalCells);
-    Data->Biome.SetNumZeroed(TotalCells);
+    // Climate and biome grids are bake-time data. Their durable representation
+    // is the tiled texture set, so rebuilding Mesh Partition output from the
+    // baked asset must not allocate them again.
     Data->ReceiverA.Init(INDEX_NONE, TotalCells);
     Data->ReceiverB.Init(INDEX_NONE, TotalCells);
     Data->ReceiverWeightA.SetNumZeroed(TotalCells);

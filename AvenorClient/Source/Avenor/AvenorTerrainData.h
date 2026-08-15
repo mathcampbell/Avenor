@@ -223,11 +223,6 @@ struct AVENOR_API FAvenorTerrainSample
     float Hill = 0.0f;
     float Desert = 0.0f;
     float Plains = 0.0f;
-    float MacroTemperature = 0.5f;
-    float MacroMoisture = 0.5f;
-    float Temperature = 0.5f;
-    float Moisture = 0.5f;
-    EAvenorBiomeClass Biome = EAvenorBiomeClass::TemperateMoist;
 };
 
 /** Expanded fields from one independently compressed terrain chunk. */
@@ -242,11 +237,6 @@ struct AVENOR_API FAvenorTerrainSampleChunk
     TArray<float> Plains;
     TArray<float> Accumulation;
     TArray<float> Slope;
-    TArray<float> MacroTemperature;
-    TArray<float> MacroMoisture;
-    TArray<float> Temperature;
-    TArray<float> Moisture;
-    TArray<uint8> Biome;
 };
 
 /** Per-operation cache; only chunks actually sampled are expanded. */
@@ -268,13 +258,13 @@ class AVENOR_API UAvenorTerrainData : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
-    static constexpr int32 CurrentFormatVersion = 4;
+    static constexpr int32 CurrentFormatVersion = 5;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     int32 FormatVersion = CurrentFormatVersion;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
-    int32 GeneratorAlgorithmVersion = 4;
+    int32 GeneratorAlgorithmVersion = 5;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     FString SettingsHash;

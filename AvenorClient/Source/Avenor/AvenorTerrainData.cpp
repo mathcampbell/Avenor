@@ -5,7 +5,7 @@
 namespace
 {
 constexpr uint32 TerrainChunkMagic = 0x41564431; // AVD1
-constexpr int32 TerrainChunkPayloadVersion = 4;
+constexpr int32 TerrainChunkPayloadVersion = 5;
 
 // Lake actors use explicit closed Catmull-Rom/Hermite tangents. Sample the
 // same curve here so terrain carving, water tests and Spine bridge detection
@@ -163,11 +163,6 @@ bool UAvenorTerrainData::LoadSampleChunk(
     Archive << DiscardFloat; // FilledHeight
     Archive << OutChunk.Accumulation;
     Archive << OutChunk.Slope;
-    Archive << OutChunk.MacroTemperature;
-    Archive << OutChunk.MacroMoisture;
-    Archive << OutChunk.Temperature;
-    Archive << OutChunk.Moisture;
-    Archive << OutChunk.Biome;
     Archive << DiscardInt;   // ReceiverA
     Archive << DiscardInt;   // ReceiverB
     Archive << DiscardFloat; // ReceiverWeightA
@@ -184,12 +179,7 @@ bool UAvenorTerrainData::LoadSampleChunk(
         && OutChunk.Desert.Num() == Expected
         && OutChunk.Plains.Num() == Expected
         && OutChunk.Accumulation.Num() == Expected
-        && OutChunk.Slope.Num() == Expected
-        && OutChunk.MacroTemperature.Num() == Expected
-        && OutChunk.MacroMoisture.Num() == Expected
-        && OutChunk.Temperature.Num() == Expected
-        && OutChunk.Moisture.Num() == Expected
-        && OutChunk.Biome.Num() == Expected;
+        && OutChunk.Slope.Num() == Expected;
 }
 
 bool UAvenorTerrainData::SampleBaseHeight(
@@ -436,13 +426,6 @@ bool UAvenorTerrainData::SampleTerrain(
         Value.Plains = SampleChunk->Plains[LocalIndex];
         Value.Accumulation = SampleChunk->Accumulation[LocalIndex];
         Value.Slope = SampleChunk->Slope[LocalIndex];
-        Value.MacroTemperature = SampleChunk->MacroTemperature[LocalIndex];
-        Value.MacroMoisture = SampleChunk->MacroMoisture[LocalIndex];
-        Value.Temperature = SampleChunk->Temperature[LocalIndex];
-        Value.Moisture = SampleChunk->Moisture[LocalIndex];
-        Value.Biome = static_cast<EAvenorBiomeClass>(
-            SampleChunk->Biome[LocalIndex]
-        );
         return true;
     };
 
@@ -472,25 +455,6 @@ bool UAvenorTerrainData::SampleTerrain(
     OutSample.Plains = Bilinear(S00.Plains, S10.Plains, S01.Plains, S11.Plains);
     OutSample.Accumulation = Bilinear(S00.Accumulation, S10.Accumulation, S01.Accumulation, S11.Accumulation);
     OutSample.Slope = Bilinear(S00.Slope, S10.Slope, S01.Slope, S11.Slope);
-    OutSample.MacroTemperature = Bilinear(
-        S00.MacroTemperature, S10.MacroTemperature,
-        S01.MacroTemperature, S11.MacroTemperature
-    );
-    OutSample.MacroMoisture = Bilinear(
-        S00.MacroMoisture, S10.MacroMoisture,
-        S01.MacroMoisture, S11.MacroMoisture
-    );
-    OutSample.Temperature = Bilinear(
-        S00.Temperature, S10.Temperature, S01.Temperature, S11.Temperature
-    );
-    OutSample.Moisture = Bilinear(
-        S00.Moisture, S10.Moisture, S01.Moisture, S11.Moisture
-    );
-    const bool bRight = AlphaX >= 0.5f;
-    const bool bTop = AlphaY >= 0.5f;
-    OutSample.Biome = bTop
-        ? (bRight ? S11.Biome : S01.Biome)
-        : (bRight ? S10.Biome : S00.Biome);
     return true;
 }
 
