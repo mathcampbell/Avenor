@@ -5,7 +5,7 @@
 namespace
 {
 constexpr uint32 TerrainChunkMagic = 0x41564431; // AVD1
-constexpr int32 TerrainChunkPayloadVersion = 2;
+constexpr int32 TerrainChunkPayloadVersion = 3;
 
 // Lake actors use explicit closed Catmull-Rom/Hermite tangents. Sample the
 // same curve here so terrain carving, water tests and Spine bridge detection
@@ -495,6 +495,7 @@ FColor UAvenorTerrainData::GetBiomeColour(EAvenorBiomeClass Biome)
     case EAvenorBiomeClass::AlpineTundra:    return FColor(151, 157, 137);
     case EAvenorBiomeClass::SnowIce:         return FColor(232, 244, 248);
     case EAvenorBiomeClass::Wetland:         return FColor(52, 116, 113);
+    case EAvenorBiomeClass::Oasis:           return FColor(42, 171, 151);
     default:                                 return FColor::Magenta;
     }
 }

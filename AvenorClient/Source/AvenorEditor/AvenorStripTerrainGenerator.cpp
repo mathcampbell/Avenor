@@ -600,8 +600,8 @@ struct FAvenorStripData
 namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431; // AVD1
-static constexpr int32 ChunkPayloadVersion = 2;
-static constexpr int32 GeneratorAlgorithmVersion = 2;
+static constexpr int32 ChunkPayloadVersion = 3;
+static constexpr int32 GeneratorAlgorithmVersion = 3;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2334,15 +2334,23 @@ static void ExtractRivers(
         Points.Reserve(CandidateReach.Cells.Num());
         double MeanSlope = 0.0;
         double MeanResistance = 0.0;
+        double MeanDesert = 0.0;
+        double MeanMoisture = 0.0;
         for (int32 Cell : CandidateReach.Cells)
         {
             const FVector2D Position = Data.CellPosition(Cell);
             Points.Emplace(Position.X, Position.Y, Data.FilledHeight[Cell]);
             MeanSlope += Data.Slope[Cell];
             MeanResistance += Data.Resistance.IsValidIndex(Cell) ? Data.Resistance[Cell] : 0.0;
+            MeanDesert += Data.DesertMask.IsValidIndex(Cell)
+                ? Data.DesertMask[Cell] : 0.0;
+            MeanMoisture += Data.Moisture.IsValidIndex(Cell)
+                ? Data.Moisture[Cell] : 0.5;
         }
         MeanSlope /= CandidateReach.Cells.Num();
         MeanResistance /= CandidateReach.Cells.Num();
+        MeanDesert /= CandidateReach.Cells.Num();
+        MeanMoisture /= CandidateReach.Cells.Num();
         Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
@@ -2405,7 +2413,19 @@ static void ExtractRivers(
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
         River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
         River.ChannelSteepness = ChannelSteepness;
-        if (bCanyons && Area >= CanyonStartArea && MeanSlope > 0.055 && MeanResistance > 0.25)
+        // Moist climates cut broader green valleys. Arid, resistant terrain
+        // automatically enables the existing deep, narrow canyon profile,
+        // without requiring the legacy global mesa switch to be enabled.
+        const double HumidValley = Smooth01(FMath::Clamp(
+            (MeanMoisture - 0.48) / 0.42, 0.0, 1.0
+        ));
+        River.ValleyHalfWidth *= FMath::Lerp(0.96, 1.18, HumidValley);
+        River.ValleyDepth *= FMath::Lerp(0.94, 1.08, HumidValley);
+        const bool bClimateCanyon = MeanDesert > 0.42;
+        if ((bCanyons || bClimateCanyon)
+            && Area >= CanyonStartArea
+            && MeanSlope > 0.045
+            && MeanResistance > 0.22)
         {
             River.ValleyHalfWidth *= FMath::Lerp(0.75, 0.42, MeanResistance);
             River.ValleyDepth = FMath::Max(River.ValleyDepth, MaximumValleyDepth * FMath::Lerp(1.1, 1.5, MeanResistance));
@@ -2621,6 +2641,9 @@ static double EvaluateLandform(
     double HillsRelief,
     double HillsScale,
     double MesaScale,
+    bool bClimateEnabled,
+    double ClimateTemperature,
+    double ClimateMoisture,
     double& OutResistance,
     double& OutMountainMask,
     double& OutHillMask,
@@ -2669,9 +2692,35 @@ static double EvaluateLandform(
     // configured relief at its own core rather than being diluted by
     // whatever three other independent noise fields happen to be doing at
     // the same point.
-    double HillWeighted = ZoneAffinity(131.0) * FMath::Max(0.0, HillWeight);
-    double DesertWeighted = ZoneAffinity(277.0) * FMath::Max(0.0, DesertWeight);
-    double PlainsWeighted = ZoneAffinity(419.0) * FMath::Max(0.0, PlainsWeight);
+    // Geology still decides where mountains and the underlying low-frequency
+    // zones are. Climate biases the surface expression: warm, dry regions
+    // expose resistant desert rock, while moist regions favour broader
+    // erodible hills and plains. This is a weighting pass, not another
+    // terrain simulation.
+    const double Warmth = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.28) / 0.58, 0.0, 1.0
+        ))
+        : 0.0;
+    const double Dryness = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
+        ))
+        : 0.0;
+    const double Aridity = Warmth * Dryness;
+    const double Humidity = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateMoisture - 0.32) / 0.55, 0.0, 1.0
+        ))
+        : 0.5;
+    double HillWeighted = ZoneAffinity(131.0)
+        * FMath::Max(0.0, HillWeight) * FMath::Lerp(0.82, 1.12, Humidity);
+    double DesertWeighted = ZoneAffinity(277.0)
+        * FMath::Max(0.0, DesertWeight);
+    DesertWeighted += Aridity * 1.65;
+    double PlainsWeighted = ZoneAffinity(419.0)
+        * FMath::Max(0.0, PlainsWeight)
+        * FMath::Lerp(0.92, 1.12, 1.0 - Aridity);
     const double WeightSum = FMath::Max(
         0.0001, HillWeighted + DesertWeighted + PlainsWeighted
     );
@@ -2820,16 +2869,41 @@ static double EvaluateLandform(
         const double HillNoise = Fbm(Warped, HillsScale, SeedOffset + FVector2D(887.0, 157.0), 5, 0.54, 2.03);
         Height += HillNoise * HillsRelief * HillAffinity;
     }
-    if (bDesert)
+    if (bDesert || DesertAffinity > 0.04)
     {
-        // No mesa/canyon shape is painted here at all. This only sets down
-        // a gentle base (soft rolling ground, nothing dramatic) plus a
-        // resistance value; erosion is what actually carves canyons where
-        // a river cuts through and leaves mesa remnants where resistant
-        // rock nearby didn't erode at the same rate.
-        const double DesertNoise = 0.5 + 0.5 * Fbm(Warped, MesaScale, SeedOffset + FVector2D(555.0, 222.0), 4);
-        Height += (DesertNoise - 0.5) * HillsRelief * 0.35 * DesertAffinity;
-        OutResistance = DesertAffinity * FMath::Clamp(0.55 + 0.45 * DesertNoise, 0.0, 1.0);
+        const double DesertNoise = 0.5 + 0.5 * Fbm(
+            Warped, MesaScale,
+            SeedOffset + FVector2D(555.0, 222.0), 4
+        );
+        // Broad, sharp-edged uplift supplies plateau remnants for the stream
+        // power pass to cut through. It is deliberately modest: resistance
+        // and river carving, rather than stacks of procedural terraces, make
+        // the final mesa/canyon silhouette.
+        const double ClimateMesaStrength = bClimateEnabled ? Aridity : 1.0;
+        double PlateauMask = 0.0;
+        // Skip the extra plateau noise entirely outside genuinely arid
+        // regions. This keeps ordinary hills/plains at the old generation
+        // cost even though their blended desert affinity may be non-zero.
+        if (bDesert || ClimateMesaStrength > 0.28)
+        {
+            const double PlateauSignal = 0.5 + 0.5 * Fbm(
+                Warped,
+                MesaScale * 1.8,
+                SeedOffset + FVector2D(811.0, 397.0),
+                3, 0.55, 2.0
+            );
+            PlateauMask = Smooth01(FMath::Clamp(
+                (PlateauSignal - 0.48) / 0.24, 0.0, 1.0
+            ));
+        }
+        Height += (DesertNoise - 0.5) * HillsRelief * 0.28
+            * DesertAffinity;
+        Height += PlateauMask * HillsRelief * 0.62
+            * DesertAffinity * ClimateMesaStrength;
+        OutResistance = DesertAffinity * FMath::Clamp(
+            0.48 + 0.38 * DesertNoise + 0.20 * PlateauMask,
+            0.0, 1.0
+        );
     }
     else
     {
@@ -2847,7 +2921,7 @@ using namespace UE::Avenor::Strip;
 
 namespace UE::Avenor::Strip
 {
-static void BuildInitialClimate(
+static void BuildMacroClimate(
     FAvenorStripData& Data,
     const AAvenorStripTerrainGenerator& Generator
 )
@@ -2896,19 +2970,25 @@ static void BuildInitialClimate(
     double MoistureTrend = Random.FRandRange(-0.10f, 0.10f);
     const double MaximumTemperatureStep = Generator.bShowcaseClimateCompression
         ? 0.22 : 0.11;
+    const double ShowcaseVariation = Generator.bShowcaseClimateCompression
+        ? 2.2 : 1.0;
+    const double ShowcaseMoistureVariation =
+        Generator.bShowcaseClimateCompression ? 1.6 : 1.0;
     for (int32 Index = 1; Index < AnchorCount; ++Index)
     {
         TemperatureTrend = FMath::Clamp(
             TemperatureTrend * 0.72
                 + Random.FRandRange(-0.055f, 0.055f)
-                    * Generator.ClimateRegionalVariation,
+                    * Generator.ClimateRegionalVariation
+                    * ShowcaseVariation,
             -MaximumTemperatureStep,
             MaximumTemperatureStep
         );
         MoistureTrend = FMath::Clamp(
             MoistureTrend * 0.55
                 + Random.FRandRange(-0.12f, 0.12f)
-                    * Generator.ClimateRegionalVariation,
+                    * Generator.ClimateRegionalVariation
+                    * ShowcaseMoistureVariation,
             -0.18,
             0.18
         );
@@ -2954,32 +3034,62 @@ static void BuildInitialClimate(
             Position, Spacing * 1.7, NoiseSeed + FVector2D(619.0, 277.0),
             3, 0.55, 2.0
         );
-        const double ElevationCooling = FMath::Clamp(
-            FMath::Max(0.0, Data.Height[Cell]) / 300000.0,
-            0.0, 1.25
-        ) * 0.38;
-        const double ElevationDrying = FMath::Clamp(
-            FMath::Max(0.0, Data.Height[Cell]) / 300000.0,
-            0.0, 1.25
-        ) * 0.12;
-        const double ExposedUplandDrying = ElevationDrying
-            + FMath::Clamp(Data.MountainMask[Cell], 0.0, 1.0) * 0.04;
         const double Temperature = FMath::Clamp(
             MacroTemperature
-                + TemperatureNoise * Generator.ClimateRegionalVariation * 0.07
-                - ElevationCooling,
+                + TemperatureNoise
+                    * Generator.ClimateRegionalVariation * 0.07,
             0.0, 1.0
         );
         const double Precipitation = FMath::Clamp(
             MacroMoisture
-                + MoistureNoise * Generator.ClimateRegionalVariation * 0.14
-                - ExposedUplandDrying,
+                + MoistureNoise
+                    * Generator.ClimateRegionalVariation * 0.14,
             0.0, 1.0
         );
         Data.Temperature[Cell] = Temperature;
         Data.Moisture[Cell] = Precipitation;
         Data.Runoff[Cell] = FMath::Clamp(
             0.28 + Precipitation * 1.45 - Temperature * 0.22,
+            0.08, 1.75
+        );
+    }
+}
+
+static void ApplyTerrainClimate(
+    FAvenorStripData& Data,
+    const AAvenorStripTerrainGenerator& Generator
+)
+{
+    const int32 CellCount = Data.Columns * Data.Rows;
+    if (!Generator.bGenerateClimate
+        || Data.Temperature.Num() != CellCount
+        || Data.Moisture.Num() != CellCount
+        || Data.Runoff.Num() != CellCount)
+    {
+        return;
+    }
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const double ElevationFraction = FMath::Clamp(
+            FMath::Max(0.0, Data.Height[Cell]) / 300000.0,
+            0.0, 1.25
+        );
+        const double MountainExposure = FMath::Clamp(
+            Data.MountainMask[Cell], 0.0, 1.0
+        );
+        Data.Temperature[Cell] = FMath::Clamp(
+            Data.Temperature[Cell] - ElevationFraction * 0.38,
+            0.0, 1.0
+        );
+        Data.Moisture[Cell] = FMath::Clamp(
+            Data.Moisture[Cell]
+                - ElevationFraction * 0.12
+                - MountainExposure * 0.04,
+            0.0, 1.0
+        );
+        Data.Runoff[Cell] = FMath::Clamp(
+            0.28 + Data.Moisture[Cell] * 1.45
+                - Data.Temperature[Cell] * 0.22,
             0.08, 1.75
         );
     }
@@ -3057,6 +3167,7 @@ static void RefineClimateFromHydrology(
     );
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
+        const double RegionalMoisture = Data.Moisture[Cell];
         const double WaterProximity = Smooth01(
             1.0 - WaterDistance[Cell] / InfluenceDistance
         );
@@ -3088,6 +3199,13 @@ static void RefineClimateFromHydrology(
             && Data.MountainMask[Cell] > 0.3)
         {
             Biome = EAvenorBiomeClass::AlpineTundra;
+        }
+        else if (Temperature >= 0.50
+            && RegionalMoisture < 0.42
+            && AvailableMoisture >= 0.48
+            && WaterProximity > 0.30)
+        {
+            Biome = EAvenorBiomeClass::Oasis;
         }
         else if (AvailableMoisture > 0.84
             && Data.Slope[Cell] < 0.04
@@ -3146,6 +3264,11 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     Data->DesertMask.SetNumUninitialized(CellCount);
     Data->PlainsMask.SetNumUninitialized(CellCount);
 
+    // Establish the low-frequency climate before selecting lowland terrain
+    // forms. This lets dry warm regions become desert/mesa terrain rather
+    // than merely receiving a desert label after geography already exists.
+    BuildMacroClimate(*Data, Generator);
+
     TArray<FMountainRange> Mountains;
     if (Generator.bGenerateMountains)
     {
@@ -3172,7 +3295,10 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Mountains, Generator.ZoneLength,
             Generator.MountainZoneWeight, Generator.HillZoneWeight, Generator.DesertZoneWeight, Generator.PlainsZoneWeight,
             Generator.HillsRelief, Generator.HillsScale,
-            Generator.MesaScale, CellResistance,
+            Generator.MesaScale,
+            Generator.bGenerateClimate,
+            Data->Temperature[Cell], Data->Moisture[Cell],
+            CellResistance,
             CellMountainMask, CellHillMask, CellDesertMask, CellPlainsMask,
             Generator.bGenerateOcean, Generator.SeaLevel,
             Generator.MinimumOceanDepth, Generator.MaximumOceanDepth,
@@ -3186,10 +3312,9 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Data->PlainsMask[Cell] = CellPlainsMask;
     }
 
-    // Macro climate is intentionally computed on the existing coarse grid.
-    // Its runoff multiplier affects erosion and drainage, while the final
-    // habitat moisture is refined once generated rivers and lakes are known.
-    BuildInitialClimate(*Data, Generator);
+    // Apply height-dependent cooling/drying only after landforms exist. The
+    // resulting runoff then affects erosion and the drainage network.
+    ApplyTerrainClimate(*Data, Generator);
 
     ApplyThermalErosion(
         *Data, Generator.ThermalErosionIterations, Generator.ThermalErosionStrength,
@@ -3340,7 +3465,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("8d607f34-c152-4d76-94bc-92b334ef74b1")); }
+    static FGuid Version() { return FGuid(TEXT("2e22f565-a750-4f90-91fe-49b11af1060d")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -3708,6 +3833,13 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
         Climate.WaterMoistureBoost, 0.0, 1.0
     );
     bShowcaseClimateCompression = Climate.bShowcaseClimateCompression;
+
+    // Climate-generated arid rock needs to survive the broad erosion pass so
+    // the later river modifier can cut a canyon through a retained plateau.
+    // Non-desert cells have zero resistance, so this does not globally make
+    // the terrain harder or add another processing pass.
+    ErosionResistanceStrength = (bGenerateClimate || bGenerateMesasAndCanyons)
+        ? 0.55 : 0.0;
 
     const double ErosionStrength = FMath::Clamp(Erosion.Strength, 0.0, 1.0);
     ThermalErosionIterations = FMath::Clamp(Erosion.Passes, 1, 24);

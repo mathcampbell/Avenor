@@ -21,7 +21,9 @@ enum class EAvenorBiomeClass : uint8
     HotWet,
     AlpineTundra,
     SnowIce,
-    Wetland
+    Wetland,
+    /** A locally wet pocket inside an otherwise arid warm/hot region. */
+    Oasis
 };
 
 /** One independently loadable macro-climate source tile. */
@@ -246,13 +248,13 @@ class AVENOR_API UAvenorTerrainData : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
-    static constexpr int32 CurrentFormatVersion = 2;
+    static constexpr int32 CurrentFormatVersion = 3;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     int32 FormatVersion = CurrentFormatVersion;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
-    int32 GeneratorAlgorithmVersion = 2;
+    int32 GeneratorAlgorithmVersion = 3;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     FString SettingsHash;
