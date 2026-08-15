@@ -401,6 +401,7 @@ protected:
 private:
     void ResolveSettings();
     void InvalidateData();
+    void ReleaseCachedData();
     bool BakeData(const TSharedPtr<const FAvenorStripData>& Data);
     TSharedPtr<const FAvenorStripData> LoadBakedData() const;
     void BuildCompleteWorldFromCurrentData();

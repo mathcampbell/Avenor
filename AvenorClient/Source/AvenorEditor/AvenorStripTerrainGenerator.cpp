@@ -4264,6 +4264,25 @@ void AAvenorStripTerrainGenerator::InvalidateData()
     bRefinementPlanReadyForWater = false;
 }
 
+void AAvenorStripTerrainGenerator::ReleaseCachedData()
+{
+    int32 ReleasedCells = 0;
+    {
+        FScopeLock Lock(&DataMutex);
+        ReleasedCells = CachedData ? CachedData->Height.Num() : 0;
+        CachedData.Reset();
+    }
+    if (ReleasedCells > 0)
+    {
+        UE_LOG(
+            LogTemp,
+            Display,
+            TEXT("Avenor released the expanded terrain analysis cache (%d cells); Mesh Partition will continue from the baked chunk asset."),
+            ReleasedCells
+        );
+    }
+}
+
 FString AAvenorStripTerrainGenerator::BuildSettingsSnapshot() const
 {
     return FString::Printf(
@@ -4945,6 +4964,10 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
         Data->RiverTerminusLakeCandidates
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip terrain submitted: %s"), *LastBuildStamp);
+    if (!bDeferMeshRefresh)
+    {
+        ReleaseCachedData();
+    }
 #endif
 }
 
@@ -5052,7 +5075,7 @@ static bool SpawnRefinementSpline(
 void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
 {
 #if WITH_EDITOR
-    if (!bTerrainPlanReadyForWater || !CachedData)
+    if (!bTerrainPlanReadyForWater)
     {
         FMessageDialog::Open(
             EAppMsgType::Ok,
@@ -5101,6 +5124,18 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
     }
     TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
 
+    const TSharedPtr<const FAvenorStripData> Data = GetOrCreateData();
+    if (!Data)
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "The baked Avenor terrain data could not be loaded for refinement."
+            ))
+        );
+        return;
+    }
+
     FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating refinement splines...")));
     Progress.MakeDialog();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Replacing this generator's refinement splines")));
@@ -5126,9 +5161,9 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
 
     int32 CreatedRiverSplines = 0;
     int32 CreatedLakeSplines = 0;
-    for (int32 Index = 0; Index < CachedData->Rivers.Num(); ++Index)
+    for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
-        const FRiverReach& River = CachedData->Rivers[Index];
+        const FRiverReach& River = Data->Rivers[Index];
         const double EdgeLength = River.bIsCanyon
             ? RefinementEdgeLengthCanyon
             : FMath::Lerp(
@@ -5157,12 +5192,12 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
             ++CreatedRiverSplines;
         }
     }
-    for (int32 Index = 0; Index < CachedData->Lakes.Num(); ++Index)
+    for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
-        const FLakeBasin& Lake = CachedData->Lakes[Index];
+        const FLakeBasin& Lake = Data->Lakes[Index];
         const double ShoreRadius = FMath::Max(
             RefinementCoverageMargin,
-            CachedData->CellSize * 0.6
+            Data->CellSize * 0.6
         );
         if (SpawnRefinementSpline(
             *World,
@@ -5178,8 +5213,8 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
     }
 
     bRefinementPlanReadyForWater =
-        CreatedRiverSplines == CachedData->Rivers.Num() &&
-        CreatedLakeSplines == CachedData->Lakes.Num();
+        CreatedRiverSplines == Data->Rivers.Num() &&
+        CreatedLakeSplines == Data->Lakes.Num();
 
     if (bRefinementPlanReadyForWater && !bDeferMeshRefresh)
     {
@@ -5190,8 +5225,8 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         TEXT("Refinement splines placed %s | code %s | %d/%d river reaches | %d/%d lake shores"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
-        CreatedRiverSplines, CachedData->Rivers.Num(),
-        CreatedLakeSplines, CachedData->Lakes.Num()
+        CreatedRiverSplines, Data->Rivers.Num(),
+        CreatedLakeSplines, Data->Lakes.Num()
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip refinement splines placed: %s"), *LastBuildStamp);
     if (!bRefinementPlanReadyForWater)
@@ -5200,10 +5235,14 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
             EAppMsgType::Ok,
             FText::FromString(FString::Printf(
                 TEXT("Some refinement modifiers could not be created (%d/%d rivers and %d/%d lakes succeeded). Check the Output Log before rebuilding terrain."),
-                CreatedRiverSplines, CachedData->Rivers.Num(),
-                CreatedLakeSplines, CachedData->Lakes.Num()
+                CreatedRiverSplines, Data->Rivers.Num(),
+                CreatedLakeSplines, Data->Lakes.Num()
             ))
         );
+    }
+    if (!bDeferMeshRefresh)
+    {
+        ReleaseCachedData();
     }
 #endif
 }
@@ -5243,6 +5282,8 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
         FScopeLock Lock(&DataMutex);
         CachedData = GeneratedData;
     }
+    const int32 GeneratedRiverCount = GeneratedData->Rivers.Num();
+    const int32 GeneratedLakeCount = GeneratedData->Lakes.Num();
     BuildCompleteWorldFromCurrentData();
     LastBuildStamp = FString::Printf(
         TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes"),
@@ -5250,9 +5291,10 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
         *BakedTerrainData.ToSoftObjectPath().ToString(),
         *BuildSettingsHash(),
         BakedTerrainData.LoadSynchronous() ? BakedTerrainData.LoadSynchronous()->Chunks.Num() : 0,
-        CachedData ? CachedData->Rivers.Num() : 0,
-        CachedData ? CachedData->Lakes.Num() : 0
+        GeneratedRiverCount,
+        GeneratedLakeCount
     );
+    ReleaseCachedData();
 #endif
 }
 
@@ -5319,6 +5361,7 @@ void AAvenorStripTerrainGenerator::RebuildWorldFromBakedData()
             );
     }
     BuildCompleteWorldFromCurrentData();
+    ReleaseCachedData();
 #endif
 }
 
@@ -5347,6 +5390,7 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
                 *BuildSettingsHash()
             );
     }
+    const TSharedPtr<const FAvenorStripData> Data = CachedData;
     bTerrainPlanReadyForWater = true;
     bDeferMeshRefresh = true;
     ClearGeneratedWater();
@@ -5354,7 +5398,7 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
     GenerateRefinementSplines();
     if (bRefinementPlanReadyForWater)
     {
-        CreateWaterActors(CachedData);
+        CreateWaterActors(Data);
     }
     bDeferMeshRefresh = false;
     if (bRefinementPlanReadyForWater)
@@ -5364,9 +5408,10 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
     LastBuildStamp = FString::Printf(
         TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
-        CachedData ? CachedData->Rivers.Num() : 0,
-        CachedData ? CachedData->Lakes.Num() : 0
+        Data ? Data->Rivers.Num() : 0,
+        Data ? Data->Lakes.Num() : 0
     );
+    ReleaseCachedData();
 #endif
 }
 
@@ -5553,7 +5598,7 @@ void AAvenorStripTerrainGenerator::GenerateFastPreview()
 void AAvenorStripTerrainGenerator::GenerateWater()
 {
 #if WITH_EDITOR
-    if (!bTerrainPlanReadyForWater || !bRefinementPlanReadyForWater || !CachedData)
+    if (!bTerrainPlanReadyForWater || !bRefinementPlanReadyForWater)
     {
         FMessageDialog::Open(
             EAppMsgType::Ok,
@@ -5564,22 +5609,34 @@ void AAvenorStripTerrainGenerator::GenerateWater()
         );
         return;
     }
+    const TSharedPtr<const FAvenorStripData> Data = GetOrCreateData();
+    if (!Data)
+    {
+        FMessageDialog::Open(
+            EAppMsgType::Ok,
+            FText::FromString(TEXT(
+                "The baked Avenor terrain data could not be loaded for water generation."
+            ))
+        );
+        return;
+    }
 
     FScopedSlowTask Progress(2.0f, FText::FromString(TEXT("Generating strip water...")));
     Progress.MakeDialog();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Replacing this generator's water")));
     ClearGeneratedWater();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Creating lakes and rivers")));
-    CreateWaterActors(CachedData);
+    CreateWaterActors(Data);
     BindModifiersAndRefresh(true);
 
     LastBuildStamp = FString::Printf(
         TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
-        Seed, CachedData->Rivers.Num(), CachedData->Lakes.Num()
+        Seed, Data->Rivers.Num(), Data->Lakes.Num()
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip water generated: %s"), *LastBuildStamp);
+    ReleaseCachedData();
 #endif
 }
 
