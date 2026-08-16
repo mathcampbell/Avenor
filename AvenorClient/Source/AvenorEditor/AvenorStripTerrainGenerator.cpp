@@ -603,7 +603,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431; // AVD1
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 5;
+static constexpr int32 GeneratorAlgorithmVersion = 6;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1054,6 +1054,7 @@ static bool BuildClimateTextureTiles(
 )
 {
     Asset.ClimateTiles.Reset();
+    Asset.WorldClimateMaps = FAvenorWorldClimateMapReference();
     const int32 CellCount = Data.Columns * Data.Rows;
     if (Data.MacroTemperature.Num() != CellCount
         || Data.MacroMoisture.Num() != CellCount
@@ -1102,6 +1103,90 @@ static bool BuildClimateTextureTiles(
     const double HeightRange = FMath::Max(1.0, MaximumHeight - MinimumHeight);
     const double FlowLogRange = FMath::Max(1.0, FMath::Loge(1.0 + MaximumFlow));
 
+    TArray<FColor> WorldBaseBiomePixels;
+    TArray<FColor> WorldLocalBiomePixels;
+    TArray<FColor> WorldClimatePixels;
+    TArray<FColor> WorldTerrainPixels;
+    TArray<FColor> WorldWaterPixels;
+    WorldBaseBiomePixels.SetNumUninitialized(CellCount);
+    WorldLocalBiomePixels.SetNumUninitialized(CellCount);
+    WorldClimatePixels.SetNumUninitialized(CellCount);
+    WorldTerrainPixels.SetNumUninitialized(CellCount);
+    WorldWaterPixels.SetNumUninitialized(CellCount);
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        WorldBaseBiomePixels[Cell] = UAvenorTerrainData::GetBiomeColour(
+            ClassifyBaseBiome(
+                Data.MacroTemperature[Cell],
+                Data.MacroMoisture[Cell]
+            )
+        );
+        EAvenorBiomeClass LocalBiome =
+            static_cast<EAvenorBiomeClass>(Data.Biome[Cell]);
+        bool bHasLocalBiome = LocalBiome == EAvenorBiomeClass::SnowIce
+            || LocalBiome == EAvenorBiomeClass::AlpineTundra
+            || LocalBiome == EAvenorBiomeClass::Wetland
+            || LocalBiome == EAvenorBiomeClass::Oasis;
+        if (SurfaceMasks.Lakebed[Cell] >= 0.5)
+        {
+            LocalBiome = EAvenorBiomeClass::Lakebed;
+            bHasLocalBiome = true;
+        }
+        else if (SurfaceMasks.Riverbed[Cell] >= 0.5)
+        {
+            LocalBiome = EAvenorBiomeClass::Riverbed;
+            bHasLocalBiome = true;
+        }
+        else if (LocalBiome != EAvenorBiomeClass::SnowIce
+            && LocalBiome != EAvenorBiomeClass::AlpineTundra
+            && SurfaceMasks.Lakeshore[Cell] >= 0.25)
+        {
+            LocalBiome = EAvenorBiomeClass::Lakeshore;
+            bHasLocalBiome = true;
+        }
+        else if (LocalBiome != EAvenorBiomeClass::SnowIce
+            && LocalBiome != EAvenorBiomeClass::AlpineTundra
+            && SurfaceMasks.Riverbank[Cell] >= 0.25)
+        {
+            LocalBiome = EAvenorBiomeClass::Riverbank;
+            bHasLocalBiome = true;
+        }
+        WorldLocalBiomePixels[Cell] = bHasLocalBiome
+            ? UAvenorTerrainData::GetBiomeColour(LocalBiome)
+            : FColor(0, 0, 0, 0);
+        WorldClimatePixels[Cell] = FColor(
+            UnitToByte(Data.MacroTemperature[Cell]),
+            UnitToByte(Data.MacroMoisture[Cell]),
+            UnitToByte(Data.Temperature[Cell]),
+            UnitToByte(Data.Moisture[Cell])
+        );
+        const double NormalizedSlope = FMath::Clamp(
+            Data.Slope[Cell] / 0.35, 0.0, 1.0
+        );
+        const double ExposedRock = FMath::Clamp(
+            FMath::Max(
+                NormalizedSlope,
+                Data.MountainMask[Cell] * 0.68
+            ) * (1.0 - Data.Moisture[Cell] * 0.42)
+                + Data.DesertMask[Cell] * 0.24,
+            0.0, 1.0
+        );
+        WorldTerrainPixels[Cell] = FColor(
+            UnitToByte((Data.Height[Cell] - MinimumHeight) / HeightRange),
+            UnitToByte(NormalizedSlope),
+            UnitToByte(FMath::Loge(1.0 + FMath::Max(
+                0.0, Data.Accumulation[Cell]
+            )) / FlowLogRange),
+            UnitToByte(ExposedRock)
+        );
+        WorldWaterPixels[Cell] = FColor(
+            UnitToByte(SurfaceMasks.Riverbed[Cell]),
+            UnitToByte(SurfaceMasks.Riverbank[Cell]),
+            UnitToByte(SurfaceMasks.Lakebed[Cell]),
+            UnitToByte(SurfaceMasks.Lakeshore[Cell])
+        );
+    }
+
     for (int32 TileIndex = 0; TileIndex < TileCount; ++TileIndex)
     {
         const int32 LongStart = TileIndex * CellsPerTile;
@@ -1130,77 +1215,11 @@ static bool BuildClimateTextureTiles(
                     StartX + LocalX, StartY + LocalY
                 );
                 const int32 Pixel = LocalY * CountX + LocalX;
-                BaseBiomePixels[Pixel] = UAvenorTerrainData::GetBiomeColour(
-                    ClassifyBaseBiome(
-                        Data.MacroTemperature[SourceCell],
-                        Data.MacroMoisture[SourceCell]
-                    )
-                );
-                EAvenorBiomeClass LocalBiome =
-                    static_cast<EAvenorBiomeClass>(Data.Biome[SourceCell]);
-                bool bHasLocalBiome = LocalBiome == EAvenorBiomeClass::SnowIce
-                    || LocalBiome == EAvenorBiomeClass::AlpineTundra
-                    || LocalBiome == EAvenorBiomeClass::Wetland
-                    || LocalBiome == EAvenorBiomeClass::Oasis;
-                if (SurfaceMasks.Lakebed[SourceCell] >= 0.5)
-                {
-                    LocalBiome = EAvenorBiomeClass::Lakebed;
-                    bHasLocalBiome = true;
-                }
-                else if (SurfaceMasks.Riverbed[SourceCell] >= 0.5)
-                {
-                    LocalBiome = EAvenorBiomeClass::Riverbed;
-                    bHasLocalBiome = true;
-                }
-                else if (LocalBiome != EAvenorBiomeClass::SnowIce
-                    && LocalBiome != EAvenorBiomeClass::AlpineTundra
-                    && SurfaceMasks.Lakeshore[SourceCell] >= 0.25)
-                {
-                    LocalBiome = EAvenorBiomeClass::Lakeshore;
-                    bHasLocalBiome = true;
-                }
-                else if (LocalBiome != EAvenorBiomeClass::SnowIce
-                    && LocalBiome != EAvenorBiomeClass::AlpineTundra
-                    && SurfaceMasks.Riverbank[SourceCell] >= 0.25)
-                {
-                    LocalBiome = EAvenorBiomeClass::Riverbank;
-                    bHasLocalBiome = true;
-                }
-                LocalBiomePixels[Pixel] = bHasLocalBiome
-                    ? UAvenorTerrainData::GetBiomeColour(LocalBiome)
-                    : FColor(0, 0, 0, 0);
-                ClimatePixels[Pixel] = FColor(
-                    UnitToByte(Data.MacroTemperature[SourceCell]),
-                    UnitToByte(Data.MacroMoisture[SourceCell]),
-                    UnitToByte(Data.Temperature[SourceCell]),
-                    UnitToByte(Data.Moisture[SourceCell])
-                );
-                const double NormalizedSlope = FMath::Clamp(
-                    Data.Slope[SourceCell] / 0.35, 0.0, 1.0
-                );
-                const double ExposedRock = FMath::Clamp(
-                    FMath::Max(
-                        NormalizedSlope,
-                        Data.MountainMask[SourceCell] * 0.68
-                    ) * (1.0 - Data.Moisture[SourceCell] * 0.42)
-                        + Data.DesertMask[SourceCell] * 0.24,
-                    0.0, 1.0
-                );
-                TerrainPixels[Pixel] = FColor(
-                    UnitToByte((Data.Height[SourceCell] - MinimumHeight)
-                        / HeightRange),
-                    UnitToByte(NormalizedSlope),
-                    UnitToByte(FMath::Loge(1.0 + FMath::Max(
-                        0.0, Data.Accumulation[SourceCell]
-                    )) / FlowLogRange),
-                    UnitToByte(ExposedRock)
-                );
-                WaterPixels[Pixel] = FColor(
-                    UnitToByte(SurfaceMasks.Riverbed[SourceCell]),
-                    UnitToByte(SurfaceMasks.Riverbank[SourceCell]),
-                    UnitToByte(SurfaceMasks.Lakebed[SourceCell]),
-                    UnitToByte(SurfaceMasks.Lakeshore[SourceCell])
-                );
+                BaseBiomePixels[Pixel] = WorldBaseBiomePixels[SourceCell];
+                LocalBiomePixels[Pixel] = WorldLocalBiomePixels[SourceCell];
+                ClimatePixels[Pixel] = WorldClimatePixels[SourceCell];
+                TerrainPixels[Pixel] = WorldTerrainPixels[SourceCell];
+                WaterPixels[Pixel] = WorldWaterPixels[SourceCell];
             }
         }
 
@@ -1279,6 +1298,7 @@ static bool BuildClimateTextureTiles(
             || !AssetSubsystem->SaveLoadedAsset(WaterTexture, false))
         {
             Asset.ClimateTiles.Reset();
+            Asset.WorldClimateMaps = FAvenorWorldClimateMapReference();
             return false;
         }
 
@@ -1308,6 +1328,84 @@ static bool BuildClimateTextureTiles(
         Tile.TerrainFilterTexture = TerrainTexture;
         Tile.WaterSurfaceTexture = WaterTexture;
     }
+
+    const FString WorldBaseBiomeName = FString::Printf(
+        TEXT("T_AvenorWorldBiome_%s"), *OwnerName
+    );
+    const FString WorldLocalBiomeName = FString::Printf(
+        TEXT("T_AvenorWorldLocalBiome_%s"), *OwnerName
+    );
+    const FString WorldClimateName = FString::Printf(
+        TEXT("T_AvenorWorldClimate_%s"), *OwnerName
+    );
+    const FString WorldTerrainName = FString::Printf(
+        TEXT("T_AvenorWorldTerrainFilter_%s"), *OwnerName
+    );
+    const FString WorldWaterName = FString::Printf(
+        TEXT("T_AvenorWorldWaterSurface_%s"), *OwnerName
+    );
+    const FString WorldTextureFolder = TEXT("/Game/Avenor/Generated/Climate/World");
+    UTexture2D* WorldBaseBiomeTexture = CreateOrUpdateClimateTexture(
+        FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldBaseBiomeName),
+        WorldBaseBiomeName,
+        Data.Columns,
+        Data.Rows,
+        WorldBaseBiomePixels,
+        TF_Nearest
+    );
+    UTexture2D* WorldLocalBiomeTexture = CreateOrUpdateClimateTexture(
+        FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldLocalBiomeName),
+        WorldLocalBiomeName,
+        Data.Columns,
+        Data.Rows,
+        WorldLocalBiomePixels,
+        TF_Nearest
+    );
+    UTexture2D* WorldClimateTexture = CreateOrUpdateClimateTexture(
+        FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldClimateName),
+        WorldClimateName,
+        Data.Columns,
+        Data.Rows,
+        WorldClimatePixels,
+        TF_Bilinear
+    );
+    UTexture2D* WorldTerrainTexture = CreateOrUpdateClimateTexture(
+        FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldTerrainName),
+        WorldTerrainName,
+        Data.Columns,
+        Data.Rows,
+        WorldTerrainPixels,
+        TF_Bilinear
+    );
+    UTexture2D* WorldWaterTexture = CreateOrUpdateClimateTexture(
+        FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldWaterName),
+        WorldWaterName,
+        Data.Columns,
+        Data.Rows,
+        WorldWaterPixels,
+        TF_Bilinear
+    );
+    if (!WorldBaseBiomeTexture || !WorldLocalBiomeTexture
+        || !WorldClimateTexture || !WorldTerrainTexture || !WorldWaterTexture
+        || !AssetSubsystem->SaveLoadedAsset(WorldBaseBiomeTexture, false)
+        || !AssetSubsystem->SaveLoadedAsset(WorldLocalBiomeTexture, false)
+        || !AssetSubsystem->SaveLoadedAsset(WorldClimateTexture, false)
+        || !AssetSubsystem->SaveLoadedAsset(WorldTerrainTexture, false)
+        || !AssetSubsystem->SaveLoadedAsset(WorldWaterTexture, false))
+    {
+        Asset.ClimateTiles.Reset();
+        Asset.WorldClimateMaps = FAvenorWorldClimateMapReference();
+        return false;
+    }
+
+    Asset.WorldClimateMaps.WorldBounds = Data.Bounds;
+    Asset.WorldClimateMaps.CellCount = FIntPoint(Data.Columns, Data.Rows);
+    Asset.WorldClimateMaps.CellSize = Data.CellSize;
+    Asset.WorldClimateMaps.BaseBiomeTexture = WorldBaseBiomeTexture;
+    Asset.WorldClimateMaps.LocalBiomeTexture = WorldLocalBiomeTexture;
+    Asset.WorldClimateMaps.ClimateFilterTexture = WorldClimateTexture;
+    Asset.WorldClimateMaps.TerrainFilterTexture = WorldTerrainTexture;
+    Asset.WorldClimateMaps.WaterSurfaceTexture = WorldWaterTexture;
     return true;
 }
 #endif
@@ -4365,6 +4463,7 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
     else
     {
         Asset->ClimateTiles.Reset();
+        Asset->WorldClimateMaps = FAvenorWorldClimateMapReference();
     }
 
     Asset->Rivers.Reset(Data->Rivers.Num());

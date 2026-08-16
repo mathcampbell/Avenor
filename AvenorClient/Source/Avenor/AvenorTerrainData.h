@@ -69,6 +69,43 @@ struct AVENOR_API FAvenorClimateTileReference
     TSoftObjectPtr<UTexture2D> WaterSurfaceTexture;
 };
 
+/** Whole-world material control maps assembled from the same pixels as the PCG tiles. */
+USTRUCT(BlueprintType)
+struct AVENOR_API FAvenorWorldClimateMapReference
+{
+    GENERATED_BODY()
+
+    /** Outer world-space edges of the texture; texel centres are half a cell inside. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    FBox2D WorldBounds = FBox2D(ForceInit);
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    FIntPoint CellCount = FIntPoint::ZeroValue;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    double CellSize = 0.0;
+
+    /** Regional climate biome IDs; sampled with nearest filtering. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> BaseBiomeTexture;
+
+    /** Snow/alpine/wetland/oasis and water-surface biome overlays. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> LocalBiomeTexture;
+
+    /** R/G = macro temperature/moisture; B/A = local values. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> ClimateFilterTexture;
+
+    /** R = elevation, G = slope, B = flow, A = exposed rock. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> TerrainFilterTexture;
+
+    /** R = riverbed, G = riverbank, B = lakebed, A = lakeshore. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
+    TSoftObjectPtr<UTexture2D> WaterSurfaceTexture;
+};
+
 USTRUCT(BlueprintType)
 struct AVENOR_API FAvenorTerrainDataChunk
 {
@@ -258,13 +295,13 @@ class AVENOR_API UAvenorTerrainData : public UPrimaryDataAsset
     GENERATED_BODY()
 
 public:
-    static constexpr int32 CurrentFormatVersion = 5;
+    static constexpr int32 CurrentFormatVersion = 6;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     int32 FormatVersion = CurrentFormatVersion;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
-    int32 GeneratorAlgorithmVersion = 5;
+    int32 GeneratorAlgorithmVersion = 6;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Version")
     FString SettingsHash;
@@ -307,6 +344,10 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Climate")
     TArray<FAvenorClimateTileReference> ClimateTiles;
+
+    /** Material-facing maps covering the complete baked world. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Climate")
+    FAvenorWorldClimateMapReference WorldClimateMaps;
 
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Layers|Spine")
     FAvenorBakedSpineLayer SpineLayer;
