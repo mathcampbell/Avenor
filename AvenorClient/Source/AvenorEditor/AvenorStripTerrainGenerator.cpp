@@ -1398,7 +1398,9 @@ static bool BuildClimateTextureTiles(
         return false;
     }
 
-    Asset.WorldClimateMaps.WorldBounds = Data.Bounds;
+    Asset.WorldClimateMaps.WorldBounds = FBox2D(
+        FVector2D(Data.Bounds.Min.X, Data.Bounds.Min.Y),
+        FVector2D(Data.Bounds.Max.X, Data.Bounds.Max.Y));
     Asset.WorldClimateMaps.CellCount = FIntPoint(Data.Columns, Data.Rows);
     Asset.WorldClimateMaps.CellSize = Data.CellSize;
     Asset.WorldClimateMaps.BaseBiomeTexture = WorldBaseBiomeTexture;
