@@ -96,7 +96,7 @@ static bool BuildBlendPixels(
 {
     const int32 Width = ClimateTexture.Source.GetSizeX();
     const int32 Height = ClimateTexture.Source.GetSizeY();
-    if (Width <= 0 || Height <= 0 || ClimateTexture.Source.GetFormat() != TSF_BGRA8)
+    if (Width <= 0 || Height <= 0 || ClimateTexture.Source.GetFormat(0) != TSF_BGRA8)
     {
         return false;
     }
@@ -241,6 +241,7 @@ static void GenerateForTerrainData(UAvenorTerrainData& TerrainData)
 
 static void OnObjectPreSave(UObject* Object, FObjectPreSaveContext SaveContext)
 {
+    (void)SaveContext;
     if (UAvenorTerrainData* TerrainData = Cast<UAvenorTerrainData>(Object))
     {
         GenerateForTerrainData(*TerrainData);
