@@ -1,0 +1,39 @@
+name: Fix structural terrain climate members
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore internal climate fields
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.h')
+          s = p.read_text()
+          needle = '''    double RiftStrength = 0.45;\n    bool bGenerateMesasAndCanyons = false;'''
+          replacement = '''    double RiftStrength = 0.45;\n    bool bGenerateClimate = true;\n    double ClimateTemperature = 0.5;\n    double ClimateMoisture = 0.5;\n    double ClimateRegionalVariation = 0.55;\n    double ClimateRegionSpacing = 500000.0;\n    double ClimateWaterInfluenceDistance = 100000.0;\n    double ClimateWaterMoistureBoost = 0.35;\n    bool bShowcaseClimateCompression = false;\n    bool bGenerateMesasAndCanyons = false;'''
+          if needle not in s:
+              raise SystemExit('Expected insertion point not found')
+          p.write_text(s.replace(needle, replacement, 1))
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-structural-terrain-climate-members.yml
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.h
+          git commit -m "Fix structural terrain climate state"
+          git push
