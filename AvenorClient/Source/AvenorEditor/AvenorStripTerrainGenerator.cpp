@@ -453,11 +453,11 @@ static void AddBroadMeanders(
 
     FRandomStream Random(Seed);
     const double Amplitude = FMath::Min(
-        TotalLength * 0.11,
-        CellSize * FMath::Lerp(3.5, 8.0, Discharge)
-    ) * Strength * Lowland * FMath::Lerp(0.55, 1.25, Discharge) * Freedom;
-    const double Wavelength = Random.FRandRange(0.82, 1.18)
-        * FMath::Lerp(8.0, 30.0, Discharge) * CellSize;
+        TotalLength * 0.075,
+        CellSize * FMath::Lerp(2.2, 5.0, Discharge)
+    ) * Strength * Lowland * FMath::Lerp(0.55, 1.0, Discharge) * Freedom;
+    const double Wavelength = Random.FRandRange(0.88, 1.16)
+        * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;
     const double PhaseA = Random.FRandRange(-PI, PI);
     const double PhaseB = Random.FRandRange(-PI, PI);
     for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
@@ -622,7 +622,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 7;
+static constexpr int32 GeneratorAlgorithmVersion = 8;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2474,6 +2474,60 @@ static void ConstrainMeandersToValley(
     }
 }
 
+static void SuppressPathologicalMeanders(
+    const TArray<FVector>& BasePoints,
+    TArray<FVector>& Points,
+    double CellSize
+)
+{
+    if (Points.Num() < 4 || BasePoints.Num() != Points.Num())
+    {
+        return;
+    }
+
+    const double MinimumSeparation = CellSize * 1.6;
+    for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+    {
+        const FVector2D Incoming =
+            (FVector2D(Points[Index]) - FVector2D(Points[Index - 1])).GetSafeNormal();
+        const FVector2D Outgoing =
+            (FVector2D(Points[Index + 1]) - FVector2D(Points[Index])).GetSafeNormal();
+        const double Dot = FVector2D::DotProduct(Incoming, Outgoing);
+        if (Dot < -0.10)
+        {
+            const double Severity = FMath::Clamp((-0.10 - Dot) / 0.90, 0.0, 1.0);
+            const double Keep = FMath::Lerp(0.55, 0.18, Severity);
+            Points[Index].X = FMath::Lerp(BasePoints[Index].X, Points[Index].X, Keep);
+            Points[Index].Y = FMath::Lerp(BasePoints[Index].Y, Points[Index].Y, Keep);
+        }
+    }
+
+    for (int32 Index = 4; Index + 1 < Points.Num(); ++Index)
+    {
+        double ClosestEarlier = TNumericLimits<double>::Max();
+        for (int32 Earlier = 0; Earlier + 2 < Index; ++Earlier)
+        {
+            ClosestEarlier = FMath::Min(
+                ClosestEarlier,
+                SegmentDistance(
+                    FVector2D(Points[Index]),
+                    FVector2D(Points[Earlier]),
+                    FVector2D(Points[Earlier + 1])
+                )
+            );
+        }
+        if (ClosestEarlier < MinimumSeparation)
+        {
+            const double SeparationAlpha = FMath::Clamp(
+                ClosestEarlier / MinimumSeparation, 0.0, 1.0
+            );
+            const double Keep = FMath::Lerp(0.20, 0.75, SeparationAlpha);
+            Points[Index].X = FMath::Lerp(BasePoints[Index].X, Points[Index].X, Keep);
+            Points[Index].Y = FMath::Lerp(BasePoints[Index].Y, Points[Index].Y, Keep);
+        }
+    }
+}
+
 struct FRiverCandidate
 {
     TArray<int32> Cells;
@@ -2900,6 +2954,9 @@ static void ExtractRivers(
         ConstrainMeandersToValley(
             Data, BaseMeanderPoints, Points, LowlandFraction
         );
+        SuppressPathologicalMeanders(
+            BaseMeanderPoints, Points, Data.CellSize
+        );
         Points = ChaikinSmooth(Points, false, 2);
         Points = ResamplePolyline(
             Points,
@@ -3253,11 +3310,11 @@ static double EvaluateLandform(
         4
     );
     double Height =
-        RegionalRelief * HillsRelief * 0.18
-        + (RegionalRidges - 0.42) * HillsRelief * 0.075
+        RegionalRelief * HillsRelief * 0.26
+        + (RegionalRidges - 0.42) * HillsRelief * 0.11
         - FMath::Pow(FMath::Clamp(BroadValleys, 0.0, 1.0), 2.0)
-            * HillsRelief * 0.085
-            * FMath::Lerp(0.55, 1.0, PlainsAffinity);
+            * HillsRelief * 0.12
+            * FMath::Lerp(0.60, 1.10, PlainsAffinity);
 
     OutMountainMask = 0.0;
     if (bMountains)
@@ -3323,48 +3380,52 @@ static double EvaluateLandform(
             const double SpurLift = MainFlank * DownSlope *
                 FMath::Pow(FMath::Clamp(SpurNoise, 0.0, 1.0), 2.2);
 
-            const double ChannelSpacing = FMath::Max(
-                Range.PeakSpacing * 0.62, 30000.0
+            const double GullyScale = FMath::Max(
+                Range.PeakSpacing * 0.78,
+                Range.HalfWidth * 0.18
             );
-            const double ChannelWander = Fbm(
-                Position,
-                ChannelSpacing * 1.8,
-                SeedOffset + FVector2D(Range.Phase * 601.0, 109.0),
-                3, 0.55, 2.0
-            );
-            const double ChannelCoordinate =
-                Along / ChannelSpacing +
-                RidgeSide * DownSlope * (0.48 + 0.22 * ChannelWander);
-            const double ChannelDistance = FMath::Abs(
-                ChannelCoordinate - static_cast<double>(FMath::RoundToInt(ChannelCoordinate))
-            );
-            const double ChannelHalfWidth = FMath::Lerp(
-                0.075, 0.22, Smooth01(FMath::Min(1.0, DownSlope))
-            );
-            const double ChannelMask = 1.0 - Smooth01(
-                ChannelDistance / FMath::Max(0.001, ChannelHalfWidth)
-            );
-            const double ChannelLongitudinalVariation = FMath::Clamp(
-                0.72 + 0.28 * Fbm(
-                    Position,
-                    ChannelSpacing * 0.7,
-                    SeedOffset + FVector2D(53.0, Range.Phase * 733.0),
-                    3, 0.55, 2.0
+            const FVector2D DrainageWarp(
+                Fbm(
+                    Warped, GullyScale * 2.4,
+                    SeedOffset + FVector2D(Range.Phase * 601.0, 109.0),
+                    4, 0.55, 2.03
                 ),
-                0.42, 1.0
+                Fbm(
+                    Warped, GullyScale * 2.1,
+                    SeedOffset + FVector2D(53.0, Range.Phase * 733.0),
+                    4, 0.55, 2.07
+                )
+            );
+            const FVector2D DrainagePosition =
+                Warped + DrainageWarp * GullyScale * 0.72;
+            const double GullyNoise = RidgedFbm(
+                DrainagePosition,
+                GullyScale,
+                SeedOffset + FVector2D(1663.0, Range.Phase * 947.0),
+                5
+            );
+            const double BranchNoise = 0.5 + 0.5 * Fbm(
+                DrainagePosition,
+                GullyScale * 1.85,
+                SeedOffset + FVector2D(Range.Phase * 367.0, 1871.0),
+                4, 0.56, 2.0
             );
             const double GullyProfile =
-                FMath::Pow(FMath::Min(1.0, DownSlope), 0.72) *
-                Smooth01((1.25 - DownSlope) / 0.25) *
-                ChannelMask * ChannelLongitudinalVariation;
+                FMath::Pow(FMath::Clamp(GullyNoise, 0.0, 1.0), 3.1)
+                * FMath::Pow(FMath::Min(1.0, DownSlope), 0.82)
+                * Smooth01((1.25 - DownSlope) / 0.25)
+                * FMath::Lerp(
+                    0.38, 1.0,
+                    FMath::Clamp(BranchNoise, 0.0, 1.0)
+                );
 
             const double MountainStrength = FMath::Max(0.0, MountainWeight);
             const double Core = Range.Relief * MountainStrength *
                 FMath::Max(
                     0.0,
                     MainFlank * SummitVariation +
-                    SpurLift * 0.2 -
-                    GullyProfile * 0.19
+                    SpurLift * 0.24 -
+                    GullyProfile * 0.115
                 );
             const double IrregularFoothills = RidgedFbm(
                 Warped,
@@ -3511,11 +3572,11 @@ static double EvaluateLandform(
             4
         );
         Height += HillsRelief * PlainsAffinity * (
-            PlainsRoll * 0.20
-            + (PlainsRidges - 0.43) * 0.075
+            PlainsRoll * 0.30
+            + (PlainsRidges - 0.43) * 0.11
             - FMath::Pow(
                 FMath::Clamp(PlainsValleys, 0.0, 1.0), 2.0
-            ) * 0.055
+            ) * 0.085
         );
     }
     return Height;
@@ -4040,7 +4101,11 @@ public:
             {
                 continue;
             }
-            const double SampledHeight = Sample.Height;
+            float FinalHeight = Sample.Height;
+            Data->SampleFinalHeight(
+                XY, FinalHeight, ChunkCache, nullptr
+            );
+            const double SampledHeight = static_cast<double>(FinalHeight);
             WorldPosition.Z = BaseWorldZ + SampledHeight;
             MeshView.SetVertexPos(Vertex, MeshTransform.InverseTransformPosition(WorldPosition));
             MeshView.SetVertexAttributeWeight(
@@ -4069,7 +4134,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("e3a3d87f-6d21-4f8c-9c72-27c64db1a947")); }
+    static FGuid Version() { return FGuid(TEXT("3b6044af-2fc4-4b2e-bc19-83c52493bda8")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -5038,19 +5103,15 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         return;
     }
     const FName WaterPriorityLayer = PriorityLayers.Last();
-    UClass* LakeModifierClass = Hydrology.bLakes
-        ? FindWaterModifierClass(TEXT("LakeModifier"))
-        : nullptr;
     UClass* RiverModifierClass = Hydrology.bRivers
         ? FindWaterModifierClass(TEXT("RiverModifier"))
         : nullptr;
-    if ((Hydrology.bLakes && !LakeModifierClass)
-        || (Hydrology.bRivers && !RiverModifierClass))
+    if (Hydrology.bRivers && !RiverModifierClass)
     {
         FMessageDialog::Open(
             EAppMsgType::Ok,
             FText::FromString(TEXT(
-                "Unreal's MeshPartitionWater LakeModifier or RiverModifier "
+                "Unreal's MeshPartitionWater RiverModifier "
                 "Blueprint class could not be loaded. Check that the "
                 "MeshPartitionWater plugin is enabled and Show Plugin Content "
                 "reveals its modifier assets. No water actors were generated."
@@ -5096,10 +5157,10 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, WaterTerrain.LakeBedDepth,
                 WaterTerrain.LakeShoreWidth, WaterTerrain
             );
-            AddNativeWaterModifier(
-                *Lake, *TargetMeshPartition, WaterPriorityLayer,
-                *LakeModifierClass
-            );
+            // Avenor's broad terrain op already carves the lake bed and
+            // exterior shoreline with a min-only operation. Attaching Epic's
+            // LakeModifier here would sculpt the terrain a second time and can
+            // raise low ground toward the water datum, creating an uphill bank.
             Lake->PostEditChange();
         }
     }
