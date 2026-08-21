@@ -95,8 +95,6 @@
 # Optional source artwork exclusions
 # ------------------------------------------------------------
 
-**/SourceArt/**/*.png
-**/SourceArt/**/*.tga
 
 # ------------------------------------------------------------
 # Operating-system clutter
@@ -162,3 +160,9 @@ AvenorClient/Content/Monorail_rail_pipe.uasset
 AvenorClient/Content/Monorail_Supports.uasset
 AvenorClient/Content/Monrail_Pier.uasset
 AvenorClient/Content/Avenor/Generated/DA_AvenorTerrainData_AvenorStripTerrainGenerator_UAID_244BFE585839F1F602_1902117687.uasset
+
+# Avenor procedurally generated world data - regenerate locally
+AvenorClient/Content/Avenor/Generated/**
+
+# Unreal binary assets are local-only
+*.uasset
