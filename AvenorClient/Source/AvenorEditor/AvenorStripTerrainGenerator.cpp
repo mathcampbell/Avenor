@@ -269,8 +269,7 @@ static TArray<FVector> ResamplePolyline(
     for (int32 Index = 0; Index < SegmentCount; ++Index)
     {
         SegmentLengths[Index] = FVector2D::Distance(
-            FVector2D(Input[Index]),
-            FVector2D(Input[(Index + 1) % Input.Num()])
+            FVector2D(Input[Index]), FVector2D(Input[(Index + 1) % Input.Num()])
         );
         TotalLength += SegmentLengths[Index];
     }
@@ -311,9 +310,6 @@ static TArray<FVector> ResamplePolyline(
     return Result;
 }
 
-// Reduce dense analysis polylines to the control points actually needed by
-// Unreal's curved splines. Ramer-Douglas-Peucker is evaluated in 3D so a
-// river's meaningful vertical profile is preserved as well as its plan shape.
 static TArray<FVector> SimplifyOpenPolyline(
     const TArray<FVector>& Input,
     double Tolerance
@@ -384,9 +380,6 @@ static TArray<FVector> SimplifyFeaturePolyline(
         return Input;
     }
 
-    // A closed RDP loop cannot use the same point as both endpoints. Split it
-    // at the point furthest from point zero, simplify both arcs, then rejoin
-    // without duplicating either preserved endpoint.
     int32 OppositeIndex = 1;
     double MaximumDistanceSquared = 0.0;
     for (int32 Index = 1; Index < Input.Num(); ++Index)
@@ -423,6 +416,8 @@ static void AddBroadMeanders(
     double CellSize,
     double Strength,
     double LowlandFraction,
+    double DischargeFraction,
+    double ValleyFreedom,
     int32 Seed,
     const FBox& Bounds
 )
@@ -445,10 +440,24 @@ static void AddBroadMeanders(
     {
         return;
     }
+
+    const double Lowland = FMath::Pow(
+        FMath::Clamp(LowlandFraction, 0.0, 1.0), 1.35
+    );
+    const double Discharge = FMath::Clamp(DischargeFraction, 0.0, 1.0);
+    const double Freedom = FMath::Clamp(ValleyFreedom, 0.15, 1.0);
+    if (Lowland < 0.04 || Freedom < 0.16)
+    {
+        return;
+    }
+
     FRandomStream Random(Seed);
-    const double Amplitude = FMath::Min(TotalLength * 0.075, CellSize * 3.8) *
-        Strength * FMath::Lerp(0.12, 1.0, LowlandFraction);
-    const double Wavelength = Random.FRandRange(10.0, 22.0) * CellSize;
+    const double Amplitude = FMath::Min(
+        TotalLength * 0.11,
+        CellSize * FMath::Lerp(3.5, 8.0, Discharge)
+    ) * Strength * Lowland * FMath::Lerp(0.55, 1.25, Discharge) * Freedom;
+    const double Wavelength = Random.FRandRange(0.82, 1.18)
+        * FMath::Lerp(8.0, 30.0, Discharge) * CellSize;
     const double PhaseA = Random.FRandRange(-PI, PI);
     const double PhaseB = Random.FRandRange(-PI, PI);
     for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
@@ -462,11 +471,21 @@ static void AddBroadMeanders(
         const FVector2D Normal = Rotate90(Tangent);
         const double Fade = FMath::Sin(PI * Alpha);
         const double Wave =
-            0.72 * FMath::Sin(2.0 * PI * Distance / Wavelength + PhaseA) +
-            0.28 * FMath::Sin(2.0 * PI * Distance / (Wavelength * 2.37) + PhaseB);
+            0.70 * FMath::Sin(2.0 * PI * Distance / Wavelength + PhaseA) +
+            0.30 * FMath::Sin(
+                2.0 * PI * Distance / (Wavelength * 2.43) + PhaseB
+            );
         const FVector2D Offset = Normal * Amplitude * Fade * Wave;
-        Points[Index].X = FMath::Clamp(Points[Index].X + Offset.X, Bounds.Min.X + CellSize, Bounds.Max.X - CellSize);
-        Points[Index].Y = FMath::Clamp(Points[Index].Y + Offset.Y, Bounds.Min.Y + CellSize, Bounds.Max.Y - CellSize);
+        Points[Index].X = FMath::Clamp(
+            Points[Index].X + Offset.X,
+            Bounds.Min.X + CellSize,
+            Bounds.Max.X - CellSize
+        );
+        Points[Index].Y = FMath::Clamp(
+            Points[Index].Y + Offset.Y,
+            Bounds.Min.Y + CellSize,
+            Bounds.Max.Y - CellSize
+        );
     }
 }
 
@@ -601,9 +620,9 @@ struct FAvenorStripData
 
 namespace UE::Avenor::Strip::BakedData
 {
-static constexpr uint32 ChunkMagic = 0x41564431; // AVD1
+static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 6;
+static constexpr int32 GeneratorAlgorithmVersion = 7;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -935,6 +954,7 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
     const double EffectiveRiverBankWidth = FMath::Max(
         Data.CellSize, RiverBankWidth
     );
+    const double MaximumRiverBankWidth = EffectiveRiverBankWidth * 1.75;
     for (const FRiverReach& River : Data.Rivers)
     {
         if (River.Points.Num() < 2)
@@ -946,17 +966,12 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
         {
             Bounds += FVector2D(Point);
         }
-        // The analysis grid is deliberately coarse (normally 100 m).  A real
-        // headwater can be much narrower than a cell and would otherwise miss
-        // every cell centre, producing no riverbed signal at all.  Preserve the
-        // physical spline as the authority, but conservatively rasterise at
-        // least one cell across for the PCG/filter texture representation.
         const double HalfWidth = FMath::Max(
             Data.CellSize * 0.55,
             FMath::Max(100.0, River.Width * 0.5)
         );
         const FIntRect Cells = BoundsToCellRect(
-            Data, Bounds.ExpandBy(HalfWidth + EffectiveRiverBankWidth)
+            Data, Bounds.ExpandBy(HalfWidth + MaximumRiverBankWidth)
         );
         for (int32 Y = Cells.Min.Y; Y < Cells.Max.Y; ++Y)
         {
@@ -983,13 +998,26 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
                         Masks.Riverbed[Cell],
                         Smooth01(1.0 - Distance / HalfWidth)
                     );
+                    continue;
                 }
-                else if (Distance <= HalfWidth + EffectiveRiverBankWidth)
+                const double SlopeAlpha = Smooth01(FMath::Clamp(
+                    Data.Slope.IsValidIndex(Cell)
+                        ? Data.Slope[Cell] / 0.22 : 0.0,
+                    0.0,
+                    1.0
+                ));
+                const double LocalBankWidth = FMath::Max(
+                    Data.CellSize * 0.65,
+                    EffectiveRiverBankWidth
+                        * FMath::Lerp(1.65, 0.32, SlopeAlpha)
+                );
+                if (Distance <= HalfWidth + LocalBankWidth)
                 {
                     Masks.Riverbank[Cell] = FMath::Max(
                         Masks.Riverbank[Cell],
-                        Smooth01(1.0 - (Distance - HalfWidth)
-                            / EffectiveRiverBankWidth)
+                        Smooth01(
+                            1.0 - (Distance - HalfWidth) / LocalBankWidth
+                        )
                     );
                 }
             }
@@ -1010,11 +1038,12 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
         const double ShoreWidth = FMath::Max(
             Data.CellSize, Lake.BankBlendWidth
         );
+        const double MaximumShoreWidth = ShoreWidth * 1.8;
         const double BedRamp = FMath::Max(
             Data.CellSize, Lake.DepthRampWidth
         );
         const FIntRect Cells = BoundsToCellRect(
-            Data, Bounds.ExpandBy(ShoreWidth)
+            Data, Bounds.ExpandBy(MaximumShoreWidth)
         );
         for (int32 Y = Cells.Min.Y; Y < Cells.Max.Y; ++Y)
         {
@@ -1031,11 +1060,21 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
                         Masks.Lakebed[Cell], Smooth01(EdgeDistance / BedRamp)
                     );
                 }
-                if (EdgeDistance <= ShoreWidth)
+                const double SlopeAlpha = Smooth01(FMath::Clamp(
+                    Data.Slope.IsValidIndex(Cell)
+                        ? Data.Slope[Cell] / 0.22 : 0.0,
+                    0.0,
+                    1.0
+                ));
+                const double LocalShoreWidth = FMath::Max(
+                    Data.CellSize * 0.65,
+                    ShoreWidth * FMath::Lerp(1.75, 0.28, SlopeAlpha)
+                );
+                if (EdgeDistance <= LocalShoreWidth)
                 {
                     Masks.Lakeshore[Cell] = FMath::Max(
                         Masks.Lakeshore[Cell],
-                        Smooth01(1.0 - EdgeDistance / ShoreWidth)
+                        Smooth01(1.0 - EdgeDistance / LocalShoreWidth)
                     );
                 }
             }
@@ -1653,6 +1692,38 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
     }
 }
 
+static double DrainageSourceMultiplier(
+    const FAvenorStripData& Data,
+    int32 Cell
+)
+{
+    const double MountainSupport = Data.MountainMask.IsValidIndex(Cell)
+        ? Data.MountainMask[Cell] : 0.0;
+    const double HillSupport = Data.HillMask.IsValidIndex(Cell)
+        ? Data.HillMask[Cell] : 0.0;
+    const double ReliefSupport = FMath::Max(
+        FMath::Max(MountainSupport, HillSupport * 0.75),
+        Smooth01(FMath::Clamp(Data.Slope[Cell] / 0.055, 0.0, 1.0))
+    );
+    const double SourceMoisture = Data.MacroMoisture.IsValidIndex(Cell)
+        ? Data.MacroMoisture[Cell]
+        : (Data.Moisture.IsValidIndex(Cell) ? Data.Moisture[Cell] : 0.5);
+    const double WetLowlandSupport = Smooth01(FMath::Clamp(
+        (SourceMoisture - 0.62) / 0.26, 0.0, 1.0
+    ));
+    const double DesertInfluence = Data.DesertMask.IsValidIndex(Cell)
+        ? Data.DesertMask[Cell] : 0.0;
+    const double AridSourcePenalty = DesertInfluence * Smooth01(
+        FMath::Clamp((0.52 - SourceMoisture) / 0.42, 0.0, 1.0)
+    );
+    const double SourceSupport = FMath::Max(
+        ReliefSupport, WetLowlandSupport
+    );
+    return 1.0
+        + (1.0 - SourceSupport) * 1.45
+        + AridSourcePenalty * 1.65;
+}
+
 static void ApplyStreamPowerErosion(
     FAvenorStripData& Data,
     int32 Iterations,
@@ -1673,11 +1744,10 @@ static void ApplyStreamPowerErosion(
         Delta.Init(0.0, Data.Height.Num());
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
-            // Use the same slope-adaptive start threshold as river seeding.
-            // The authoritative extraction pass subsequently continues an
-            // accepted seed downhill even where this local threshold rises.
             const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
-            const double StreamStartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
+            const double StreamStartArea = FMath::Lerp(
+                LowlandStartArea, MountainStartArea, MountainFraction
+            ) * DrainageSourceMultiplier(Data, Cell);
             if (Data.Accumulation[Cell] < StreamStartArea || Data.ReceiverA[Cell] == INDEX_NONE)
             {
                 continue;
@@ -1847,9 +1917,6 @@ static TArray<FVector> TraceComponentBoundary(
     }
     TArray<FVector> Reduced = ResamplePolyline(Boundary, FMath::Max(Data.CellSize, 3500.0), true);
     Boundary = ChaikinSmooth(Reduced, true, 2);
-    // Preserve the smoothed outline, but retain only control points whose
-    // removal would move the shoreline by a meaningful amount. The same
-    // simplified loop drives the Water Body and its refinement modifier.
     const double SimplificationTolerance = FMath::Max(
         FinalPointSpacing * 4.0,
         Data.CellSize * 0.15
@@ -1891,23 +1958,20 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
     SeedCells.Init(false, Data.Height.Num());
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
-        const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
-        const double StartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, MountainFraction);
-        if (Data.Accumulation[Cell] >= StartArea && PrimaryReceiver(Data, Cell) != INDEX_NONE)
+        const double MountainFraction = FMath::Clamp(
+            Data.Slope[Cell] / 0.18, 0.0, 1.0
+        );
+        const double StartArea = FMath::Lerp(
+            LowlandStartArea, MountainStartArea, MountainFraction
+        ) * DrainageSourceMultiplier(Data, Cell);
+        if (Data.Accumulation[Cell] >= StartArea
+            && PrimaryReceiver(Data, Cell) != INDEX_NONE)
         {
             SeedCells[Cell] = true;
             Channel[Cell] = true;
         }
     }
 
-    // A slope-adaptive threshold decides where a stream may begin, not
-    // whether it is allowed to continue. Previously every cell was tested
-    // independently, so a mountain tributary could disappear the instant it
-    // reached gentler terrain and inherited the higher lowland threshold.
-    // Follow every accepted seed down its primary receiver chain instead.
-    // Breaking when an existing channel is reached is safe: that cell is
-    // either another seed whose route will be followed, or a route already
-    // completed by an earlier seed.
     for (int32 SeedCell = 0; SeedCell < Data.Height.Num(); ++SeedCell)
     {
         if (!SeedCells[SeedCell])
@@ -1996,6 +2060,41 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
         }
     }
     OutRejectedSystemCount = RejectedRoots.Num();
+
+    TArray<int32> Endpoints;
+    for (int32 Cell = 0; Cell < Channel.Num(); ++Cell)
+    {
+        if (!Channel[Cell])
+        {
+            continue;
+        }
+        const int32 Receiver = PrimaryReceiver(Data, Cell);
+        if (Receiver != INDEX_NONE
+            && Channel.IsValidIndex(Receiver)
+            && !Channel[Receiver])
+        {
+            Endpoints.Add(Cell);
+        }
+    }
+    for (int32 Endpoint : Endpoints)
+    {
+        int32 Cell = Endpoint;
+        for (int32 Guard = 0; Guard < Data.Height.Num(); ++Guard)
+        {
+            const int32 Receiver = PrimaryReceiver(Data, Cell);
+            if (Receiver == INDEX_NONE || !Channel.IsValidIndex(Receiver))
+            {
+                break;
+            }
+            if (Channel[Receiver])
+            {
+                break;
+            }
+            Channel[Receiver] = true;
+            Cell = Receiver;
+        }
+    }
+
     for (int32 Cell = 0; Cell < Channel.Num(); ++Cell)
     {
         if (Channel[Cell])
@@ -2006,12 +2105,13 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
     return Channel;
 }
 
-static TArray<int32> FindDrainageTerminusSeeds(
+static TArray<int32> FindRiverFedBasinSeeds(
     const FAvenorStripData& Data,
     const TArray<bool>& Channel
 )
 {
-    TArray<int32> Termini;
+    TArray<int32> Seeds;
+    constexpr double DepressionThreshold = 50.0;
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
         if (!Channel[Cell])
@@ -2021,19 +2121,30 @@ static TArray<int32> FindDrainageTerminusSeeds(
         const int32 X = Cell % Data.Columns;
         const int32 Y = Cell / Data.Columns;
         constexpr int32 BoundaryMargin = 3;
-        const bool bNearBoundary = X <= BoundaryMargin || X >= Data.Columns - 1 - BoundaryMargin ||
-            Y <= BoundaryMargin || Y >= Data.Rows - 1 - BoundaryMargin;
+        const bool bNearBoundary =
+            X <= BoundaryMargin
+            || X >= Data.Columns - 1 - BoundaryMargin
+            || Y <= BoundaryMargin
+            || Y >= Data.Rows - 1 - BoundaryMargin;
         if (bNearBoundary)
         {
             continue;
         }
+        const bool bMeaningfulDepression =
+            Data.FilledHeight.IsValidIndex(Cell)
+            && (Data.FilledHeight[Cell] - Data.Height[Cell])
+                >= DepressionThreshold;
         const int32 Receiver = PrimaryReceiver(Data, Cell);
-        if (Receiver == INDEX_NONE || !Channel[Receiver])
+        const bool bInteriorTerminus =
+            Receiver == INDEX_NONE
+            || !Channel.IsValidIndex(Receiver)
+            || !Channel[Receiver];
+        if (bMeaningfulDepression || bInteriorTerminus)
         {
-            Termini.Add(Cell);
+            Seeds.Add(Cell);
         }
     }
-    return Termini;
+    return Seeds;
 }
 
 static void ExtractLakes(
@@ -2064,10 +2175,6 @@ static void ExtractLakes(
     const double WorldArea = Data.Height.Num() * Data.CellAreaSquareKilometres();
     TArray<bool> Candidate;
     Candidate.Init(false, Data.Height.Num());
-    // Trace close to the hydrological spill contour. Using half of the
-    // minimum accepted lake depth selected only the deep inner core (7.5 m
-    // with the defaults), leaving a conspicuous dry ring around otherwise
-    // valid basins.
     constexpr double ShorelineFillThreshold = 50.0;
     for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
     {
@@ -2096,10 +2203,6 @@ static void ExtractLakes(
         {
             const int32 Cell = Queue[QueueIndex];
             Basin.Cells.Add(Cell);
-            // A connected flooded component drains at its lowest spill
-            // datum. Taking the maximum promoted an entire nested basin to
-            // its highest local fill level, producing occasional lakes above
-            // both their surroundings and the engineered Spine.
             Basin.SurfaceHeight = FMath::Min(
                 Basin.SurfaceHeight,
                 Data.FilledHeight[Cell]
@@ -2179,35 +2282,55 @@ static void ExtractLakes(
         {
             continue;
         }
-        // A river terminus makes a basin higher priority, not automatically
-        // valid. Every lake must satisfy the same depth, area, total coverage
-        // and count limits; rejected basins remain ordinary river terrain.
-        // Optional depressions need stronger evidence than a river-connected
-        // basin so shallow incidental pits do not outnumber the drainage
-        // network merely because erosion produced many local minima.
         const double RequiredDepth = CandidateBasin.bRiverTerminus
             ? MinimumDepth
             : MinimumDepth * 1.5;
+        const double SupportedBasinArea = FMath::Max(
+            Data.CellAreaSquareKilometres() * 4.0,
+            CandidateBasin.CatchmentArea
+                * (CandidateBasin.bRiverTerminus ? 0.42 : 0.22)
+        );
         if (AcceptedCount >= MaximumCount ||
             CandidateBasin.MaximumDepth < RequiredDepth ||
             BasinArea > MaximumArea ||
+            BasinArea > SupportedBasinArea ||
             AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
             continue;
         }
         {
-            // Shape check applies to every basin, mandatory or not. A long,
-            // thin, winding depression - most obviously, an entire spine
-            // valley trough that a river runs the length of - is not a
-            // lake no matter how many rivers terminate along it. Skipping
-            // lake creation here does not orphan the river: it simply
-            // keeps flowing across that stretch of terrain unencumbered,
-            // which is the geomorphologically correct outcome anyway.
             const double BoundingWidth = FMath::Max(1.0, CandidateBasin.MaxX - CandidateBasin.MinX);
             const double BoundingHeight = FMath::Max(1.0, CandidateBasin.MaxY - CandidateBasin.MinY);
             const double FillRatio = BasinArea / FMath::Max(0.0001, (BoundingWidth * BoundingHeight) / 10000000000.0);
             const double MinimumFillRatio = CandidateBasin.bRiverTerminus ? 0.12 : 0.18;
-            if (FillRatio < MinimumFillRatio)
+            const double AspectRatio = FMath::Max(BoundingWidth, BoundingHeight)
+                / FMath::Max(1.0, FMath::Min(BoundingWidth, BoundingHeight));
+            if (FillRatio < MinimumFillRatio
+                || (AspectRatio > 7.5 && FillRatio < 0.28))
+            {
+                continue;
+            }
+
+            double MeanSlope = 0.0;
+            double MeanResistance = 0.0;
+            double MeanDesert = 0.0;
+            for (int32 Cell : CandidateBasin.Cells)
+            {
+                MeanSlope += Data.Slope.IsValidIndex(Cell) ? Data.Slope[Cell] : 0.0;
+                MeanResistance += Data.Resistance.IsValidIndex(Cell) ? Data.Resistance[Cell] : 0.0;
+                MeanDesert += Data.DesertMask.IsValidIndex(Cell) ? Data.DesertMask[Cell] : 0.0;
+            }
+            const double Count = FMath::Max(1, CandidateBasin.Cells.Num());
+            MeanSlope /= Count;
+            MeanResistance /= Count;
+            MeanDesert /= Count;
+            const bool bAridCanyonTrough =
+                MeanDesert > 0.38
+                && MeanResistance > 0.26
+                && MeanSlope > 0.045
+                && AspectRatio > 3.5
+                && FillRatio < 0.35;
+            if (bAridCanyonTrough)
             {
                 continue;
             }
@@ -2227,11 +2350,6 @@ static void ExtractLakes(
         {
             continue;
         }
-        // FilledHeight is the basin's hydrological spill datum. Lowering the
-        // water to the minimum raw sample around the simplified outline made
-        // the lake sit inside a deep inner contour and created a reservoir-
-        // like rim. The modifier is responsible for blending the final shore
-        // terrain to this physically meaningful, level surface.
         Lake.ShorelineHeight = CandidateBasin.SurfaceHeight;
         Lake.SurfaceHeight = CandidateBasin.SurfaceHeight
             - FMath::Max(0.0, SurfaceInset);
@@ -2297,6 +2415,62 @@ static void EnforceDownhill(TArray<FVector>& Points)
     {
         const double HorizontalDistance = FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
         Points[Index].Z = FMath::Min(Points[Index].Z, Points[Index - 1].Z - HorizontalDistance * 0.0006);
+    }
+}
+
+static void ConstrainMeandersToValley(
+    const FAvenorStripData& Data,
+    const TArray<FVector>& BasePoints,
+    TArray<FVector>& MeanderedPoints,
+    double LowlandFraction
+)
+{
+    if (BasePoints.Num() != MeanderedPoints.Num() || BasePoints.Num() < 3)
+    {
+        return;
+    }
+
+    const double Lowland = FMath::Clamp(LowlandFraction, 0.0, 1.0);
+    const double AllowedLateralRise = FMath::Lerp(
+        Data.CellSize * 0.04,
+        Data.CellSize * 0.22,
+        Lowland
+    );
+    for (int32 Index = 1; Index + 1 < MeanderedPoints.Num(); ++Index)
+    {
+        const FVector2D BasePosition(BasePoints[Index]);
+        const FVector2D CandidatePosition(MeanderedPoints[Index]);
+        const double BaseHeight = Data.SampleGrid(Data.Height, BasePosition);
+        const double CandidateHeight = Data.SampleGrid(
+            Data.Height, CandidatePosition
+        );
+        const double CandidateSlope = Data.SampleGrid(
+            Data.Slope, CandidatePosition
+        );
+        const double Rise = FMath::Max(0.0, CandidateHeight - BaseHeight);
+        const double RiseScale = Rise <= AllowedLateralRise
+            ? 1.0
+            : FMath::Clamp(
+                AllowedLateralRise / FMath::Max(1.0, Rise),
+                0.0,
+                1.0
+            );
+        const double SlopeScale = 1.0 - Smooth01(FMath::Clamp(
+            (CandidateSlope - 0.045) / 0.10,
+            0.0,
+            1.0
+        ));
+        const double Scale = FMath::Clamp(
+            FMath::Min(RiseScale, SlopeScale),
+            0.0,
+            1.0
+        );
+        MeanderedPoints[Index].X = FMath::Lerp(
+            BasePoints[Index].X, MeanderedPoints[Index].X, Scale
+        );
+        MeanderedPoints[Index].Y = FMath::Lerp(
+            BasePoints[Index].Y, MeanderedPoints[Index].Y, Scale
+        );
     }
 }
 
@@ -2409,8 +2583,6 @@ static void AnchorRiverToLakes(
         );
     }
 
-    // Preserve a downhill water surface without reintroducing a one-segment
-    // cliff at either fixed lake datum.
     if (bStartsAtLake && bEndsAtLake)
     {
         TArray<double> Distances;
@@ -2486,12 +2658,6 @@ static void AddLevelLakeJunctionPads(
     {
         return;
     }
-
-    // Put one point inside the lake, the exact shoreline point, and one point
-    // just outside at the same height. Automatic Curve tangents are then
-    // horizontal at the join instead of immediately diving towards the next
-    // lower river point. The short overlap also prevents a visible crack
-    // between the separately rendered river and lake Water Body meshes.
     const double PadLength = FMath::Clamp(Data.CellSize * 0.05, 200.0, 500.0);
 
     if (Data.Lakes.IsValidIndex(StartLakeIndex))
@@ -2578,9 +2744,6 @@ static void ExtractRivers(
             (!Data.LakeIndex.IsValidIndex(Seed2) || Data.LakeIndex[Seed2] == INDEX_NONE) &&
             PrimaryReceiver(Data, Seed2) != INDEX_NONE)
         {
-            // Continue the lake's spill route until it rejoins the already
-            // accepted drainage network. This keeps an outflow connected
-            // without allowing the lake to redefine system-length validity.
             int32 Cell = Seed2;
             for (int32 Guard = 0; Guard < Data.Height.Num() && Data.Height.IsValidIndex(Cell); ++Guard)
             {
@@ -2691,6 +2854,7 @@ static void ExtractRivers(
         double MeanResistance = 0.0;
         double MeanDesert = 0.0;
         double MeanMoisture = 0.0;
+        double MeanMountain = 0.0;
         for (int32 Cell : CandidateReach.Cells)
         {
             const FVector2D Position = Data.CellPosition(Cell);
@@ -2701,20 +2865,42 @@ static void ExtractRivers(
                 ? Data.DesertMask[Cell] : 0.0;
             MeanMoisture += Data.Moisture.IsValidIndex(Cell)
                 ? Data.Moisture[Cell] : 0.5;
+            MeanMountain += Data.MountainMask.IsValidIndex(Cell)
+                ? Data.MountainMask[Cell] : 0.0;
         }
         MeanSlope /= CandidateReach.Cells.Num();
         MeanResistance /= CandidateReach.Cells.Num();
         MeanDesert /= CandidateReach.Cells.Num();
         MeanMoisture /= CandidateReach.Cells.Num();
+        MeanMountain /= CandidateReach.Cells.Num();
+
+        const int32 EndCell = CandidateReach.Cells.Last();
+        const double Area = Data.Accumulation[EndCell];
+        const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
         Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
-        AddBroadMeanders(Points, Data.CellSize, MeanderStrength, LowlandFraction, Seed ^ (ReachIndex * 0x45D9F3B), Data.Bounds);
+        const double ValleyFreedom = FMath::Clamp(
+            (1.0 - MeanResistance * 0.72)
+                * (1.0 - MeanMountain * 0.62),
+            0.18,
+            1.0
+        );
+        const TArray<FVector> BaseMeanderPoints = Points;
+        AddBroadMeanders(
+            Points,
+            Data.CellSize,
+            MeanderStrength,
+            LowlandFraction,
+            RiverAlpha,
+            ValleyFreedom,
+            Seed ^ (ReachIndex * 0x45D9F3B),
+            Data.Bounds
+        );
+        ConstrainMeandersToValley(
+            Data, BaseMeanderPoints, Points, LowlandFraction
+        );
         Points = ChaikinSmooth(Points, false, 2);
-        // Hydrology still chooses the drainage topology on the analysis
-        // grid, but the visible/vector feature is sampled independently.
-        // All downstream consumers use this same dense polyline, so water,
-        // remeshing and analytic carving cannot take different shortcuts.
         Points = ResamplePolyline(
             Points,
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
@@ -2723,10 +2909,6 @@ static void ExtractRivers(
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
-            // River spline Z is the water surface datum. Reach.Depth and
-            // ValleyDepth describe terrain below/beside that datum and are
-            // consumed by the native water modifier. Do not lower the Water
-            // Body below the surface that its own modifier is about to carve.
             Point.Z = Data.SampleGrid(Data.Height, Position);
         }
         EnforceDownhill(Points);
@@ -2755,9 +2937,6 @@ static void ExtractRivers(
                 Points.Last().Y = ShorePoint.Y;
             }
         }
-        const int32 EndCell = CandidateReach.Cells.Last();
-        const double Area = Data.Accumulation[EndCell];
-        const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
         FRiverReach River;
         River.Points = MoveTemp(Points);
         River.DrainageArea = Area;
@@ -2768,9 +2947,6 @@ static void ExtractRivers(
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
         River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
         River.ChannelSteepness = ChannelSteepness;
-        // Moist climates cut broader green valleys. Arid, resistant terrain
-        // automatically enables the existing deep, narrow canyon profile,
-        // without requiring the legacy global mesa switch to be enabled.
         const double HumidValley = Smooth01(FMath::Clamp(
             (MeanMoisture - 0.48) / 0.42, 0.0, 1.0
         ));
@@ -2799,8 +2975,6 @@ static void ExtractRivers(
         Data.Rivers.Add(MoveTemp(River));
     }
 
-    // The detected lake surface is authoritative. Grade connected rivers to
-    // it, but never move the whole lake to an independently sampled reach.
     const double SimplificationTolerance = FMath::Max(
         FeaturePointSpacing * 4.0,
         Data.CellSize * 0.15
@@ -2829,9 +3003,6 @@ static void ExtractRivers(
 
 double FAvenorStripData::SampleHeight(const FVector2D& Position) const
 {
-    // This modifier owns only the broad, eroded land surface. River beds,
-    // banks, lake beds and shores are written later by MeshPartitionWater's
-    // native modifiers, using the Water Body spline as their shared datum.
     return SampleGrid(Height, Position);
 }
 
@@ -2937,17 +3108,10 @@ static TArray<FMountainRange> BuildMountainRanges(
     {
         const double RequestedHalfWidth = RangeWidth * Random.FRandRange(0.7, 1.35) * 0.5;
         const double AvailableHalfWidth = FMath::Max(0.0, AcrossExtent * 0.96 - ExclusionHalfWidth);
-        // Fit ranges to the available side of the strip instead of silently
-        // dropping them. Narrow proof-of-concept worlds still get a real
-        // ridge, just a narrower one that respects the Spine exclusion.
         const double HalfWidth = FMath::Min(RequestedHalfWidth, AvailableHalfWidth * 0.92);
-        // The near edge of the range - not just its centre - must clear
-        // the exclusion width, otherwise a wide range placed close to the
-        // minimum distance can still poke well into the excluded band.
         const double MinimumAcrossDistance = ExclusionHalfWidth + HalfWidth;
         if (HalfWidth < 10000.0 || MinimumAcrossDistance >= AcrossExtent * 0.96)
         {
-            // There is genuinely no useful land outside the exclusion band.
             continue;
         }
         const double Side = Random.FRand() < 0.5 ? -1.0 : 1.0;
@@ -3013,18 +3177,13 @@ static double EvaluateLandform(
     bool bOceanLengthEnds
 )
 {
+    (void)Bounds;
     (void)bOcean; (void)SeaLevel; (void)MinimumOceanDepth; (void)MaximumOceanDepth;
     (void)CoastWidth; (void)bOceanWidthEdges; (void)bOceanLengthEnds;
     const FVector2D SeedOffset(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
-    // Primary domain warp. Amplitude is now on the same order as the
-    // mountain feature scale (rather than a small fixed 180000cm), which
-    // is the standard rule of thumb for hiding Perlin's inherent
-    // directional periodicity - too small a warp relative to a noise
-    // field's own wavelength lets that periodicity show through as
-    // regular, parallel, "corrugated sheet metal" banding.
     const FVector2D Warp(
         Fbm(Position, 950000.0, SeedOffset + FVector2D(137.0, 911.0), 4),
         Fbm(Position, 950000.0, SeedOffset + FVector2D(733.0, 271.0), 4)
@@ -3036,22 +3195,8 @@ static double EvaluateLandform(
     auto ZoneAffinity = [&](double PhaseOffset)
     {
         const double Raw = 0.5 + 0.5 * Fbm(FVector2D(ZoneT, PhaseOffset), 1.0, SeedOffset, 3, 0.55, 2.0);
-        // Sharpen toward 0/1: without this, independent noise fields hover
-        // near 0.5 almost everywhere, so after normalizing by weight every
-        // biome contributes a near-constant share everywhere instead of
-        // actually dominating a region.
         return FMath::Pow(FMath::Clamp(Raw, 0.0, 1.0), 3.2);
     };
-    // Mountains are no longer part of this blend at all - they are placed
-    // as discrete range objects (below), each guaranteed to reach its full
-    // configured relief at its own core rather than being diluted by
-    // whatever three other independent noise fields happen to be doing at
-    // the same point.
-    // Geology still decides where mountains and the underlying low-frequency
-    // zones are. Climate biases the surface expression: warm, dry regions
-    // expose resistant desert rock, while moist regions favour broader
-    // erodible hills and plains. This is a weighting pass, not another
-    // terrain simulation.
     const double Warmth = bClimateEnabled
         ? Smooth01(FMath::Clamp(
             (ClimateTemperature - 0.28) / 0.58, 0.0, 1.0
@@ -3086,16 +3231,39 @@ static double EvaluateLandform(
     OutDesertMask = DesertAffinity;
     OutPlainsMask = PlainsAffinity;
 
-    double Height = 0.0;
-    OutMountainMask = 0.0;
+    const double RegionalRelief = Fbm(
+        Warped,
+        FMath::Max(HillsScale * 7.5, 900000.0),
+        SeedOffset + FVector2D(1201.0, 331.0),
+        4, 0.55, 2.0
+    );
+    const double RegionalRidges = RidgedFbm(
+        Warped,
+        FMath::Max(HillsScale * 5.2, 650000.0),
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4
+    );
+    const double BroadValleys = RidgedFbm(
+        Warped + FVector2D(
+            Fbm(Warped, HillsScale * 3.7, SeedOffset + FVector2D(509.0, 193.0), 3) * HillsScale,
+            Fbm(Warped, HillsScale * 3.7, SeedOffset + FVector2D(827.0, 557.0), 3) * HillsScale
+        ) * 0.42,
+        FMath::Max(HillsScale * 5.8, 720000.0),
+        SeedOffset + FVector2D(919.0, 1601.0),
+        4
+    );
+    double Height =
+        RegionalRelief * HillsRelief * 0.18
+        + (RegionalRidges - 0.42) * HillsRelief * 0.075
+        - FMath::Pow(FMath::Clamp(BroadValleys, 0.0, 1.0), 2.0)
+            * HillsRelief * 0.085
+            * FMath::Lerp(0.55, 1.0, PlainsAffinity);
 
+    OutMountainMask = 0.0;
     if (bMountains)
     {
         for (const FMountainRange& Range : Mountains)
         {
-            // Distort the silhouette locally while keeping its nominated
-            // centre fixed. The previous global 6.5 km warp moved the whole
-            // range away from its guaranteed in-bounds placement.
             const FVector2D SilhouetteWarp(
                 Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
                 Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
@@ -3110,17 +3278,12 @@ static double EvaluateLandform(
             const double Across = FVector2D::DotProduct(Delta, Range.Across);
             const double AlongNorm = FMath::Abs(Along) / FMath::Max(1.0, Range.HalfLength);
             const double AcrossNorm = FMath::Abs(Across) / FMath::Max(1.0, Range.HalfWidth);
-            // A broad low skirt tapers the range into surrounding terrain.
-            // The displaced main ridge is evaluated separately below.
             const double SkirtEnvelope = Smooth01(1.0 - AlongNorm / 1.4) *
                 Smooth01(1.0 - AcrossNorm / 1.8);
             if (SkirtEnvelope <= 0.0)
             {
                 continue;
             }
-            // Build an irregular ridgeline rather than a row of radial
-            // cosine peaks. The crest wanders laterally, the two flanks have
-            // different gradients, and ridged detail forms subsidiary spurs.
             const double RidgeWander = Fbm(
                 FVector2D(Along, Range.Phase * Range.PeakSpacing),
                 Range.PeakSpacing * 2.4,
@@ -3160,10 +3323,6 @@ static double EvaluateLandform(
             const double SpurLift = MainFlank * DownSlope *
                 FMath::Pow(FMath::Clamp(SpurNoise, 0.0, 1.0), 2.2);
 
-            // Incise a family of branching gullies down both flanks. Their
-            // heads are narrow near the crest and they widen/deepen
-            // downslope, giving the later stream-power pass real drainage
-            // structure to develop instead of a smooth plasticine cone.
             const double ChannelSpacing = FMath::Max(
                 Range.PeakSpacing * 0.62, 30000.0
             );
@@ -3212,17 +3371,35 @@ static double EvaluateLandform(
                 Range.PeakSpacing * 1.35,
                 SeedOffset + FVector2D(947.0, Range.Phase * 271.0), 5
             );
-            const double Foothills = Range.Relief * MountainStrength * 0.16 *
-                FMath::Max(0.0, SkirtEnvelope - MainFlank * 0.65) *
-                FMath::Lerp(0.3, 1.0, IrregularFoothills);
+            const double Foothills = Range.Relief * MountainStrength * 0.24 *
+                FMath::Max(0.0, SkirtEnvelope - MainFlank * 0.58) *
+                FMath::Lerp(0.28, 1.0, IrregularFoothills);
             Height = FMath::Max(Height, Core + Foothills);
             OutMountainMask = FMath::Max(OutMountainMask, SkirtEnvelope);
         }
     }
     if (bHills)
     {
-        const double HillNoise = Fbm(Warped, HillsScale, SeedOffset + FVector2D(887.0, 157.0), 5, 0.54, 2.03);
-        Height += HillNoise * HillsRelief * HillAffinity;
+        const double BroadHillNoise = Fbm(
+            Warped, HillsScale * 2.6,
+            SeedOffset + FVector2D(887.0, 157.0),
+            5, 0.54, 2.03
+        );
+        const double HillRidges = RidgedFbm(
+            Warped, HillsScale * 1.65,
+            SeedOffset + FVector2D(347.0, 1039.0),
+            5
+        );
+        const double HillDetail = Fbm(
+            Warped, HillsScale * 0.82,
+            SeedOffset + FVector2D(1171.0, 673.0),
+            4, 0.52, 2.05
+        );
+        Height += HillsRelief * HillAffinity * (
+            BroadHillNoise * 0.52
+            + (HillRidges - 0.43) * 0.34
+            + HillDetail * 0.14
+        );
     }
     if (bDesert || DesertAffinity > 0.04)
     {
@@ -3230,16 +3407,11 @@ static double EvaluateLandform(
             Warped, MesaScale,
             SeedOffset + FVector2D(555.0, 222.0), 4
         );
-        // Broad, sharp-edged uplift supplies plateau remnants for the stream
-        // power pass to cut through. It is deliberately modest: resistance
-        // and river carving, rather than stacks of procedural terraces, make
-        // the final mesa/canyon silhouette.
-        const double ClimateMesaStrength = bClimateEnabled ? Aridity : 1.0;
+        const double AridStrength = bClimateEnabled
+            ? (bDesert ? FMath::Max(0.72, Aridity) : Aridity)
+            : 1.0;
         double PlateauMask = 0.0;
-        // Skip the extra plateau noise entirely outside genuinely arid
-        // regions. This keeps ordinary hills/plains at the old generation
-        // cost even though their blended desert affinity may be non-zero.
-        if (bDesert || ClimateMesaStrength > 0.28)
+        if (bDesert || AridStrength > 0.28)
         {
             const double PlateauSignal = 0.5 + 0.5 * Fbm(
                 Warped,
@@ -3248,15 +3420,73 @@ static double EvaluateLandform(
                 3, 0.55, 2.0
             );
             PlateauMask = Smooth01(FMath::Clamp(
-                (PlateauSignal - 0.48) / 0.24, 0.0, 1.0
+                (PlateauSignal - 0.46) / 0.24, 0.0, 1.0
             ));
         }
-        Height += (DesertNoise - 0.5) * HillsRelief * 0.28
+        const double MesaSuitability =
+            DesertAffinity * AridStrength
+            * FMath::Lerp(0.35, 1.0, HillAffinity);
+        Height += (DesertNoise - 0.5) * HillsRelief * 0.30
             * DesertAffinity;
-        Height += PlateauMask * HillsRelief * 0.62
-            * DesertAffinity * ClimateMesaStrength;
+        Height += PlateauMask * HillsRelief * 0.78
+            * MesaSuitability;
+        const double BadlandRidges = RidgedFbm(
+            Warped,
+            FMath::Max(MesaScale * 0.52, 70000.0),
+            SeedOffset + FVector2D(1733.0, 449.0),
+            5
+        );
+        Height += (BadlandRidges - 0.46) * HillsRelief * 0.12
+            * MesaSuitability * PlateauMask;
+
+        const double DuneFieldSignal = 0.5 + 0.5 * Fbm(
+            Warped,
+            FMath::Max(MesaScale * 2.7, 500000.0),
+            SeedOffset + FVector2D(1327.0, 2053.0),
+            3, 0.55, 2.0
+        );
+        const double DuneFieldMask = Smooth01(FMath::Clamp(
+            (DuneFieldSignal - 0.38) / 0.42, 0.0, 1.0
+        ));
+        const double DuneSuitability =
+            DesertAffinity * AridStrength
+            * FMath::Lerp(0.45, 1.0, PlainsAffinity)
+            * (1.0 - PlateauMask * 0.82)
+            * (1.0 - OutMountainMask * 0.9)
+            * DuneFieldMask;
+        if (DuneSuitability > 0.015)
+        {
+            const double WindAngle = FMath::Fmod(
+                FMath::Abs(static_cast<double>(Seed)) * 0.000731 + 0.83,
+                PI
+            );
+            const FVector2D WindDirection(
+                FMath::Cos(WindAngle), FMath::Sin(WindAngle)
+            );
+            const double DuneWavelength = FMath::Clamp(
+                HillsScale * 0.34, 45000.0, 140000.0
+            );
+            const double PhaseWarp = Fbm(
+                Warped,
+                DuneWavelength * 5.2,
+                SeedOffset + FVector2D(1877.0, 1021.0),
+                3, 0.55, 2.0
+            ) * DuneWavelength * 0.85;
+            const double WindCoordinate =
+                FVector2D::DotProduct(Warped, WindDirection) + PhaseWarp;
+            const double DuneWave = 0.5 + 0.5 * FMath::Sin(
+                2.0 * PI * WindCoordinate / DuneWavelength
+            );
+            const double DuneRidge = FMath::Pow(
+                FMath::Clamp(DuneWave, 0.0, 1.0), 2.25
+            );
+            Height += (DuneRidge - 0.31) * HillsRelief * 0.105
+                * DuneSuitability;
+        }
+
         OutResistance = DesertAffinity * FMath::Clamp(
-            0.48 + 0.38 * DesertNoise + 0.20 * PlateauMask,
+            (0.48 + 0.38 * DesertNoise + 0.22 * PlateauMask)
+                * (1.0 - DuneSuitability * 0.68),
             0.0, 1.0
         );
     }
@@ -3265,8 +3495,28 @@ static double EvaluateLandform(
         OutResistance = 0.0;
     }
     {
-        const double PlainsNoise = Fbm(Warped, HillsScale * 3.0, SeedOffset + FVector2D(101.0, 43.0), 4);
-        Height += PlainsNoise * (HillsRelief * 0.12) * PlainsAffinity;
+        const double PlainsRoll = Fbm(
+            Warped, HillsScale * 4.2,
+            SeedOffset + FVector2D(101.0, 43.0),
+            4, 0.55, 2.0
+        );
+        const double PlainsRidges = RidgedFbm(
+            Warped, HillsScale * 3.0,
+            SeedOffset + FVector2D(607.0, 1489.0),
+            4
+        );
+        const double PlainsValleys = RidgedFbm(
+            Warped, HillsScale * 2.45,
+            SeedOffset + FVector2D(1543.0, 271.0),
+            4
+        );
+        Height += HillsRelief * PlainsAffinity * (
+            PlainsRoll * 0.20
+            + (PlainsRidges - 0.43) * 0.075
+            - FMath::Pow(
+                FMath::Clamp(PlainsValleys, 0.0, 1.0), 2.0
+            ) * 0.055
+        );
     }
     return Height;
 }
@@ -3623,9 +3873,6 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     Data->DesertMask.SetNumUninitialized(CellCount);
     Data->PlainsMask.SetNumUninitialized(CellCount);
 
-    // Establish the low-frequency climate before selecting lowland terrain
-    // forms. This lets dry warm regions become desert/mesa terrain rather
-    // than merely receiving a desert label after geography already exists.
     BuildMacroClimate(*Data, Generator);
 
     TArray<FMountainRange> Mountains;
@@ -3671,8 +3918,6 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Data->PlainsMask[Cell] = CellPlainsMask;
     }
 
-    // Apply height-dependent cooling/drying only after landforms exist. The
-    // resulting runoff then affects erosion and the drainage network.
     ApplyTerrainClimate(*Data, Generator);
 
     ApplyThermalErosion(
@@ -3704,7 +3949,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     if (Generator.bGenerateLakes)
     {
         const TArray<int32> MandatoryTerminusSeeds = Generator.bGenerateRivers
-            ? FindDrainageTerminusSeeds(*Data, AuthoritativeRiverNetwork)
+            ? FindRiverFedBasinSeeds(*Data, AuthoritativeRiverNetwork)
             : TArray<int32>();
         ExtractLakes(
             *Data, MandatoryTerminusSeeds, Generator.MinimumLakeDepth, Generator.MinimumLakeBedDepth,
@@ -3824,7 +4069,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("7c925f1b-1be8-4b25-bcbf-c32ad0361182")); }
+    static FGuid Version() { return FGuid(TEXT("e3a3d87f-6d21-4f8c-9c72-27c64db1a947")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -3886,12 +4131,6 @@ static void ConfigureWaterSpline(
 static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
 {
     ConfigureWaterSpline(Spline, Points, false);
-
-    // Ordinary Curve points restore the smooth plan-view meanders that
-    // CurveClamped visibly faceted. Replace only their vertical tangents with
-    // zero-slope Hermite tangents: Z then transitions monotonically between
-    // the already downhill-constrained samples and cannot overshoot into the
-    // unexplained humps that originally prompted CurveClamped.
     for (int32 Index = 0; Index < Points.Num(); ++Index)
     {
         const int32 PreviousIndex = FMath::Max(0, Index - 1);
@@ -3971,8 +4210,6 @@ static void ConfigureWaterTerrainSettings(
     Heightmap.Effects.CurlNoise.Curl1Tiling = bLake ? 65000.0f : 30000.0f;
     Heightmap.Effects.CurlNoise.Curl2Amount = Roughness * (bLake ? 650.0f : 250.0f);
     Heightmap.Effects.CurlNoise.Curl2Tiling = bLake ? 18000.0f : 9000.0f;
-    // Displacement requires an authored texture. Leaving height at zero is
-    // intentional; curl noise supplies controlled natural edge variation.
     Heightmap.Effects.Displacement.DisplacementHeight = 0.0f;
     Heightmap.Effects.SmoothBlending.InnerSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.2);
     Heightmap.Effects.SmoothBlending.OuterSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.35);
@@ -4005,11 +4242,6 @@ static void ConfigureWaterTerrainSettings(
     }
 }
 
-// UE 5.8 documents LakeModifier and RiverModifier as reflected component
-// classes while exposing only their abstract UWaterModifier base in the public
-// C++ headers. Resolve Epic's actual reflected classes instead of inventing
-// project-owned subclasses. Current engine builds may supply them as private
-// native classes or as plugin-content Blueprints, so support both forms.
 static UClass* FindWaterModifierClass(FName ModifierName)
 {
     static TMap<FName, TWeakObjectPtr<UClass>> Cache;
@@ -4091,7 +4323,7 @@ static UE::MeshPartition::UModifierComponent* AddNativeWaterModifier(
 
     UE::MeshPartition::UModifierComponent* Modifier =
         NewObject<UE::MeshPartition::UModifierComponent>(
-        &Water, &ModifierClass, TEXT("AvenorMeshTerrainWaterModifier"), RF_Transactional
+            &Water, &ModifierClass, TEXT("AvenorMeshTerrainWaterModifier"), RF_Transactional
     );
     if (!Modifier)
     {
@@ -4193,10 +4425,6 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     );
     bShowcaseClimateCompression = Climate.bShowcaseClimateCompression;
 
-    // Climate-generated arid rock needs to survive the broad erosion pass so
-    // the later river modifier can cut a canyon through a retained plateau.
-    // Non-desert cells have zero resistance, so this does not globally make
-    // the terrain harder or add another processing pass.
     ErosionResistanceStrength = (bGenerateClimate || bGenerateMesasAndCanyons)
         ? 0.55 : 0.0;
 
@@ -4415,8 +4643,6 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
     Asset->CellSize = Data->CellSize;
     Asset->ChunkCellSize = FMath::Clamp(BakedChunkCellSize, 16, 512);
     Asset->Chunks.Reset();
-    // Base geography changed, so any engineered layer solved from the old
-    // heights is deliberately invalidated and must be regenerated.
     Asset->SpineLayer = FAvenorBakedSpineLayer();
 
     const int32 ChunkColumns = FMath::DivideAndRoundUp(Data->Columns, Asset->ChunkCellSize);
@@ -4557,9 +4783,6 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData()
     Data->FilledHeight.SetNumZeroed(TotalCells);
     Data->Accumulation.SetNumZeroed(TotalCells);
     Data->Slope.SetNumZeroed(TotalCells);
-    // Climate and biome grids are bake-time data. Their durable representation
-    // is the tiled texture set, so rebuilding Mesh Partition output from the
-    // baked asset must not allocate them again.
     Data->ReceiverA.Init(INDEX_NONE, TotalCells);
     Data->ReceiverB.Init(INDEX_NONE, TotalCells);
     Data->ReceiverWeightA.SetNumZeroed(TotalCells);
@@ -4673,10 +4896,6 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
         return false;
     }
 
-    // Binding is intentionally performed after CachedData has been replaced.
-    // Previously this happened before InvalidateData()/GetOrCreateData(), so
-    // Mesh Partition could retain a background operation containing old data
-    // until the level was reloaded.
     TerrainModifier->Modify();
     TerrainModifier->SetAffectedMeshPartition(nullptr);
     TerrainModifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
@@ -4695,8 +4914,6 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
         }
         return false;
     }
-    // Broad eroded terrain is first. Refinement and native water carving
-    // then share the final layer, ordered by sub-priority.
     TerrainModifier->SetPriorityLayer(PriorityLayers[0]);
     TerrainModifier->SetPriority(0.0);
     TerrainModifier->PostEditChange();
@@ -4863,9 +5080,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     for (int32 Index = 0; Index < Data->Lakes.Num(); ++Index)
     {
         TArray<FVector> LocalShoreline = Data->Lakes[Index].Shoreline;
-        // SurfaceHeight was fixed while the matching analytic shore profile
-        // was built. Do not independently re-sample/re-lower the Water Body
-        // here: that created two competing versions of the same lake.
         for (FVector& Point : LocalShoreline)
         {
             Point.Z = Data->Lakes[Index].SurfaceHeight;
@@ -4906,8 +5120,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *River, false, Reach.Depth,
                 WaterTerrain.RiverBankWidth, WaterTerrain
             );
-            // Register only after spline metadata exists. UWaterModifier
-            // expects river metadata to be available during registration.
             AddNativeWaterModifier(
                 *River, *TargetMeshPartition, WaterPriorityLayer,
                 *RiverModifierClass
@@ -5075,9 +5287,6 @@ static bool SpawnRefinementSpline(
     SplineComp->ClearSplinePoints(false);
     SplineComp->SetSplinePoints(WorldPoints, ESplineCoordinateSpace::World, false);
     SplineComp->SetClosedLoop(bClosed, false);
-    // Match the sparse authoritative Water Body path. Ordinary Curve is
-    // deliberately used here: CurveClamped visibly facets these simplified
-    // paths in UE 5.8, while automatic curve tangents remain smooth.
     for (int32 PointIndex = 0; PointIndex < SplineComp->GetNumberOfSplinePoints(); ++PointIndex)
     {
         SplineComp->SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
@@ -5184,10 +5393,6 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
         TArray<FVector> Result = Source;
         for (FVector& Point : Result)
         {
-            // Spline Remesh executes before the Avenor height modifier, so
-            // its region of interest must intersect the original rectangle.
-            // Native water modifiers later deform these new vertices into
-            // the final bed, bank and shoreline profiles.
             Point.Z = SourceMeshWorldZ;
         }
         return Result;
@@ -5204,10 +5409,6 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
                 RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
                 FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
             );
-        // Normal rivers need dense vertices across the channel and immediate
-        // banks, not across the entire broad geomorphic valley. Canyons also
-        // refine their walls/rims, but are capped to avoid enormous 1-2 m
-        // tessellation bands.
         const double CoverageRadius = River.bIsCanyon
             ? FMath::Min(
                 River.ValleyHalfWidth + RefinementCoverageMargin,
