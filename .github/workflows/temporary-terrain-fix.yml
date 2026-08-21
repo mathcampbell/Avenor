@@ -1,0 +1,115 @@
+name: Temporary terrain generator fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-terrain:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply terrain fixes
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          text = path.read_text(encoding='utf-8')
+
+          if 'GeneratorAlgorithmVersion = 8;' in text:
+              print('Terrain fix already applied')
+              raise SystemExit(0)
+
+          def exact(old, new, name):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{name}: expected exactly 1 match, found {count}')
+              text = text.replace(old, new)
+              print('OK:', name)
+
+          def regex(pattern, replacement, name):
+              global text
+              text, count = re.subn(pattern, replacement, text, count=1, flags=re.S)
+              if count != 1:
+                  raise RuntimeError(f'{name}: expected exactly 1 match, found {count}')
+              print('OK:', name)
+
+          exact('static constexpr int32 GeneratorAlgorithmVersion = 7;',
+                'static constexpr int32 GeneratorAlgorithmVersion = 8;',
+                'algorithm version')
+
+          exact('static FGuid Version() { return FGuid(TEXT("e3a3d87f-6d21-4f8c-9c72-27c64db1a947")); }',
+                'static FGuid Version() { return FGuid(TEXT("3b6044af-2fc4-4b2e-bc19-83c52493bda8")); }',
+                'Mesh Partition version')
+
+          regex(
+              r'''    const double Amplitude = FMath::Min\(\s*TotalLength \* 0\.11,\s*CellSize \* FMath::Lerp\(3\.5, 8\.0, Discharge\)\s*\) \* Strength \* Lowland \* FMath::Lerp\(0\.55, 1\.25, Discharge\) \* Freedom;\s*    const double Wavelength = Random\.FRandRange\(0\.82, 1\.18\)\s*        \* FMath::Lerp\(8\.0, 30\.0, Discharge\) \* CellSize;''',
+              '''    const double Amplitude = FMath::Min(\n        TotalLength * 0.075,\n        CellSize * FMath::Lerp(2.2, 5.0, Discharge)\n    ) * Strength * Lowland * FMath::Lerp(0.55, 1.0, Discharge) * Freedom;\n    const double Wavelength = Random.FRandRange(0.88, 1.16)\n        * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;''',
+              'meander amplitude')
+
+          marker = '''struct FRiverCandidate\n{\n'''
+          insertion = '''static void SuppressPathologicalMeanders(\n    const TArray<FVector>& BasePoints,\n    TArray<FVector>& Points,\n    double CellSize\n)\n{\n    if (Points.Num() < 4 || BasePoints.Num() != Points.Num())\n    {\n        return;\n    }\n\n    const double MinimumSeparation = CellSize * 1.6;\n    for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)\n    {\n        const FVector2D Incoming =\n            (FVector2D(Points[Index]) - FVector2D(Points[Index - 1])).GetSafeNormal();\n        const FVector2D Outgoing =\n            (FVector2D(Points[Index + 1]) - FVector2D(Points[Index])).GetSafeNormal();\n        const double Dot = FVector2D::DotProduct(Incoming, Outgoing);\n        if (Dot < -0.10)\n        {\n            const double Severity = FMath::Clamp((-0.10 - Dot) / 0.90, 0.0, 1.0);\n            const double Keep = FMath::Lerp(0.55, 0.18, Severity);\n            Points[Index].X = FMath::Lerp(BasePoints[Index].X, Points[Index].X, Keep);\n            Points[Index].Y = FMath::Lerp(BasePoints[Index].Y, Points[Index].Y, Keep);\n        }\n    }\n\n    for (int32 Index = 4; Index + 1 < Points.Num(); ++Index)\n    {\n        double ClosestEarlier = TNumericLimits<double>::Max();\n        for (int32 Earlier = 0; Earlier + 2 < Index; ++Earlier)\n        {\n            ClosestEarlier = FMath::Min(\n                ClosestEarlier,\n                SegmentDistance(\n                    FVector2D(Points[Index]),\n                    FVector2D(Points[Earlier]),\n                    FVector2D(Points[Earlier + 1])\n                )\n            );\n        }\n        if (ClosestEarlier < MinimumSeparation)\n        {\n            const double SeparationAlpha = FMath::Clamp(\n                ClosestEarlier / MinimumSeparation, 0.0, 1.0\n            );\n            const double Keep = FMath::Lerp(0.20, 0.75, SeparationAlpha);\n            Points[Index].X = FMath::Lerp(BasePoints[Index].X, Points[Index].X, Keep);\n            Points[Index].Y = FMath::Lerp(BasePoints[Index].Y, Points[Index].Y, Keep);\n        }\n    }\n}\n\nstruct FRiverCandidate\n{\n'''
+          exact(marker, insertion, 'meander sanity helper')
+
+          regex(
+              r'''        ConstrainMeandersToValley\(\s*            Data, BaseMeanderPoints, Points, LowlandFraction\s*        \);\s*        Points = ChaikinSmooth\(Points, false, 2\);''',
+              '''        ConstrainMeandersToValley(\n            Data, BaseMeanderPoints, Points, LowlandFraction\n        );\n        SuppressPathologicalMeanders(\n            BaseMeanderPoints, Points, Data.CellSize\n        );\n        Points = ChaikinSmooth(Points, false, 2);''',
+              'meander sanity call')
+
+          regex(
+              r'''            const double ChannelSpacing = FMath::Max\(.*?            const double GullyProfile =\s*                FMath::Pow\(FMath::Min\(1\.0, DownSlope\), 0\.72\) \*\s*                Smooth01\(\(1\.25 - DownSlope\) / 0\.25\) \*\s*                ChannelMask \* ChannelLongitudinalVariation;''',
+              '''            const double GullyScale = FMath::Max(\n                Range.PeakSpacing * 0.78,\n                Range.HalfWidth * 0.18\n            );\n            const FVector2D DrainageWarp(\n                Fbm(\n                    Warped, GullyScale * 2.4,\n                    SeedOffset + FVector2D(Range.Phase * 601.0, 109.0),\n                    4, 0.55, 2.03\n                ),\n                Fbm(\n                    Warped, GullyScale * 2.1,\n                    SeedOffset + FVector2D(53.0, Range.Phase * 733.0),\n                    4, 0.55, 2.07\n                )\n            );\n            const FVector2D DrainagePosition =\n                Warped + DrainageWarp * GullyScale * 0.72;\n            const double GullyNoise = RidgedFbm(\n                DrainagePosition,\n                GullyScale,\n                SeedOffset + FVector2D(1663.0, Range.Phase * 947.0),\n                5\n            );\n            const double BranchNoise = 0.5 + 0.5 * Fbm(\n                DrainagePosition,\n                GullyScale * 1.85,\n                SeedOffset + FVector2D(Range.Phase * 367.0, 1871.0),\n                4, 0.56, 2.0\n            );\n            const double GullyProfile =\n                FMath::Pow(FMath::Clamp(GullyNoise, 0.0, 1.0), 3.1)\n                * FMath::Pow(FMath::Min(1.0, DownSlope), 0.82)\n                * Smooth01((1.25 - DownSlope) / 0.25)\n                * FMath::Lerp(\n                    0.38, 1.0,\n                    FMath::Clamp(BranchNoise, 0.0, 1.0)\n                );''',
+              'mountain gully morphology')
+
+          exact('''                    SpurLift * 0.2 -\n                    GullyProfile * 0.19''',
+                '''                    SpurLift * 0.24 -\n                    GullyProfile * 0.115''',
+                'mountain gully depth')
+
+          exact('''    double Height =\n        RegionalRelief * HillsRelief * 0.18\n        + (RegionalRidges - 0.42) * HillsRelief * 0.075\n        - FMath::Pow(FMath::Clamp(BroadValleys, 0.0, 1.0), 2.0)\n            * HillsRelief * 0.085\n            * FMath::Lerp(0.55, 1.0, PlainsAffinity);''',
+                '''    double Height =\n        RegionalRelief * HillsRelief * 0.26\n        + (RegionalRidges - 0.42) * HillsRelief * 0.11\n        - FMath::Pow(FMath::Clamp(BroadValleys, 0.0, 1.0), 2.0)\n            * HillsRelief * 0.12\n            * FMath::Lerp(0.60, 1.10, PlainsAffinity);''',
+                'regional lowland relief')
+
+          exact('''        Height += HillsRelief * PlainsAffinity * (\n            PlainsRoll * 0.20\n            + (PlainsRidges - 0.43) * 0.075\n            - FMath::Pow(\n                FMath::Clamp(PlainsValleys, 0.0, 1.0), 2.0\n            ) * 0.055\n        );''',
+                '''        Height += HillsRelief * PlainsAffinity * (\n            PlainsRoll * 0.30\n            + (PlainsRidges - 0.43) * 0.11\n            - FMath::Pow(\n                FMath::Clamp(PlainsValleys, 0.0, 1.0), 2.0\n            ) * 0.085\n        );''',
+                'plains relief')
+
+          exact('''            const double SampledHeight = Sample.Height;\n            WorldPosition.Z = BaseWorldZ + SampledHeight;''',
+                '''            float FinalHeight = Sample.Height;\n            Data->SampleFinalHeight(\n                XY, FinalHeight, ChunkCache, nullptr\n            );\n            const double SampledHeight = static_cast<double>(FinalHeight);\n            WorldPosition.Z = BaseWorldZ + SampledHeight;''',
+                'water-aware terrain height')
+
+          exact('''    UClass* LakeModifierClass = Hydrology.bLakes\n        ? FindWaterModifierClass(TEXT("LakeModifier"))\n        : nullptr;\n    UClass* RiverModifierClass = Hydrology.bRivers\n        ? FindWaterModifierClass(TEXT("RiverModifier"))\n        : nullptr;\n    if ((Hydrology.bLakes && !LakeModifierClass)\n        || (Hydrology.bRivers && !RiverModifierClass))''',
+                '''    UClass* RiverModifierClass = Hydrology.bRivers\n        ? FindWaterModifierClass(TEXT("RiverModifier"))\n        : nullptr;\n    if (Hydrology.bRivers && !RiverModifierClass)''',
+                'disable lake modifier requirement')
+
+          exact('''                "Unreal's MeshPartitionWater LakeModifier or RiverModifier "\n                "Blueprint class could not be loaded. Check that the "''',
+                '''                "Unreal's MeshPartitionWater RiverModifier "\n                "Blueprint class could not be loaded. Check that the "''',
+                'water modifier message')
+
+          exact('''            AddNativeWaterModifier(\n                *Lake, *TargetMeshPartition, WaterPriorityLayer,\n                *LakeModifierClass\n            );\n            Lake->PostEditChange();''',
+                '''            // Avenor's broad terrain op already carves the lake bed and\n            // exterior shoreline with a min-only operation. Attaching Epic's\n            // LakeModifier here would sculpt the terrain a second time and can\n            // raise low ground toward the water datum, creating an uphill bank.\n            Lake->PostEditChange();''',
+                'disable native lake terrain modifier')
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+          print('Terrain patch written successfully')
+          PY
+
+          if git diff --quiet -- AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp; then
+            echo "No terrain source changes needed"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Fix lake shores and terrain morphology"
+          git push origin HEAD:main
