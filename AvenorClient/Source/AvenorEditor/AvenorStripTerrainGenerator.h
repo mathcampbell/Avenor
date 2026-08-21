@@ -309,6 +309,14 @@ public:
     double StructuralScale = 1600000.0;
     double TectonicActivity = 0.65;
     double RiftStrength = 0.45;
+    bool bGenerateClimate = true;
+    double ClimateTemperature = 0.5;
+    double ClimateMoisture = 0.5;
+    double ClimateRegionalVariation = 0.55;
+    double ClimateRegionSpacing = 500000.0;
+    double ClimateWaterInfluenceDistance = 100000.0;
+    double ClimateWaterMoistureBoost = 0.35;
+    bool bShowcaseClimateCompression = false;
     bool bGenerateMesasAndCanyons = false;
     double MesaScale = 400000.0;
     double ErosionResistanceStrength = 0.0;
