@@ -1,0 +1,160 @@
+name: Apply terrain balance v12
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch terrain balance
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s = p.read_text(encoding='utf-8')
+
+          def one(old, new, name):
+              global s
+              if old not in s:
+                  raise RuntimeError(f'missing patch target: {name}')
+              s = s.replace(old, new, 1)
+
+          one('static constexpr int32 GeneratorAlgorithmVersion = 11;',
+              'static constexpr int32 GeneratorAlgorithmVersion = 12;', 'algorithm version')
+
+          # Province fields need to vary several times across the showcase world,
+          # not once across a scale larger than the short dimension.
+          one('''    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.8,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.1,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.70 + Province2 * 0.30 - 0.64) / 0.24,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.46 + Province2 * 0.54 - 0.37) / 0.34,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.72);
+    const double QuietProvince = FMath::Clamp(
+        1.0 - MountainProvince * 0.90 - HillProvince * 0.58,
+        0.0, 1.0
+    );''', '''    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.80,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.35,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+
+    // Provinces are preferences, not hard biome-like gates. Mountains are
+    // uncommon, hills/uplands are common, and sizeable lowland provinces remain.
+    const double ProvinceMix = Province * 0.66 + Province2 * 0.34;
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (ProvinceMix - 0.57) / 0.27,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.44 + Province2 * 0.56 - 0.31) / 0.42,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.50);
+    const double QuietProvince = FMath::Clamp(
+        1.0 - MountainProvince * 0.78 - HillProvince * 0.52,
+        0.0, 1.0
+    );''', 'province distribution')
+
+          # Make ranges possible without allowing ridge noise itself to become spikes.
+          one('''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.54, 0.46, Activity)) / 0.34,
+        0.0, 1.0
+    )) * MountainProvince
+       * FMath::Lerp(0.58, 1.0, PositiveUplift);''', '''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.49, 0.41, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.34, 1.0, MountainProvince)
+       * FMath::Lerp(0.62, 1.0, PositiveUplift);''', 'broad mountain range')
+
+          # Hill country should be a positive landform, not noise centred around zero.
+          one('''    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.48 * UplandRidges
+            + 0.34 * (0.5 + 0.5 * Rolling)
+            + 0.18 * Province2 - 0.42) / 0.34,
+        0.0, 1.0
+    ));''', '''    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.42 * UplandRidges
+            + 0.38 * (0.5 + 0.5 * Rolling)
+            + 0.20 * Province2 - 0.34) / 0.44,
+        0.0, 1.0
+    ));''', 'independent hills')
+
+          one('''    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.42, 0.72, Activity)
+        * CrestShape;
+
+    // Foothills and hill country are deliberately much lower than mountains.
+    Height += FoothillEnvelope * Relief * 0.11
+        * (0.72 + UplandRidges * 0.28);
+    Height += IndependentHills * Relief * (
+        Rolling * 0.055
+        + (UplandRidges - 0.48) * 0.070
+        + HillDetail * 0.025
+    );''', '''    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.34, 0.58, Activity)
+        * CrestShape;
+
+    // Broad mountain shoulders and substantial rolling/upland country bridge
+    // the scale gap between plains and true ranges. Hills always add a positive
+    // base rise; noise changes their shape rather than deciding whether they exist.
+    Height += FoothillEnvelope * Relief * 0.135
+        * (0.76 + UplandRidges * 0.24);
+    Height += IndependentHills * Relief * (
+        0.052
+        + (0.5 + 0.5 * Rolling) * 0.050
+        + UplandRidges * 0.045
+        + HillDetail * 0.018
+    );''', 'height balance')
+
+          one('''    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.018
+        + (PlainRidges - 0.46) * 0.012
+    );''', '''    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.026
+        + (PlainRidges - 0.46) * 0.018
+    );''', 'plain relief')
+
+          # New DDC code key for changed geometry.
+          s, n = re.subn(r'static FGuid Version\(\) \{ return FGuid\(TEXT\("[0-9a-fA-F-]{36}"\)\); \}',
+                         'static FGuid Version() { return FGuid(TEXT("9a2d0dc1-42dc-41a2-9e3e-4d91a6608b51")); }', s, count=1)
+          if n != 1:
+              raise RuntimeError('could not update terrain op version GUID')
+
+          p.write_text(s, encoding='utf-8')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Balance terrain provinces and relief" || exit 0
+          git push
