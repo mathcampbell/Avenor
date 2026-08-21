@@ -89,7 +89,7 @@ static UTexture2D* CreateOrUpdateBlendTexture(
 }
 
 static bool BuildBlendPixels(
-    const UTexture2D& ClimateTexture,
+    UTexture2D& ClimateTexture,
     double CellSize,
     TArray<FColor>& OutPixels
 )
