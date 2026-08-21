@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 10;
+static constexpr int32 GeneratorAlgorithmVersion = 11;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3141,17 +3141,12 @@ static double EvaluateLandform(
     const double Relief = FMath::Max(25000.0, ReliefHeight);
     const FVector WorldSize = Bounds.GetSize();
     const double ShortExtent = FMath::Max(
-        100000.0,
-        FMath::Min(WorldSize.X, WorldSize.Y)
+        100000.0, FMath::Min(WorldSize.X, WorldSize.Y)
     );
-
-    // StructuralScale is an artistic target, but a scale larger than the
-    // short world dimension collapses the whole strip into one smooth dome.
-    // Keep several independent structures across the playable width.
     const double Scale = FMath::Clamp(
         StructuralScale,
         250000.0,
-        FMath::Max(350000.0, ShortExtent * 0.46)
+        FMath::Max(450000.0, ShortExtent * 0.62)
     );
     const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
     const double RiftAmount = FMath::Clamp(RiftStrength, 0.0, 1.0);
@@ -3161,22 +3156,11 @@ static double EvaluateLandform(
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
 
-    // Broad warp keeps belts, faults and valleys coherent while preventing
-    // the terrain from looking like straight mathematical bands.
-    const FVector2D MacroWarp(
-        Fbm(Position, Scale * 1.65,
-            SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
-        Fbm(Position, Scale * 1.55,
-            SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.03)
-    );
-    const FVector2D Warped = Position + MacroWarp * Scale * 0.34;
-
     const FVector2D StripAxis = LongAxis == EAvenorStripLongAxis::X
         ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
     const FVector2D StripAcross = Rotate90(StripAxis);
     const double SeedAngleA = FMath::Fmod(
-        FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37,
-        PI
+        FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
     );
     const double SeedAngleB = FMath::Fmod(
         SeedAngleA + 1.047
@@ -3200,211 +3184,225 @@ static double EvaluateLandform(
         );
     };
 
-    // Continental-scale elevation only establishes regional high and low
-    // country. It no longer supplies most of the visible relief itself.
+    // A broad warp gives coherent geological direction without making
+    // every valley or ridge parallel.
+    const FVector2D MacroWarp(
+        Fbm(Position, Scale * 1.8,
+            SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
+        Fbm(Position, Scale * 1.7,
+            SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.03)
+    );
+    const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
+
+    // Province fields deliberately reserve substantial quiet country.
+    // This is the high-level distribution of plains, hill country,
+    // uplands and active mountain belts; it prevents ruggedness from
+    // saturating the whole strip.
+    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.8,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.1,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.70 + Province2 * 0.30 - 0.64) / 0.24,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.46 + Province2 * 0.54 - 0.37) / 0.34,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.72);
+    const double QuietProvince = FMath::Clamp(
+        1.0 - MountainProvince * 0.90 - HillProvince * 0.58,
+        0.0, 1.0
+    );
+
+    // Regional uplift gives high and low country, but intentionally
+    // contributes little direct relief. Mountains are not giant noise domes.
     const double PlateField = Fbm(
-        Warped, Scale * 2.25,
+        Warped, Scale * 2.6,
         SeedOffset + FVector2D(1201.0, 331.0),
         5, 0.57, 2.0
     );
     const double RegionalTilt = Fbm(
-        Oriented(Warped, StripAxis, StripAcross, 2.8, 0.85),
-        Scale * 2.4,
+        Oriented(Warped, StripAxis, StripAcross, 2.8, 0.9),
+        Scale * 3.0,
         SeedOffset + FVector2D(149.0, 1267.0),
         4, 0.55, 2.0
     );
     const double Uplift = FMath::Clamp(
-        PlateField * 0.74 + RegionalTilt * 0.26,
+        PlateField * 0.72 + RegionalTilt * 0.28,
         -1.0, 1.0
     );
     const double PositiveUplift = Smooth01(FMath::Clamp(
-        (Uplift + 0.18) / 0.92, 0.0, 1.0
+        (Uplift + 0.12) / 0.92, 0.0, 1.0
     ));
     const double Subsidence = Smooth01(FMath::Clamp(
-        (-Uplift + 0.14) / 0.88, 0.0, 1.0
+        (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    // Orogenic belts are narrow, anisotropic and multi-scale. A broad belt
-    // provides the range; a finer ridge field breaks it into peaks, passes,
-    // secondary ridges and shoulders. Mountains are therefore an emergent
-    // part of the same field, not separately placed objects.
+    // Broad orogenic envelopes define where a range exists. Narrow ridge
+    // noise is only allowed to sculpt the range by a modest amount, so it
+    // cannot turn one sample into a kilometre-high needle.
     const double BeltA = RidgedFbm(
-        Oriented(Warped, AxisA, AcrossA, 3.6, 0.52),
-        Scale * 0.58,
+        Oriented(Warped, AxisA, AcrossA, 4.2, 0.82),
+        Scale * 0.95,
         SeedOffset + FVector2D(421.0, 719.0),
-        6
+        5
     );
     const double BeltB = RidgedFbm(
-        Oriented(Warped, AxisB, AcrossB, 2.8, 0.60),
-        Scale * 0.72,
+        Oriented(Warped, AxisB, AcrossB, 3.4, 0.90),
+        Scale * 1.05,
         SeedOffset + FVector2D(877.0, 149.0),
-        6
+        5
     );
-    const double RidgeBreakup = RidgedFbm(
-        Warped,
-        Scale * 0.19,
-        SeedOffset + FVector2D(947.0, 271.0),
-        6
-    );
-    const double PeakVariation = 0.5 + 0.5 * Fbm(
-        Warped,
-        Scale * 0.31,
-        SeedOffset + FVector2D(211.0, 883.0),
-        5, 0.54, 2.07
-    );
-
     const double BeltSignal = FMath::Clamp(
-        BeltA * 0.58 + BeltB * 0.42,
-        0.0, 1.0
+        BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
-    const double OrogenicPotential = BeltSignal
-        * FMath::Lerp(0.52, 1.0, PositiveUplift);
-    const double MountainThreshold = FMath::Lerp(0.49, 0.36, Activity);
-    const double MountainCore = Smooth01(FMath::Clamp(
-        (OrogenicPotential - MountainThreshold) / 0.34,
+    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.54, 0.46, Activity)) / 0.34,
+        0.0, 1.0
+    )) * MountainProvince
+       * FMath::Lerp(0.58, 1.0, PositiveUplift);
+
+    const double CrestRidges = RidgedFbm(
+        Warped, Scale * 0.30,
+        SeedOffset + FVector2D(947.0, 271.0),
+        5
+    );
+    const double CrestVariation = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 0.42,
+        SeedOffset + FVector2D(211.0, 883.0),
+        4, 0.54, 2.07
+    );
+    const double CrestShape = FMath::Clamp(
+        0.78
+            + (CrestRidges - 0.50) * 0.30
+            + (CrestVariation - 0.50) * 0.20,
+        0.62, 1.12
+    );
+    OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
+
+    // Welsh/Scottish-style uplands and ordinary rolling hill country are
+    // separate scales, not weak mountain noise.
+    const double UplandRidges = RidgedFbm(
+        Warped, Scale * 0.48,
+        SeedOffset + FVector2D(347.0, 1039.0),
+        5
+    );
+    const double Rolling = Fbm(
+        Warped, Scale * 0.62,
+        SeedOffset + FVector2D(1171.0, 673.0),
+        5, 0.54, 2.03
+    );
+    const double HillDetail = Fbm(
+        Warped, Scale * 0.24,
+        SeedOffset + FVector2D(163.0, 1429.0),
+        4, 0.52, 2.1
+    );
+    const double FoothillEnvelope = Smooth01(FMath::Clamp(
+        (BeltSignal - 0.34) / 0.38, 0.0, 1.0
+    )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
+    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.48 * UplandRidges
+            + 0.34 * (0.5 + 0.5 * Rolling)
+            + 0.18 * Province2 - 0.42) / 0.34,
         0.0, 1.0
     ));
-    const double MountainTexture = FMath::Clamp(
-        0.62 + RidgeBreakup * 0.55 + (PeakVariation - 0.5) * 0.32,
-        0.42, 1.34
-    );
-    OutMountainMask = FMath::Clamp(
-        MountainCore * FMath::Lerp(0.76, 1.0, PositiveUplift),
+    OutHillMask = FMath::Clamp(
+        FMath::Max(FoothillEnvelope * 0.82, IndependentHills)
+            * (1.0 - OutMountainMask * 0.62),
         0.0, 1.0
     );
 
-    // Foothills deliberately occupy a broader envelope than mountain cores.
-    // This creates long approaches and subordinate ridges instead of ranges
-    // rising directly from otherwise flat terrain.
-    const double FoothillMask = Smooth01(FMath::Clamp(
-        (OrogenicPotential - (MountainThreshold - 0.16)) / 0.36,
-        0.0, 1.0
-    )) * (1.0 - OutMountainMask * 0.58);
-
-    // Extension is equally structural. Long depressed belts produce rift
-    // valleys and major lowland corridors, with fault shoulders on either side.
+    // Long extension zones become rift valleys and broad structural
+    // corridors. They are intentionally wide enough to contain floodplains.
     const FVector2D RiftWarp = Warped + FVector2D(
-        Fbm(Warped, Scale * 0.85,
-            SeedOffset + FVector2D(509.0, 193.0), 3) * Scale * 0.20,
-        Fbm(Warped, Scale * 0.85,
-            SeedOffset + FVector2D(827.0, 557.0), 3) * Scale * 0.20
+        Fbm(Warped, Scale * 1.2,
+            SeedOffset + FVector2D(509.0, 193.0), 3) * Scale * 0.16,
+        Fbm(Warped, Scale * 1.2,
+            SeedOffset + FVector2D(827.0, 557.0), 3) * Scale * 0.16
     );
     const double RiftLine = RidgedFbm(
-        Oriented(RiftWarp, AxisB, AcrossB, 4.0, 0.42),
-        Scale * 0.43,
+        Oriented(RiftWarp, AxisB, AcrossB, 4.5, 0.72),
+        Scale * 0.72,
         SeedOffset + FVector2D(919.0, 1601.0),
-        6
+        5
     );
     const double RiftContinuity = 0.5 + 0.5 * Fbm(
-        Warped,
-        Scale * 1.5,
+        Warped, Scale * 1.8,
         SeedOffset + FVector2D(1733.0, 449.0),
         3, 0.58, 2.0
     );
     const double RiftMask = Smooth01(FMath::Clamp(
-        (RiftLine * FMath::Lerp(0.58, 1.0, Subsidence)
-            * FMath::Lerp(0.62, 1.0, RiftContinuity) - 0.46) / 0.34,
+        (RiftLine * FMath::Lerp(0.55, 1.0, Subsidence)
+            * FMath::Lerp(0.65, 1.0, RiftContinuity) - 0.50) / 0.34,
         0.0, 1.0
     )) * RiftAmount * (1.0 - OutMountainMask * 0.72);
     const double RiftShoulder = Smooth01(FMath::Clamp(
-        (RiftLine - 0.34) / 0.42, 0.0, 1.0
+        (RiftLine - 0.35) / 0.40, 0.0, 1.0
     )) * (1.0 - RiftMask) * RiftAmount;
 
-    // Basins are broad negative landforms rather than merely flat areas.
     const double BasinNoise = 0.5 + 0.5 * Fbm(
-        Warped,
-        Scale * 1.05,
+        Warped, Scale * 1.45,
         SeedOffset + FVector2D(1543.0, 271.0),
         4, 0.56, 2.0
     );
     const double BasinMask = Subsidence
-        * Smooth01(FMath::Clamp(
-            (BasinNoise - 0.40) / 0.44, 0.0, 1.0
-        ))
-        * (1.0 - OutMountainMask * 0.75);
+        * Smooth01(FMath::Clamp((BasinNoise - 0.46) / 0.36, 0.0, 1.0))
+        * (1.0 - OutMountainMask * 0.72);
 
-    // Rolling hill country has its own structure and exists even where no
-    // orogenic core is present. This is the missing middle scale between
-    // plains and mountains.
-    const double HillRidges = RidgedFbm(
-        Warped,
-        Scale * 0.23,
-        SeedOffset + FVector2D(347.0, 1039.0),
-        5
-    );
-    const double HillRoll = Fbm(
-        Warped,
-        Scale * 0.34,
-        SeedOffset + FVector2D(1171.0, 673.0),
-        5, 0.54, 2.03
-    );
-    const double HillRegions = 0.5 + 0.5 * Fbm(
-        Warped,
-        Scale * 0.92,
-        SeedOffset + FVector2D(887.0, 157.0),
-        4, 0.56, 2.0
-    );
-    const double IndependentHills = Smooth01(FMath::Clamp(
-        (HillRegions * 0.48 + HillRidges * 0.52 - 0.34) / 0.46,
-        0.0, 1.0
-    ));
-    OutHillMask = FMath::Clamp(
-        FMath::Max(FoothillMask, IndependentHills * 0.86)
-            * (1.0 - OutMountainMask * 0.72)
-            * (1.0 - RiftMask * 0.46),
-        0.0, 1.0
-    );
     OutPlainsMask = FMath::Clamp(
-        1.0 - OutMountainMask * 0.96
-            - OutHillMask * 0.68
-            - RiftMask * 0.48,
+        FMath::Max(QuietProvince, 1.0 - OutMountainMask * 0.96
+            - OutHillMask * 0.72 - RiftMask * 0.42),
         0.0, 1.0
     );
 
-    // Regional elevation is intentionally restrained. Visible terrain form
-    // comes from structures below, avoiding the previous single swollen dome.
-    double Height = Uplift * Relief * 0.11
-        + RegionalTilt * Relief * 0.035;
+    double Height = Uplift * Relief * 0.075
+        + RegionalTilt * Relief * 0.025;
 
-    // Mountain belts: high local relief, sharp cores, broken summits.
-    Height += FMath::Pow(OutMountainMask, 1.28)
-        * Relief * FMath::Lerp(0.62, 1.10, Activity)
-        * MountainTexture;
+    // Mountains occupy broad bases and are capped by the envelope. The
+    // crest texture changes their profile by only +/- ~20 percent.
+    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.42, 0.72, Activity)
+        * CrestShape;
 
-    // Foothill/range shoulders create intermediate relief around cores.
-    Height += FoothillMask * Relief * 0.18
-        * (0.55 + HillRidges * 0.45);
-
-    // Independent hills are substantial enough to read as actual rolling
-    // country from world scale, not texture noise on a flat sheet.
-    Height += OutHillMask * Relief * (
-        HillRoll * 0.105
-        + (HillRidges - 0.42) * 0.115
+    // Foothills and hill country are deliberately much lower than mountains.
+    Height += FoothillEnvelope * Relief * 0.11
+        * (0.72 + UplandRidges * 0.28);
+    Height += IndependentHills * Relief * (
+        Rolling * 0.055
+        + (UplandRidges - 0.48) * 0.070
+        + HillDetail * 0.025
     );
 
-    // Rifts and basins can dominate local topography just as uplift can.
-    Height -= RiftMask * Relief * FMath::Lerp(0.18, 0.46, RiftAmount)
-        * FMath::Lerp(0.82, 1.12, RiftLine);
-    Height += RiftShoulder * Relief * 0.075;
-    Height -= BasinMask * Relief * 0.12;
+    // Rift floors and basins provide the large negative landforms needed
+    // for wide valleys and long drainage corridors.
+    Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
+        * FMath::Lerp(0.86, 1.08, RiftLine);
+    Height += RiftShoulder * Relief * 0.045;
+    Height -= BasinMask * Relief * 0.085;
 
-    // Plains still contain broad rolls and drainage divides, but remain
-    // visibly quieter than hill country.
-    const double LowlandRoll = Fbm(
-        Warped,
-        Scale * 0.58,
+    // True plains are allowed to stay broad and quiet. Their relief is on
+    // the scale of rolling countryside, not repeated mini-mountains.
+    const double PlainRoll = Fbm(
+        Warped, Scale * 0.95,
         SeedOffset + FVector2D(101.0, 43.0),
         4, 0.56, 2.0
     );
-    const double LowlandRidges = RidgedFbm(
-        Warped,
-        Scale * 0.39,
+    const double PlainRidges = RidgedFbm(
+        Warped, Scale * 0.72,
         SeedOffset + FVector2D(607.0, 1489.0),
         4
     );
     Height += OutPlainsMask * Relief * (
-        LowlandRoll * 0.040
-        + (LowlandRidges - 0.43) * 0.026
+        PlainRoll * 0.018
+        + (PlainRidges - 0.46) * 0.012
     );
 
     const double Warmth = bClimateEnabled
@@ -3417,36 +3415,41 @@ static double EvaluateLandform(
         )) : 0.0;
     const double Aridity = Warmth * Dryness;
     OutDesertMask = Aridity * FMath::Clamp(
-        1.0 - OutMountainMask * 0.42,
-        0.0, 1.0
+        1.0 - OutMountainMask * 0.38, 0.0, 1.0
     );
 
-    // Climate changes the expression of pre-existing geology rather than
-    // selecting a separate terrain generator.
+    // Arid climate exposes and flattens resistant uplands into mesas and
+    // escarpments, but only where structural hill/upland terrain already exists.
     const double PlateauSignal = 0.5 + 0.5 * Fbm(
-        Warped,
-        Scale * 0.30,
+        Warped, Scale * 0.52,
         SeedOffset + FVector2D(811.0, 397.0),
         4, 0.55, 2.0
     );
     const double PlateauMask = Smooth01(FMath::Clamp(
-        (PlateauSignal - 0.50) / 0.25, 0.0, 1.0
-    )) * OutDesertMask * FMath::Lerp(0.25, 1.0, OutHillMask);
-    Height += PlateauMask * Relief * 0.085;
+        (PlateauSignal - 0.57) / 0.25, 0.0, 1.0
+    )) * OutDesertMask
+       * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.55, 0.0, 1.0)
+       * (1.0 - OutMountainMask * 0.72);
+
+    // Terrace the *upper* part of an existing upland rather than building
+    // free-standing desert spikes.
+    const double MesaStep = FMath::Floor(
+        FMath::Clamp(PlateauSignal, 0.0, 0.999) * 5.0
+    ) / 5.0;
+    Height += PlateauMask * Relief
+        * (0.055 + MesaStep * 0.035);
 
     const double BadlandRidges = RidgedFbm(
-        Warped,
-        FMath::Max(70000.0, Scale * 0.065),
+        Warped, FMath::Max(70000.0, Scale * 0.10),
         SeedOffset + FVector2D(1733.0, 1449.0),
-        5
+        4
     );
-    Height += (BadlandRidges - 0.46) * Relief * 0.032
-        * PlateauMask;
+    Height += (BadlandRidges - 0.48) * Relief * 0.018 * PlateauMask;
 
-    const double DuneSuitability = OutDesertMask
-        * OutPlainsMask
-        * (1.0 - PlateauMask * 0.85)
-        * (1.0 - RiftMask * 0.65);
+    // Dunes remain low-amplitude regional terrain on quiet arid plains.
+    const double DuneSuitability = OutDesertMask * OutPlainsMask
+        * (1.0 - PlateauMask * 0.90)
+        * (1.0 - RiftMask * 0.55);
     if (DuneSuitability > 0.03)
     {
         const double WindAngle = FMath::Fmod(
@@ -3457,29 +3460,27 @@ static double EvaluateLandform(
             FMath::Cos(WindAngle), FMath::Sin(WindAngle)
         );
         const double DuneWavelength = FMath::Clamp(
-            Scale * 0.045, 45000.0, 140000.0
+            Scale * 0.07, 45000.0, 160000.0
         );
         const double PhaseWarp = Fbm(
-            Warped,
-            DuneWavelength * 5.2,
+            Warped, DuneWavelength * 5.2,
             SeedOffset + FVector2D(1877.0, 1021.0),
             3, 0.55, 2.0
-        ) * DuneWavelength * 0.85;
+        ) * DuneWavelength * 0.70;
         const double WindCoordinate =
             FVector2D::DotProduct(Warped, WindDirection) + PhaseWarp;
         const double DuneWave = 0.5 + 0.5 * FMath::Sin(
             2.0 * PI * WindCoordinate / DuneWavelength
         );
-        Height += (FMath::Pow(DuneWave, 2.25) - 0.31)
-            * Relief * 0.022 * DuneSuitability;
+        Height += (FMath::Pow(DuneWave, 2.1) - 0.31)
+            * Relief * 0.010 * DuneSuitability;
     }
 
     OutResistance = FMath::Clamp(
-        OutMountainMask * 0.42
-            + OutHillMask * 0.15
-            + RiftShoulder * 0.12
-            + OutDesertMask * (0.22 + PlateauMask * 0.36)
-            + RidgeBreakup * 0.07,
+        OutMountainMask * 0.28
+            + OutHillMask * 0.11
+            + OutDesertMask * (0.18 + PlateauMask * 0.38)
+            + RiftShoulder * 0.10,
         0.0, 1.0
     );
     return Height;
@@ -4021,7 +4022,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("e77a69d8-d36d-4c4e-9edc-3d65761d2c27")); }
+    static FGuid Version() { return FGuid(TEXT("0d67db9f-1539-4d60-8fba-269d8d459e61")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
