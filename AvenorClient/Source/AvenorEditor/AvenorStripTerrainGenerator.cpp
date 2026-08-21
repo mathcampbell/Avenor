@@ -505,18 +505,6 @@ struct FRiverReach
     FBox2D Bounds = FBox2D(ForceInit);
 };
 
-struct FMountainRange
-{
-    FVector2D Centre = FVector2D::ZeroVector;
-    FVector2D Along = FVector2D(1.0, 0.0);
-    FVector2D Across = FVector2D(0.0, 1.0);
-    double HalfLength = 1.0;
-    double HalfWidth = 1.0;
-    double PeakSpacing = 1.0;
-    double Relief = 0.0;
-    double Phase = 0.0;
-};
-
 struct FLakeBasin
 {
     TArray<FVector> Shoreline;
@@ -622,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 8;
+static constexpr int32 GeneratorAlgorithmVersion = 9;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3131,92 +3119,15 @@ float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) 
 
 namespace UE::Avenor::Strip
 {
-static TArray<FMountainRange> BuildMountainRanges(
-    const FBox& Bounds,
-    EAvenorStripLongAxis LongAxis,
-    int32 Seed,
-    double RangesPer100Km,
-    double RangeLength,
-    double RangeWidth,
-    double PeakSpacing,
-    double Relief,
-    double ExclusionHalfWidth,
-    int32& OutRequestedCount
-)
-{
-    const FVector Size = Bounds.GetSize();
-    const double LongLength = LongAxis == EAvenorStripLongAxis::X ? Size.X : Size.Y;
-    const double AcrossExtent = LongAxis == EAvenorStripLongAxis::X
-        ? Size.Y * 0.5 : Size.X * 0.5;
-    const int32 Count = FMath::Clamp(
-        FMath::RoundToInt(FMath::Max(0.0, RangesPer100Km) * LongLength / 10000000.0),
-        RangesPer100Km > 0.0 ? 1 : 0,
-        128
-    );
-    OutRequestedCount = Count;
-    const FVector2D Centre(Bounds.GetCenter());
-    FRandomStream Random(Seed ^ 0x51A7F00D);
-    TArray<FMountainRange> Ranges;
-    Ranges.Reserve(Count);
-    FVector2D LongDirection = LongAxis == EAvenorStripLongAxis::X
-        ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
-    FVector2D AcrossDirection = Rotate90(LongDirection);
-    for (int32 Index = 0; Index < Count; ++Index)
-    {
-        const double RequestedHalfWidth = RangeWidth * Random.FRandRange(0.7, 1.35) * 0.5;
-        const double AvailableHalfWidth = FMath::Max(0.0, AcrossExtent * 0.96 - ExclusionHalfWidth);
-        const double HalfWidth = FMath::Min(RequestedHalfWidth, AvailableHalfWidth * 0.92);
-        const double MinimumAcrossDistance = ExclusionHalfWidth + HalfWidth;
-        if (HalfWidth < 10000.0 || MinimumAcrossDistance >= AcrossExtent * 0.96)
-        {
-            continue;
-        }
-        const double Side = Random.FRand() < 0.5 ? -1.0 : 1.0;
-        const double AcrossDistance = Random.FRandRange(
-            MinimumAcrossDistance, AcrossExtent * 0.96
-        );
-        const double AlongValue = Random.FRandRange(
-            -LongLength * 0.48, LongLength * 0.48
-        );
-        const double Angle = Random.FRandRange(-0.3, 0.3);
-        FVector2D Along =
-            LongDirection * FMath::Cos(Angle) + AcrossDirection * FMath::Sin(Angle);
-        Along.Normalize();
-        FMountainRange Range;
-        Range.Centre = Centre + LongDirection * AlongValue +
-            AcrossDirection * (AcrossDistance * Side);
-        Range.Along = Along;
-        Range.Across = Rotate90(Along);
-        Range.HalfLength = RangeLength * Random.FRandRange(0.75, 1.3) * 0.5;
-        Range.HalfWidth = HalfWidth;
-        Range.PeakSpacing = PeakSpacing * Random.FRandRange(0.78, 1.22);
-        Range.Relief = Relief * Random.FRandRange(0.78, 1.2);
-        Range.Phase = Random.FRandRange(-PI, PI);
-        Ranges.Add(Range);
-    }
-    return Ranges;
-}
-} // namespace UE::Avenor::Strip
-
-namespace UE::Avenor::Strip
-{
 static double EvaluateLandform(
     const FVector2D& Position,
     const FBox& Bounds,
     int32 Seed,
     EAvenorStripLongAxis LongAxis,
-    bool bMountains,
-    bool bHills,
-    bool bDesert,
-    const TArray<FMountainRange>& Mountains,
-    double ZoneLength,
-    double MountainWeight,
-    double HillWeight,
-    double DesertWeight,
-    double PlainsWeight,
-    double HillsRelief,
-    double HillsScale,
-    double MesaScale,
+    double ReliefHeight,
+    double StructuralScale,
+    double TectonicActivity,
+    double RiftStrength,
     bool bClimateEnabled,
     double ClimateTemperature,
     double ClimateMoisture,
@@ -3224,361 +3135,291 @@ static double EvaluateLandform(
     double& OutMountainMask,
     double& OutHillMask,
     double& OutDesertMask,
-    double& OutPlainsMask,
-    bool bOcean,
-    double SeaLevel,
-    double MinimumOceanDepth,
-    double MaximumOceanDepth,
-    double CoastWidth,
-    bool bOceanWidthEdges,
-    bool bOceanLengthEnds
+    double& OutPlainsMask
 )
 {
     (void)Bounds;
-    (void)bOcean; (void)SeaLevel; (void)MinimumOceanDepth; (void)MaximumOceanDepth;
-    (void)CoastWidth; (void)bOceanWidthEdges; (void)bOceanLengthEnds;
+    const double Relief = FMath::Max(25000.0, ReliefHeight);
+    const double Scale = FMath::Max(250000.0, StructuralScale);
+    const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
+    const double RiftAmount = FMath::Clamp(RiftStrength, 0.0, 1.0);
+
     const FVector2D SeedOffset(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
-    const FVector2D Warp(
-        Fbm(Position, 950000.0, SeedOffset + FVector2D(137.0, 911.0), 4),
-        Fbm(Position, 950000.0, SeedOffset + FVector2D(733.0, 271.0), 4)
-    );
-    const FVector2D Warped = Position + Warp * 650000.0;
 
-    const double ZoneCoordinate = LongAxis == EAvenorStripLongAxis::X ? Position.X : Position.Y;
-    const double ZoneT = ZoneCoordinate / FMath::Max(1.0, ZoneLength);
-    auto ZoneAffinity = [&](double PhaseOffset)
+    // Large, smoothly varying distortion keeps structural lines from
+    // looking like analytic bands while preserving kilometre-scale continuity.
+    const FVector2D MacroWarp(
+        Fbm(Position, Scale * 1.75, SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
+        Fbm(Position, Scale * 1.75, SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.0)
+    );
+    const FVector2D Warped = Position + MacroWarp * Scale * 0.38;
+
+    const FVector2D StripAxis = LongAxis == EAvenorStripLongAxis::X
+        ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
+    const FVector2D StripAcross = Rotate90(StripAxis);
+    const double SeedAngleA = FMath::Fmod(
+        FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
+    );
+    const double SeedAngleB = FMath::Fmod(SeedAngleA + 1.047 +
+        FMath::Abs(static_cast<double>(Seed)) * 0.000217, PI);
+    const FVector2D AxisA(
+        FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA)
+    );
+    const FVector2D AxisB(
+        FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB)
+    );
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);
+
+    auto Oriented = [](const FVector2D& P, const FVector2D& Along,
+                       const FVector2D& Across, double AlongStretch,
+                       double AcrossStretch)
     {
-        const double Raw = 0.5 + 0.5 * Fbm(FVector2D(ZoneT, PhaseOffset), 1.0, SeedOffset, 3, 0.55, 2.0);
-        return FMath::Pow(FMath::Clamp(Raw, 0.0, 1.0), 3.2);
+        return FVector2D(
+            FVector2D::DotProduct(P, Along) / AlongStretch,
+            FVector2D::DotProduct(P, Across) / AcrossStretch
+        );
     };
+
+    // The plate field is authoritative: positive regions uplift,
+    // negative regions subside. It exists everywhere, so plains are
+    // not merely the empty space between explicitly placed mountains.
+    const double PlateField = Fbm(
+        Warped,
+        Scale * 2.15,
+        SeedOffset + FVector2D(1201.0, 331.0),
+        5, 0.57, 2.0
+    );
+    const double RegionalTilt = Fbm(
+        Oriented(Warped, StripAxis, StripAcross, 2.4, 0.85),
+        Scale * 2.8,
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4, 0.55, 2.0
+    );
+    const double Uplift = FMath::Clamp(
+        PlateField * 0.72 + RegionalTilt * 0.28,
+        -1.0, 1.0
+    );
+    const double PositiveUplift = Smooth01(FMath::Clamp(
+        (Uplift + 0.08) / 0.88, 0.0, 1.0
+    ));
+    const double Subsidence = Smooth01(FMath::Clamp(
+        (-Uplift + 0.06) / 0.82, 0.0, 1.0
+    ));
+
+    // Two differently oriented compression systems generate belts,
+    // branching ridges, saddles and uplands without spawning a
+    // separate mountain primitive.
+    const double CompressionA = RidgedFbm(
+        Oriented(Warped, AxisA, AcrossA, 2.6, 0.72),
+        Scale * 0.72,
+        SeedOffset + FVector2D(421.0, 719.0),
+        6
+    );
+    const double CompressionB = RidgedFbm(
+        Oriented(Warped, AxisB, AcrossB, 2.0, 0.80),
+        Scale * 0.92,
+        SeedOffset + FVector2D(877.0, 149.0),
+        5
+    );
+    const double Compression = FMath::Clamp(
+        CompressionA * 0.64 + CompressionB * 0.36,
+        0.0, 1.0
+    );
+    const double CompressionSupport =
+        Compression * FMath::Lerp(0.35, 1.0, PositiveUplift);
+    OutMountainMask = Smooth01(FMath::Clamp(
+        (CompressionSupport - FMath::Lerp(0.62, 0.43, Activity))
+            / 0.34,
+        0.0, 1.0
+    ));
+
+    // Extension/subsidence creates elongated rifts and fault-bounded
+    // valleys. A second low-frequency field prevents every rift from
+    // crossing the entire world as one uninterrupted groove.
+    const double RiftRidge = RidgedFbm(
+        Oriented(
+            Warped + FVector2D(
+                Fbm(Warped, Scale, SeedOffset + FVector2D(509.0, 193.0), 3) * Scale * 0.25,
+                Fbm(Warped, Scale, SeedOffset + FVector2D(827.0, 557.0), 3) * Scale * 0.25
+            ),
+            AxisB, AcrossB, 3.1, 0.58
+        ),
+        Scale * 0.58,
+        SeedOffset + FVector2D(919.0, 1601.0),
+        5
+    );
+    const double RiftContinuity = 0.5 + 0.5 * Fbm(
+        Warped,
+        Scale * 1.9,
+        SeedOffset + FVector2D(1733.0, 449.0),
+        3, 0.58, 2.0
+    );
+    const double RiftMask = Smooth01(FMath::Clamp(
+        (RiftRidge * FMath::Lerp(0.55, 1.0, Subsidence)
+            * FMath::Lerp(0.45, 1.0, RiftContinuity) - 0.48)
+            / 0.38,
+        0.0, 1.0
+    )) * RiftAmount * (1.0 - OutMountainMask * 0.72);
+
+    const double BasinNoise = 0.5 + 0.5 * Fbm(
+        Warped,
+        Scale * 1.25,
+        SeedOffset + FVector2D(1543.0, 271.0),
+        4, 0.56, 2.0
+    );
+    const double BasinMask = Subsidence
+        * Smooth01(FMath::Clamp((BasinNoise - 0.38) / 0.48, 0.0, 1.0))
+        * (1.0 - RiftMask * 0.45);
+
+    const double RidgeDetail = RidgedFbm(
+        Warped,
+        Scale * 0.24,
+        SeedOffset + FVector2D(947.0, 271.0),
+        5
+    );
+    const double RollingField = Fbm(
+        Warped,
+        Scale * 0.42,
+        SeedOffset + FVector2D(887.0, 157.0),
+        5, 0.54, 2.03
+    );
+    OutHillMask = Smooth01(FMath::Clamp(
+        (0.48 * RidgeDetail
+            + 0.34 * FMath::Abs(Uplift)
+            + 0.18 * FMath::Abs(RollingField) - 0.26) / 0.46,
+        0.0, 1.0
+    )) * (1.0 - OutMountainMask * 0.82)
+       * (1.0 - RiftMask * 0.55);
+
+    OutPlainsMask = FMath::Clamp(
+        1.0 - OutMountainMask * 0.94
+            - OutHillMask * 0.58
+            - RiftMask * 0.42,
+        0.0, 1.0
+    );
+
+    double Height =
+        Uplift * Relief * 0.28
+        + RegionalTilt * Relief * 0.10;
+
+    // High relief is an emergent extreme of the same compression
+    // field that produces ordinary ridges and uplands.
+    Height += FMath::Pow(OutMountainMask, 1.35)
+        * Relief * FMath::Lerp(0.62, 1.18, Activity)
+        * FMath::Lerp(0.72, 1.10, RidgeDetail);
+
+    // Moderate structure becomes rolling hills, shoulders and
+    // dissected uplands instead of featureless non-mountain space.
+    Height += OutHillMask * Relief * 0.18
+        * (RollingField * 0.62 + (RidgeDetail - 0.43) * 0.38);
+
+    // Negative structure has equal authority: rifts and basins are
+    // genuine landforms rather than places where a mountain was not placed.
+    Height -= RiftMask * Relief * FMath::Lerp(0.16, 0.50, RiftAmount)
+        * FMath::Lerp(0.78, 1.08, RiftRidge);
+    Height -= BasinMask * Relief * 0.16;
+
+    // Lowlands retain broad rolls and drainage divides, but at much
+    // lower amplitude than active relief.
+    const double LowlandRoll = Fbm(
+        Warped,
+        Scale * 0.78,
+        SeedOffset + FVector2D(101.0, 43.0),
+        4, 0.56, 2.0
+    );
+    const double LowlandRidges = RidgedFbm(
+        Warped,
+        Scale * 0.50,
+        SeedOffset + FVector2D(607.0, 1489.0),
+        4
+    );
+    Height += OutPlainsMask * Relief * (
+        LowlandRoll * 0.065
+        + (LowlandRidges - 0.43) * 0.035
+    );
+
     const double Warmth = bClimateEnabled
         ? Smooth01(FMath::Clamp(
             (ClimateTemperature - 0.28) / 0.58, 0.0, 1.0
-        ))
-        : 0.0;
+        )) : 0.0;
     const double Dryness = bClimateEnabled
         ? Smooth01(FMath::Clamp(
             (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
-        ))
-        : 0.0;
+        )) : 0.0;
     const double Aridity = Warmth * Dryness;
-    const double Humidity = bClimateEnabled
-        ? Smooth01(FMath::Clamp(
-            (ClimateMoisture - 0.32) / 0.55, 0.0, 1.0
-        ))
-        : 0.5;
-    double HillWeighted = ZoneAffinity(131.0)
-        * FMath::Max(0.0, HillWeight) * FMath::Lerp(0.82, 1.12, Humidity);
-    double DesertWeighted = ZoneAffinity(277.0)
-        * FMath::Max(0.0, DesertWeight);
-    DesertWeighted += Aridity * 1.65;
-    double PlainsWeighted = ZoneAffinity(419.0)
-        * FMath::Max(0.0, PlainsWeight)
-        * FMath::Lerp(0.92, 1.12, 1.0 - Aridity);
-    const double WeightSum = FMath::Max(
-        0.0001, HillWeighted + DesertWeighted + PlainsWeighted
+    OutDesertMask = Aridity * FMath::Clamp(
+        1.0 - OutMountainMask * 0.42,
+        0.0, 1.0
     );
-    const double HillAffinity = HillWeighted / WeightSum;
-    const double DesertAffinity = DesertWeighted / WeightSum;
-    const double PlainsAffinity = PlainsWeighted / WeightSum;
-    OutHillMask = HillAffinity;
-    OutDesertMask = DesertAffinity;
-    OutPlainsMask = PlainsAffinity;
 
-    const double RegionalRelief = Fbm(
+    // Climate modifies the expression of existing structure. It does
+    // not create a separate desert terrain system.
+    const double PlateauSignal = 0.5 + 0.5 * Fbm(
         Warped,
-        FMath::Max(HillsScale * 7.5, 900000.0),
-        SeedOffset + FVector2D(1201.0, 331.0),
+        Scale * 0.38,
+        SeedOffset + FVector2D(811.0, 397.0),
         4, 0.55, 2.0
     );
-    const double RegionalRidges = RidgedFbm(
+    const double PlateauMask = Smooth01(FMath::Clamp(
+        (PlateauSignal - 0.50) / 0.26, 0.0, 1.0
+    )) * OutDesertMask * FMath::Lerp(0.35, 1.0, OutHillMask);
+    Height += PlateauMask * Relief * 0.10;
+
+    const double BadlandRidges = RidgedFbm(
         Warped,
-        FMath::Max(HillsScale * 5.2, 650000.0),
-        SeedOffset + FVector2D(149.0, 1267.0),
-        4
+        FMath::Max(70000.0, Scale * 0.075),
+        SeedOffset + FVector2D(1733.0, 1449.0),
+        5
     );
-    const double BroadValleys = RidgedFbm(
-        Warped + FVector2D(
-            Fbm(Warped, HillsScale * 3.7, SeedOffset + FVector2D(509.0, 193.0), 3) * HillsScale,
-            Fbm(Warped, HillsScale * 3.7, SeedOffset + FVector2D(827.0, 557.0), 3) * HillsScale
-        ) * 0.42,
-        FMath::Max(HillsScale * 5.8, 720000.0),
-        SeedOffset + FVector2D(919.0, 1601.0),
-        4
-    );
-    double Height =
-        RegionalRelief * HillsRelief * 0.26
-        + (RegionalRidges - 0.42) * HillsRelief * 0.11
-        - FMath::Pow(FMath::Clamp(BroadValleys, 0.0, 1.0), 2.0)
-            * HillsRelief * 0.12
-            * FMath::Lerp(0.60, 1.10, PlainsAffinity);
+    Height += (BadlandRidges - 0.46) * Relief * 0.035
+        * PlateauMask;
 
-    OutMountainMask = 0.0;
-    if (bMountains)
+    // Generator-scale dunes only occur on structurally quiet arid
+    // plains. Fine ripples remain a material concern.
+    const double DuneSuitability = OutDesertMask
+        * OutPlainsMask
+        * (1.0 - PlateauMask * 0.85)
+        * (1.0 - RiftMask * 0.65);
+    if (DuneSuitability > 0.03)
     {
-        for (const FMountainRange& Range : Mountains)
-        {
-            const FVector2D SilhouetteWarp(
-                Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
-                Fbm(Position, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
-            );
-            const FVector2D CentreWarp(
-                Fbm(Range.Centre, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 421.0, 77.0), 3),
-                Fbm(Range.Centre, Range.HalfWidth * 1.3, SeedOffset + FVector2D(Range.Phase * 219.0, 583.0), 3)
-            );
-            const FVector2D Delta = Position - Range.Centre +
-                (SilhouetteWarp - CentreWarp) * Range.HalfWidth * 0.35;
-            const double Along = FVector2D::DotProduct(Delta, Range.Along);
-            const double Across = FVector2D::DotProduct(Delta, Range.Across);
-            const double AlongNorm = FMath::Abs(Along) / FMath::Max(1.0, Range.HalfLength);
-            const double AcrossNorm = FMath::Abs(Across) / FMath::Max(1.0, Range.HalfWidth);
-            const double SkirtEnvelope = Smooth01(1.0 - AlongNorm / 1.4) *
-                Smooth01(1.0 - AcrossNorm / 1.8);
-            if (SkirtEnvelope <= 0.0)
-            {
-                continue;
-            }
-            const double RidgeWander = Fbm(
-                FVector2D(Along, Range.Phase * Range.PeakSpacing),
-                Range.PeakSpacing * 2.4,
-                SeedOffset + FVector2D(421.0, 719.0), 4, 0.56, 2.03
-            );
-            const double RidgeOffset = RidgeWander * Range.HalfWidth * 0.22;
-            const double RidgeAcross = Across - RidgeOffset;
-            const double RidgeSide = RidgeAcross < 0.0 ? -1.0 : 1.0;
-            const double RidgeAcrossNorm =
-                FMath::Abs(RidgeAcross) / FMath::Max(1.0, Range.HalfWidth);
-            const double AlongEnvelope = Smooth01(1.0 - AlongNorm);
-            const double FlankAsymmetry = FMath::Clamp(
-                1.0 + RidgeSide * 0.2 * Fbm(
-                    FVector2D(Along, Range.Phase * 173.0),
-                    Range.PeakSpacing * 3.0,
-                    SeedOffset + FVector2D(877.0, 149.0), 3, 0.55, 2.0
-                ),
-                0.78, 1.22
-            );
-            const double FlankDistance = RidgeAcrossNorm * FlankAsymmetry;
-            const double MainFlank = AlongEnvelope *
-                FMath::Pow(FMath::Max(0.0, 1.0 - FlankDistance), 1.28);
-            const double SummitNoise = Fbm(
-                FVector2D(Along, Range.Phase * 311.0),
-                Range.PeakSpacing * 1.65,
-                SeedOffset + FVector2D(211.0, 883.0), 5, 0.54, 2.07
-            );
-            const double SummitVariation = FMath::Clamp(
-                0.78 + 0.27 * SummitNoise, 0.52, 1.08
-            );
-            const double SpurNoise = RidgedFbm(
-                Warped + Range.Along * FMath::Abs(RidgeAcross) * 0.7,
-                Range.PeakSpacing * 0.72,
-                SeedOffset + FVector2D(Range.Phase * 997.0, 313.0), 6
-            );
-            const double DownSlope = FMath::Clamp(RidgeAcrossNorm, 0.0, 1.25);
-            const double SpurLift = MainFlank * DownSlope *
-                FMath::Pow(FMath::Clamp(SpurNoise, 0.0, 1.0), 2.2);
-
-            const double GullyScale = FMath::Max(
-                Range.PeakSpacing * 0.78,
-                Range.HalfWidth * 0.18
-            );
-            const FVector2D DrainageWarp(
-                Fbm(
-                    Warped, GullyScale * 2.4,
-                    SeedOffset + FVector2D(Range.Phase * 601.0, 109.0),
-                    4, 0.55, 2.03
-                ),
-                Fbm(
-                    Warped, GullyScale * 2.1,
-                    SeedOffset + FVector2D(53.0, Range.Phase * 733.0),
-                    4, 0.55, 2.07
-                )
-            );
-            const FVector2D DrainagePosition =
-                Warped + DrainageWarp * GullyScale * 0.72;
-            const double GullyNoise = RidgedFbm(
-                DrainagePosition,
-                GullyScale,
-                SeedOffset + FVector2D(1663.0, Range.Phase * 947.0),
-                5
-            );
-            const double BranchNoise = 0.5 + 0.5 * Fbm(
-                DrainagePosition,
-                GullyScale * 1.85,
-                SeedOffset + FVector2D(Range.Phase * 367.0, 1871.0),
-                4, 0.56, 2.0
-            );
-            const double GullyProfile =
-                FMath::Pow(FMath::Clamp(GullyNoise, 0.0, 1.0), 3.1)
-                * FMath::Pow(FMath::Min(1.0, DownSlope), 0.82)
-                * Smooth01((1.25 - DownSlope) / 0.25)
-                * FMath::Lerp(
-                    0.38, 1.0,
-                    FMath::Clamp(BranchNoise, 0.0, 1.0)
-                );
-
-            const double MountainStrength = FMath::Max(0.0, MountainWeight);
-            const double Core = Range.Relief * MountainStrength *
-                FMath::Max(
-                    0.0,
-                    MainFlank * SummitVariation +
-                    SpurLift * 0.24 -
-                    GullyProfile * 0.115
-                );
-            const double IrregularFoothills = RidgedFbm(
-                Warped,
-                Range.PeakSpacing * 1.35,
-                SeedOffset + FVector2D(947.0, Range.Phase * 271.0), 5
-            );
-            const double Foothills = Range.Relief * MountainStrength * 0.24 *
-                FMath::Max(0.0, SkirtEnvelope - MainFlank * 0.58) *
-                FMath::Lerp(0.28, 1.0, IrregularFoothills);
-            Height = FMath::Max(Height, Core + Foothills);
-            OutMountainMask = FMath::Max(OutMountainMask, SkirtEnvelope);
-        }
-    }
-    if (bHills)
-    {
-        const double BroadHillNoise = Fbm(
-            Warped, HillsScale * 2.6,
-            SeedOffset + FVector2D(887.0, 157.0),
-            5, 0.54, 2.03
+        const double WindAngle = FMath::Fmod(
+            FMath::Abs(static_cast<double>(Seed)) * 0.000731 + 0.83,
+            PI
         );
-        const double HillRidges = RidgedFbm(
-            Warped, HillsScale * 1.65,
-            SeedOffset + FVector2D(347.0, 1039.0),
-            5
+        const FVector2D WindDirection(
+            FMath::Cos(WindAngle), FMath::Sin(WindAngle)
         );
-        const double HillDetail = Fbm(
-            Warped, HillsScale * 0.82,
-            SeedOffset + FVector2D(1171.0, 673.0),
-            4, 0.52, 2.05
+        const double DuneWavelength = FMath::Clamp(
+            Scale * 0.055, 45000.0, 140000.0
         );
-        Height += HillsRelief * HillAffinity * (
-            BroadHillNoise * 0.52
-            + (HillRidges - 0.43) * 0.34
-            + HillDetail * 0.14
-        );
-    }
-    if (bDesert || DesertAffinity > 0.04)
-    {
-        const double DesertNoise = 0.5 + 0.5 * Fbm(
-            Warped, MesaScale,
-            SeedOffset + FVector2D(555.0, 222.0), 4
-        );
-        const double AridStrength = bClimateEnabled
-            ? (bDesert ? FMath::Max(0.72, Aridity) : Aridity)
-            : 1.0;
-        double PlateauMask = 0.0;
-        if (bDesert || AridStrength > 0.28)
-        {
-            const double PlateauSignal = 0.5 + 0.5 * Fbm(
-                Warped,
-                MesaScale * 1.8,
-                SeedOffset + FVector2D(811.0, 397.0),
-                3, 0.55, 2.0
-            );
-            PlateauMask = Smooth01(FMath::Clamp(
-                (PlateauSignal - 0.46) / 0.24, 0.0, 1.0
-            ));
-        }
-        const double MesaSuitability =
-            DesertAffinity * AridStrength
-            * FMath::Lerp(0.35, 1.0, HillAffinity);
-        Height += (DesertNoise - 0.5) * HillsRelief * 0.30
-            * DesertAffinity;
-        Height += PlateauMask * HillsRelief * 0.78
-            * MesaSuitability;
-        const double BadlandRidges = RidgedFbm(
+        const double PhaseWarp = Fbm(
             Warped,
-            FMath::Max(MesaScale * 0.52, 70000.0),
-            SeedOffset + FVector2D(1733.0, 449.0),
-            5
-        );
-        Height += (BadlandRidges - 0.46) * HillsRelief * 0.12
-            * MesaSuitability * PlateauMask;
-
-        const double DuneFieldSignal = 0.5 + 0.5 * Fbm(
-            Warped,
-            FMath::Max(MesaScale * 2.7, 500000.0),
-            SeedOffset + FVector2D(1327.0, 2053.0),
+            DuneWavelength * 5.2,
+            SeedOffset + FVector2D(1877.0, 1021.0),
             3, 0.55, 2.0
+        ) * DuneWavelength * 0.85;
+        const double WindCoordinate =
+            FVector2D::DotProduct(Warped, WindDirection) + PhaseWarp;
+        const double DuneWave = 0.5 + 0.5 * FMath::Sin(
+            2.0 * PI * WindCoordinate / DuneWavelength
         );
-        const double DuneFieldMask = Smooth01(FMath::Clamp(
-            (DuneFieldSignal - 0.38) / 0.42, 0.0, 1.0
-        ));
-        const double DuneSuitability =
-            DesertAffinity * AridStrength
-            * FMath::Lerp(0.45, 1.0, PlainsAffinity)
-            * (1.0 - PlateauMask * 0.82)
-            * (1.0 - OutMountainMask * 0.9)
-            * DuneFieldMask;
-        if (DuneSuitability > 0.015)
-        {
-            const double WindAngle = FMath::Fmod(
-                FMath::Abs(static_cast<double>(Seed)) * 0.000731 + 0.83,
-                PI
-            );
-            const FVector2D WindDirection(
-                FMath::Cos(WindAngle), FMath::Sin(WindAngle)
-            );
-            const double DuneWavelength = FMath::Clamp(
-                HillsScale * 0.34, 45000.0, 140000.0
-            );
-            const double PhaseWarp = Fbm(
-                Warped,
-                DuneWavelength * 5.2,
-                SeedOffset + FVector2D(1877.0, 1021.0),
-                3, 0.55, 2.0
-            ) * DuneWavelength * 0.85;
-            const double WindCoordinate =
-                FVector2D::DotProduct(Warped, WindDirection) + PhaseWarp;
-            const double DuneWave = 0.5 + 0.5 * FMath::Sin(
-                2.0 * PI * WindCoordinate / DuneWavelength
-            );
-            const double DuneRidge = FMath::Pow(
-                FMath::Clamp(DuneWave, 0.0, 1.0), 2.25
-            );
-            Height += (DuneRidge - 0.31) * HillsRelief * 0.105
-                * DuneSuitability;
-        }
+        Height += (FMath::Pow(DuneWave, 2.25) - 0.31)
+            * Relief * 0.025 * DuneSuitability;
+    }
 
-        OutResistance = DesertAffinity * FMath::Clamp(
-            (0.48 + 0.38 * DesertNoise + 0.22 * PlateauMask)
-                * (1.0 - DuneSuitability * 0.68),
-            0.0, 1.0
-        );
-    }
-    else
-    {
-        OutResistance = 0.0;
-    }
-    {
-        const double PlainsRoll = Fbm(
-            Warped, HillsScale * 4.2,
-            SeedOffset + FVector2D(101.0, 43.0),
-            4, 0.55, 2.0
-        );
-        const double PlainsRidges = RidgedFbm(
-            Warped, HillsScale * 3.0,
-            SeedOffset + FVector2D(607.0, 1489.0),
-            4
-        );
-        const double PlainsValleys = RidgedFbm(
-            Warped, HillsScale * 2.45,
-            SeedOffset + FVector2D(1543.0, 271.0),
-            4
-        );
-        Height += HillsRelief * PlainsAffinity * (
-            PlainsRoll * 0.30
-            + (PlainsRidges - 0.43) * 0.11
-            - FMath::Pow(
-                FMath::Clamp(PlainsValleys, 0.0, 1.0), 2.0
-            ) * 0.085
-        );
-    }
+    // Resistance is geological/climatic rather than a "desert only"
+    // switch. This allows humid resistant uplands to form gorges too.
+    OutResistance = FMath::Clamp(
+        OutMountainMask * 0.34
+            + OutHillMask * 0.12
+            + OutDesertMask * (0.24 + PlateauMask * 0.34)
+            + (1.0 - BasinMask) * RidgeDetail * 0.08,
+        0.0, 1.0
+    );
     return Height;
 }
 } // namespace UE::Avenor::Strip
@@ -3936,18 +3777,9 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     BuildMacroClimate(*Data, Generator);
 
-    TArray<FMountainRange> Mountains;
-    if (Generator.bGenerateMountains)
-    {
-        Mountains = BuildMountainRanges(
-            Bounds, Generator.LongAxis, Generator.Seed,
-            Generator.MountainRangesPer100Km, Generator.MountainRangeLength,
-            Generator.MountainRangeWidth, Generator.MountainPeakSpacing,
-            Generator.MountainRelief, Generator.MountainExclusionHalfWidth,
-            Data->RequestedMountainRanges
-        );
-    }
-    Data->PlacedMountainRanges = Mountains.Num();
+    // Major relief now emerges from one continuous structural field.
+    Data->RequestedMountainRanges = 0;
+    Data->PlacedMountainRanges = 0;
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -3958,19 +3790,12 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
             Data->CellPosition(Cell), Bounds, Generator.Seed, Generator.LongAxis,
-            Generator.bGenerateMountains, Generator.bGenerateHills, Generator.bGenerateMesasAndCanyons,
-            Mountains, Generator.ZoneLength,
-            Generator.MountainZoneWeight, Generator.HillZoneWeight, Generator.DesertZoneWeight, Generator.PlainsZoneWeight,
-            Generator.HillsRelief, Generator.HillsScale,
-            Generator.MesaScale,
+            Generator.StructuralRelief, Generator.StructuralScale,
+            Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
             Data->Temperature[Cell], Data->Moisture[Cell],
             CellResistance,
-            CellMountainMask, CellHillMask, CellDesertMask, CellPlainsMask,
-            Generator.bGenerateOcean, Generator.SeaLevel,
-            Generator.MinimumOceanDepth, Generator.MaximumOceanDepth,
-            Generator.CoastTransitionWidth, Generator.bOceanWidthEdges,
-            Generator.bOceanLengthEnds
+            CellMountainMask, CellHillMask, CellDesertMask, CellPlainsMask
         );
         Data->Resistance[Cell] = CellResistance;
         Data->MountainMask[Cell] = CellMountainMask;
@@ -4134,7 +3959,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("3b6044af-2fc4-4b2e-bc19-83c52493bda8")); }
+    static FGuid Version() { return FGuid(TEXT("891c782d-e654-45d7-889c-c5d1cfe75be2")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -4467,13 +4292,12 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
 void AAvenorStripTerrainGenerator::ResolveSettings()
 {
     AnalysisCellSize = Erosion.AnalysisSpacing;
-    bGenerateMountains = Landforms.bMountains;
-    MountainRelief = Landforms.MountainHeight;
-    MountainRangesPer100Km = Landforms.MountainRangesPer100Km;
-    MountainExclusionHalfWidth = Landforms.MountainClearanceFromSpine;
-    bGenerateHills = Landforms.bHills;
-    HillsRelief = Landforms.HillHeight;
-    HillsScale = Landforms.HillSize;
+    StructuralRelief = FMath::Max(25000.0, Landforms.ReliefHeight);
+    StructuralScale = FMath::Max(250000.0, Landforms.StructuralScale);
+    TectonicActivity = FMath::Clamp(Landforms.TectonicActivity, 0.0, 1.0);
+    RiftStrength = FMath::Clamp(Landforms.RiftStrength, 0.0, 1.0);
+    bGenerateMesasAndCanyons = true;
+    MesaScale = FMath::Clamp(StructuralScale * 0.24, 150000.0, 800000.0);
 
     bGenerateClimate = Climate.bEnabled;
     ClimateTemperature = FMath::Clamp(Climate.Temperature, 0.0, 1.0);
@@ -4616,15 +4440,14 @@ FString AAvenorStripTerrainGenerator::BuildSettingsSnapshot() const
 {
     return FString::Printf(
         TEXT("v%d|seed=%d|size=%.17g,%.17g|axis=%d|")
-        TEXT("land=%d,%.17g,%.17g,%.17g,%d,%.17g,%.17g|")
+        TEXT("land=%.17g,%.17g,%.17g,%.17g|")
         TEXT("climate=%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d|")
         TEXT("erosion=%.17g,%d,%.17g|hydrology=%d,%.17g,%.17g,%d,%d,%.17g|")
         TEXT("water=%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d,%.17g,%s,%s,%s,%s"),
         UE::Avenor::Strip::BakedData::GeneratorAlgorithmVersion,
         Seed, WorldSize.X, WorldSize.Y, static_cast<int32>(LongAxis),
-        Landforms.bMountains, Landforms.MountainHeight,
-        Landforms.MountainRangesPer100Km, Landforms.MountainClearanceFromSpine,
-        Landforms.bHills, Landforms.HillHeight, Landforms.HillSize,
+        Landforms.ReliefHeight, Landforms.StructuralScale,
+        Landforms.TectonicActivity, Landforms.RiftStrength,
         Climate.bEnabled, Climate.Temperature, Climate.Moisture,
         Climate.RegionalVariation, Climate.RegionSpacing,
         Climate.WaterInfluenceDistance, Climate.WaterMoistureBoost,
@@ -5259,11 +5082,11 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     }
 
     LastBuildStamp = FString::Printf(
-        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | mountains %d/%d | river seeds %d + %d downstream cells = %d channel cells | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
+        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | structural relief %.0fcm @ %.0fcm scale | river seeds %d + %d downstream cells = %d channel cells | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, Data->Height.Num(), Data->CellSize,
-        Data->PlacedMountainRanges, Data->RequestedMountainRanges,
+        StructuralRelief, StructuralScale,
         Data->RiverSeedCells, Data->RiverContinuationCells,
         Data->AuthoritativeRiverCells, Data->RejectedShortRiverSystems,
         Data->Rivers.Num(), Data->Lakes.Num(),

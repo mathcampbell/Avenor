@@ -17,32 +17,23 @@ enum class EAvenorStripLongAxis : uint8
     Y UMETA(DisplayName = "Y (north-south)")
 };
 
-/** The few broad landform decisions that should be art-directed. */
+/** Broad controls for the continuous structural terrain field. */
 USTRUCT(BlueprintType)
 struct FAvenorLandformSettings
 {
     GENERATED_BODY()
 
-    UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bMountains = true;
+    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (Units = "cm", ClampMin = "25000.0", ClampMax = "600000.0", ToolTip = "Overall vertical relief available to the structural terrain system. Mountains, uplands, basins and rifts all emerge from this same field."))
+    double ReliefHeight = 300000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (EditCondition = "bMountains", Units = "cm", ClampMin = "25000.0"))
-    double MountainHeight = 300000.0;
+    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (Units = "cm", ClampMin = "250000.0", ClampMax = "5000000.0", ToolTip = "Typical scale of major ridges, uplands, basins and rift structures. This is not a mountain size control."))
+    double StructuralScale = 1600000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (EditCondition = "bMountains", ClampMin = "0.0", ClampMax = "12.0"))
-    double MountainRangesPer100Km = 3.0;
+    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls how strongly broad uplift and compression become rugged high-relief terrain. Lower values favour older rolling terrain; higher values favour active rugged relief."))
+    double TectonicActivity = 0.65;
 
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (EditCondition = "bMountains", Units = "cm", ClampMin = "0.0"))
-    double MountainClearanceFromSpine = 150000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Landforms")
-    bool bHills = true;
-
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (EditCondition = "bHills", Units = "cm", ClampMin = "0.0"))
-    double HillHeight = 65000.0;
-
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (EditCondition = "bHills", Units = "cm", ClampMin = "10000.0"))
-    double HillSize = 220000.0;
+    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Strength of elongated subsidence and extension structures. These become rift valleys, fault-bounded basins and major lowland corridors."))
+    double RiftStrength = 0.45;
 };
 
 /**
@@ -67,13 +58,13 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls slow regional variation. Adjacent control points remain constrained so climate cannot jump directly from cold to hot."))
     double RegionalVariation = 0.55;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "100000.0", ToolTip = "Spacing of the smooth climate control points and length of each exported PCG source tile. Five kilometres is the recommended default."))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (Units = "cm", ClampMin = "100000.0", ToolTip = "Spacing of the smooth climate control points and length of each exported PCG source tile. Five kilometres is the recommended default."))
     double RegionSpacing = 500000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "10000.0", ToolTip = "Distance over which rivers and lakes increase local habitat moisture."))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (Units = "cm", ClampMin = "10000.0", ToolTip = "Distance over which rivers and lakes increase local habitat moisture."))
     double WaterInfluenceDistance = 100000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double WaterMoistureBoost = 0.35;
 
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ToolTip = "Compresses a wider climate range into a short proof-of-concept map. Leave disabled for geographically gentler transitions."))
@@ -145,25 +136,21 @@ struct FAvenorWaterTerrainSettings
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Lowers generated lake surfaces below the detected basin shoreline. 200 cm exposes roughly two metres of natural bank without changing the lake outline."))
     double LakeSurfaceInset = 200.0;
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Generator-wide dry margin between rendered water and the start of the broad terrain ramp. Applied to every generated river and lake modifier."))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Generator-wide dry margin between rendered water and the start of the broad terrain ramp. Applied to every generated river and lake modifier."))
     double DryBankWidth = 300.0;
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (ClampMin = "0", ClampMax = "16", ToolTip = "Native Water Body heightmap blur radius. Small values soften triangulation without washing out the bank."))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Water Terrain", meta = (ClampMin = "0", ClampMax = "16", ToolTip = "Native Water Body heightmap blur radius. Small values soften triangulation without washing out the bank."))
     int32 BlurRadius = 2;
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Adds restrained native curl noise to shore and bank edges."))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Water Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Adds restrained native curl noise to shore and bank edges."))
     double EdgeRoughness = 0.15;
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain|Weight Channels")
     FName RiverBedWeight = TEXT("RiverBed");
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain|Weight Channels")
     FName RiverBankWeight = TEXT("RiverBank");
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain|Weight Channels")
     FName LakeBedWeight = TEXT("LakeBed");
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain|Weight Channels")
     FName LakeShoreWeight = TEXT("LakeShore");
 };
 
@@ -264,7 +251,6 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Baked Data", meta = (ToolTip = "Authoritative saved geography. Generate and Bake creates this automatically when unassigned."))
     TSoftObjectPtr<UAvenorTerrainData> BakedTerrainData;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Baked Data", meta = (ClampMin = "16", ClampMax = "512", ToolTip = "Raster cells per independently compressed chunk. Async per-chunk loading can use this boundary later."))
     int32 BakedChunkCellSize = 128;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Terrain", meta = (ShowOnlyInnerProperties))
@@ -282,7 +268,7 @@ public:
     UPROPERTY(EditAnywhere, Category = "Avenor|Water", meta = (ShowOnlyInnerProperties))
     FAvenorWaterTerrainSettings WaterTerrain;
 
-    UPROPERTY(EditAnywhere, Category = "Avenor|Refinement", meta = (ShowOnlyInnerProperties))
+    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Avenor|Refinement", meta = (ShowOnlyInnerProperties))
     FAvenorTerrainRefinementSettings Refinement;
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Preview", meta = (Units = "cm"))
@@ -319,29 +305,10 @@ public:
     // they are implementation detail, not a second user-facing settings UI.
     double AnalysisCellSize = 10000.0;
     int32 MaximumAnalysisCells = 500000;
-    double ZoneLength = 2500000.0;
-    double MountainZoneWeight = 1.0;
-    double HillZoneWeight = 1.0;
-    double DesertZoneWeight = 0.0;
-    double PlainsZoneWeight = 1.25;
-    bool bGenerateClimate = true;
-    double ClimateTemperature = 0.5;
-    double ClimateMoisture = 0.5;
-    double ClimateRegionalVariation = 0.55;
-    double ClimateRegionSpacing = 500000.0;
-    double ClimateWaterInfluenceDistance = 100000.0;
-    double ClimateWaterMoistureBoost = 0.35;
-    bool bShowcaseClimateCompression = false;
-    bool bGenerateMountains = true;
-    double MountainRelief = 300000.0;
-    double MountainRangesPer100Km = 3.0;
-    double MountainRangeLength = 1800000.0;
-    double MountainRangeWidth = 550000.0;
-    double MountainPeakSpacing = 260000.0;
-    double MountainExclusionHalfWidth = 150000.0;
-    bool bGenerateHills = true;
-    double HillsRelief = 65000.0;
-    double HillsScale = 220000.0;
+    double StructuralRelief = 300000.0;
+    double StructuralScale = 1600000.0;
+    double TectonicActivity = 0.65;
+    double RiftStrength = 0.45;
     bool bGenerateMesasAndCanyons = false;
     double MesaScale = 400000.0;
     double ErosionResistanceStrength = 0.0;
