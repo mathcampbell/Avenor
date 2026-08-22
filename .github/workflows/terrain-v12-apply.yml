@@ -1,0 +1,177 @@
+name: Apply terrain v12 balance
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch terrain morphology balance
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s = p.read_text(encoding='utf-8')
+
+          def replace_once(old, new, name):
+              global s
+              count = s.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{name}: expected exactly one match, found {count}')
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              'static constexpr int32 GeneratorAlgorithmVersion = 11;',
+              'static constexpr int32 GeneratorAlgorithmVersion = 12;',
+              'algorithm version')
+
+          replace_once('''    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.8,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 2.1,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.70 + Province2 * 0.30 - 0.64) / 0.24,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.46 + Province2 * 0.54 - 0.37) / 0.34,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.72);
+    const double QuietProvince = FMath::Clamp(
+        1.0 - MountainProvince * 0.90 - HillProvince * 0.58,
+        0.0, 1.0
+    );''', '''    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.55,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.15,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+
+    // Provinces are broad tendencies, not hard gates. Multiple relief regimes
+    // should occur inside a showcase strip instead of one seed becoming all-flat
+    // or all-mountainous.
+    const double ProvinceMix = Province * 0.62 + Province2 * 0.38;
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (ProvinceMix - 0.56) / 0.30,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.42 + Province2 * 0.58 - 0.30) / 0.46,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.42);
+    const double QuietProvince = FMath::Clamp(
+        1.0 - MountainProvince * 0.70 - HillProvince * 0.46,
+        0.0, 1.0
+    );''', 'province fields')
+
+          replace_once('''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.54, 0.46, Activity)) / 0.34,
+        0.0, 1.0
+    )) * MountainProvince
+       * FMath::Lerp(0.58, 1.0, PositiveUplift);''', '''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40,
+        0.0, 1.0
+    )) * FMath::Lerp(0.30, 1.0, MountainProvince)
+       * FMath::Lerp(0.62, 1.0, PositiveUplift);''', 'broad ranges')
+
+          replace_once('''    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.48 * UplandRidges
+            + 0.34 * (0.5 + 0.5 * Rolling)
+            + 0.18 * Province2 - 0.42) / 0.34,
+        0.0, 1.0
+    ));''', '''    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.40 * UplandRidges
+            + 0.40 * (0.5 + 0.5 * Rolling)
+            + 0.20 * Province2 - 0.33) / 0.46,
+        0.0, 1.0
+    ));''', 'hill mask')
+
+          replace_once('''    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.42, 0.72, Activity)
+        * CrestShape;
+
+    // Foothills and hill country are deliberately much lower than mountains.
+    Height += FoothillEnvelope * Relief * 0.11
+        * (0.72 + UplandRidges * 0.28);
+    Height += IndependentHills * Relief * (
+        Rolling * 0.055
+        + (UplandRidges - 0.48) * 0.070
+        + HillDetail * 0.025
+    );''', '''    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.36, 0.60, Activity)
+        * CrestShape;
+
+    // Mountains need kilometres of shoulder/foothill transition, while hill
+    // country needs a positive relief floor. Noise modulates those forms instead
+    // of cancelling them back toward a flat sheet.
+    Height += FoothillEnvelope * Relief * 0.14
+        * (0.74 + UplandRidges * 0.26);
+    Height += IndependentHills * Relief * (
+        0.050
+        + (0.5 + 0.5 * Rolling) * 0.052
+        + UplandRidges * 0.040
+        + HillDetail * 0.016
+    );''', 'relief heights')
+
+          replace_once('''    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.018
+        + (PlainRidges - 0.46) * 0.012
+    );''', '''    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.024
+        + (PlainRidges - 0.46) * 0.016
+    );''', 'plain undulation')
+
+          # Keep the broad mountain envelope rounded; crest detail must never create
+          # isolated needles. The current CrestShape bounds are already modest, but
+          # reduce the upper bound further for realism.
+          replace_once('''    const double CrestShape = FMath::Clamp(
+        0.78
+            + (CrestRidges - 0.50) * 0.30
+            + (CrestVariation - 0.50) * 0.20,
+        0.62, 1.12
+    );''', '''    const double CrestShape = FMath::Clamp(
+        0.82
+            + (CrestRidges - 0.50) * 0.22
+            + (CrestVariation - 0.50) * 0.16,
+        0.68, 1.04
+    );''', 'crest clamp')
+
+          s, n = re.subn(
+              r'static FGuid Version\(\) \{ return FGuid\(TEXT\("[0-9a-fA-F-]{36}"\)\); \}',
+              'static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }',
+              s, count=1)
+          if n != 1:
+              raise RuntimeError('terrain op version GUID: expected one match')
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Balance terrain relief across plains hills and ranges"
+          git push
