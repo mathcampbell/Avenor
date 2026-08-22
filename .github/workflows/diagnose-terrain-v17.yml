@@ -1,0 +1,30 @@
+name: Diagnose terrain v17 source patch
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: write
+jobs:
+  diagnose:
+    if: github.event.issue.title == 'DIAGNOSE TERRAIN V17'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - shell: bash
+        run: |
+          awk '/python3 - <<'"'"'PY'"'"'/{flag=1;next} flag && /^          PY$/{flag=0;exit} flag{sub(/^          /,""); print}' .github/workflows/apply-terrain-v17-final.yml > /tmp/v17.py
+          set +e
+          python3 /tmp/v17.py > /tmp/v17.out 2> /tmp/v17.err
+          code=$?
+          git checkout -- AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp AvenorClient/Source/Avenor/AvenorTerrainData.cpp
+          printf 'exit=%s\n--- stderr ---\n' "$code" > .terrain-v17-diagnostic
+          cat /tmp/v17.err >> .terrain-v17-diagnostic
+          printf '\n--- stdout ---\n' >> .terrain-v17-diagnostic
+          cat /tmp/v17.out >> .terrain-v17-diagnostic
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .terrain-v17-diagnostic
+          git commit -m "Record terrain v17 patch diagnostic"
+          git push origin main
