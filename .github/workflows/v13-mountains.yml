@@ -1,0 +1,34 @@
+name: v13 mountain scaling
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s=p.read_text()
+          changes=[
+          ('(BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40','(BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38'),
+          (')) * FMath::Lerp(0.30, 1.0, MountainProvince)\n       * FMath::Lerp(0.62, 1.0, PositiveUplift);',')) * FMath::Lerp(0.48, 1.0, MountainProvince)\n       * FMath::Lerp(0.70, 1.0, PositiveUplift);'),
+          ('0.82\n            + (CrestRidges - 0.50) * 0.22\n            + (CrestVariation - 0.50) * 0.16,\n        0.68, 1.04','0.88\n            + (CrestRidges - 0.50) * 0.16\n            + (CrestVariation - 0.50) * 0.12,\n        0.76, 1.03'),
+          ('* FMath::Lerp(0.36, 0.60, Activity)','* FMath::Lerp(0.54, 0.82, Activity)'),
+          ('Height += FoothillEnvelope * Relief * 0.14\n        * (0.74 + UplandRidges * 0.26);','Height += FoothillEnvelope * Relief * 0.18\n        * (0.72 + UplandRidges * 0.28);'),
+          ('static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }','static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }')]
+          for a,b in changes:
+              if a not in s: raise RuntimeError('missing '+a[:50])
+              s=s.replace(a,b,1)
+          p.write_text(s)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Scale structural mountain belts to mountain relief"
+          git push
