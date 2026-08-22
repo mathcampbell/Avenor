@@ -13,45 +13,25 @@ jobs:
         with:
           fetch-depth: 0
       - run: |
-          set +e
-          python3 - <<'PY' >/tmp/v13log.txt 2>&1
+          python3 - <<'PY'
           from pathlib import Path
+          import base64
           p=Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
           s=p.read_text()
           start=s.find('    // Arid climate exposes and flattens resistant uplands into mesas and')
           end=s.find('    // Dunes remain low-amplitude regional terrain on quiet arid plains.',start)
-          print('markers', start, end)
-          if start < 0 or end < 0:
-              raise SystemExit('mesa markers missing')
-          block='''    // Lithology is independent from shape. Drainage and differential erosion
-    // strip weak arid uplands while resistant caps survive, so mesas,
-    // escarpments and canyon rims emerge instead of being height stamps.
-    const double Lithology = 0.5 + 0.5 * Fbm(
-        Warped, FMath::Max(90000.0, Scale * 0.22),
-        SeedOffset + FVector2D(811.0, 397.0),
-        4, 0.58, 2.0
-    );
-    const double ResistantCap = OutDesertMask
-        * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
-        * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
-
-'''
+          if start < 0 or end < 0: raise RuntimeError('mesa markers missing')
+          block=base64.b64decode('ICAgIC8vIExpdGhvbG9neSBpcyBpbmRlcGVuZGVudCBmcm9tIHNoYXBlLiBEcmFpbmFnZSBhbmQgZGlmZmVyZW50aWFsIGVyb3Npb24KICAgIC8vIHN0cmlwIHdlYWsgYXJpZCB1cGxhbmRzIHdoaWxlIHJlc2lzdGFudCBjYXBzIHN1cnZpdmUsIHNvIG1lc2FzLAogICAgLy8gZXNjYXJwbWVudHMgYW5kIGNhbnlvbiByaW1zIGVtZXJnZSBpbnN0ZWFkIG9mIGJlaW5nIGhlaWdodCBzdGFtcHMuCiAgICBjb25zdCBkb3VibGUgTGl0aG9sb2d5ID0gMC41ICsgMC41ICogRmJtKAogICAgICAgIFdhcnBlZCwgRk1hdGg6Ok1heCg5MDAwMC4wLCBTY2FsZSAqIDAuMjIpLAogICAgICAgIFNlZWRPZmZzZXQgKyBGVmVjdG9yMkQoODExLjAsIDM5Ny4wKSwKICAgICAgICA0LCAwLjU4LCAyLjAKICAgICk7CiAgICBjb25zdCBkb3VibGUgUmVzaXN0YW50Q2FwID0gT3V0RGVzZXJ0TWFzawogICAgICAgICogRk1hdGg6OkNsYW1wKE91dEhpbGxNYXNrICsgRm9vdGhpbGxFbnZlbG9wZSAqIDAuNDUsIDAuMCwgMS4wKQogICAgICAgICogU21vb3RoMDEoRk1hdGg6OkNsYW1wKChMaXRob2xvZ3kgLSAwLjQ4KSAvIDAuMzgsIDAuMCwgMS4wKSk7Cgo=').decode()
           s=s[:start]+block+s[end:]
           s=s.replace('(1.0 - PlateauMask * 0.90)','(1.0 - ResistantCap * 0.85)',1)
           s=s.replace('OutMountainMask * 0.28','OutMountainMask * 0.24',1)
           s=s.replace('+ OutHillMask * 0.11','+ OutHillMask * 0.09',1)
           s=s.replace('+ OutDesertMask * (0.18 + PlateauMask * 0.38)','+ OutDesertMask * 0.10\n            + ResistantCap * 0.62',1)
+          if 'PlateauMask' in s[start:end+1000]: raise RuntimeError('stale plateau reference')
           p.write_text(s)
-          print('patched')
           PY
-          STATUS=$?
-          mkdir -p .github
-          printf 'exit=%s\n' "$STATUS" > .github/lithology-log.txt
-          cat /tmp/v13log.txt >> .github/lithology-log.txt
-          cat /tmp/v13log.txt
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp .github/lithology-log.txt
-          git commit -m "Apply v13 resistant lithology"
-          git pull --rebase origin main
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Replace stamped mesas with resistant lithology"
           git push
