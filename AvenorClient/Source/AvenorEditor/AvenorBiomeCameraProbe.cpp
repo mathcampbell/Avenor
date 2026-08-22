@@ -4,10 +4,11 @@
 #include "DrawDebugHelpers.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
-#include "EditorViewportClient.h"
 #include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "HAL/IConsoleManager.h"
+#include "LevelEditorViewport.h"
+#include "UnrealEdGlobals.h"
 
 namespace UE::Avenor::BiomeProbe
 {
@@ -27,7 +28,7 @@ static TAutoConsoleVariable<float> CVarUpdateSeconds(
 
 struct FTexturePixels
 {
-    TObjectPtr<UTexture2D> Texture = nullptr;
+    UTexture2D* Texture = nullptr;
     int32 Width = 0;
     int32 Height = 0;
     TArray<FColor> Pixels;
@@ -77,11 +78,8 @@ struct FTexturePixels
             return nullptr;
         }
         const FVector2D Size = WorldBounds.GetSize();
-        if (Size.X <= UE_DOUBLE_SMALL_NUMBER || Size.Y <= UE_DOUBLE_SMALL_NUMBER)
-        {
-            return nullptr;
-        }
-        if (!WorldBounds.IsInside(Position))
+        if (Size.X <= UE_DOUBLE_SMALL_NUMBER || Size.Y <= UE_DOUBLE_SMALL_NUMBER
+            || !WorldBounds.IsInside(Position))
         {
             return nullptr;
         }
@@ -141,6 +139,21 @@ static FString BiomeName(EAvenorBiomeClass Biome)
     return TEXT("Unknown");
 }
 
+static const TCHAR* TemperatureLabel(double Value)
+{
+    if (Value < 0.25) return TEXT("Cold");
+    if (Value < 0.50) return TEXT("Temperate");
+    if (Value < 0.75) return TEXT("Warm");
+    return TEXT("Hot");
+}
+
+static const TCHAR* MoistureLabel(double Value)
+{
+    if (Value < 0.33) return TEXT("Dry");
+    if (Value < 0.66) return TEXT("Moist");
+    return TEXT("Wet");
+}
+
 class FCameraProbe
 {
 public:
@@ -172,13 +185,8 @@ private:
         Accumulator = 0.0f;
 
         UWorld* World = GEditor->GetEditorWorldContext().World();
-        FViewport* Viewport = GEditor->GetActiveViewport();
-        if (!World || !Viewport)
-        {
-            return;
-        }
-        FEditorViewportClient* ViewClient = static_cast<FEditorViewportClient*>(Viewport->GetClient());
-        if (!ViewClient)
+        FLevelEditorViewportClient* ViewClient = GCurrentLevelEditingViewportClient;
+        if (!World || !ViewClient)
         {
             return;
         }
@@ -249,11 +257,13 @@ private:
         }
 
         const FString Status = FString::Printf(
-            TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base climate biome: %s\nMacro climate: T %.2f  M %.2f   Local climate: T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
+            TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
             *BiomeName(FinalBiome),
             bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
             *BiomeName(BaseBiome),
+            TemperatureLabel(MacroTemperature), MoistureLabel(MacroMoisture),
             MacroTemperature, MacroMoisture,
+            TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),
             LocalTemperature, LocalMoisture,
             Landform,
             bTerrain ? *FString::Printf(TEXT("%.0f m"), Terrain.Height / 100.0f) : TEXT("n/a"),
