@@ -2,7 +2,6 @@
 #include "AvenorTerrainData.h"
 
 #include "Containers/Ticker.h"
-#include "DrawDebugHelpers.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "Engine/Engine.h"
@@ -44,17 +43,13 @@ struct FTexturePixels
             Width = Height = 0;
             return false;
         }
-
         const int32 NewWidth = InTexture->Source.GetSizeX();
         const int32 NewHeight = InTexture->Source.GetSizeY();
-        if (Texture == InTexture
-            && Width == NewWidth
-            && Height == NewHeight
+        if (Texture == InTexture && Width == NewWidth && Height == NewHeight
             && Pixels.Num() == Width * Height)
         {
             return true;
         }
-
         TArray64<uint8> RawMip;
         if (!InTexture->Source.GetMipData(RawMip, 0, nullptr)
             || RawMip.Num() != static_cast<int64>(NewWidth) * NewHeight * sizeof(FColor))
@@ -64,7 +59,6 @@ struct FTexturePixels
             Width = Height = 0;
             return false;
         }
-
         Texture = InTexture;
         Width = NewWidth;
         Height = NewHeight;
@@ -96,24 +90,15 @@ struct FTexturePixels
 static EAvenorBiomeClass ClosestBiomeColour(const FColor& Colour)
 {
     static const EAvenorBiomeClass Biomes[] = {
-        EAvenorBiomeClass::ColdDry,
-        EAvenorBiomeClass::ColdMoist,
-        EAvenorBiomeClass::TemperateDry,
-        EAvenorBiomeClass::TemperateMoist,
-        EAvenorBiomeClass::WarmDry,
-        EAvenorBiomeClass::WarmMoist,
-        EAvenorBiomeClass::HotDry,
-        EAvenorBiomeClass::HotWet,
-        EAvenorBiomeClass::AlpineTundra,
-        EAvenorBiomeClass::SnowIce,
-        EAvenorBiomeClass::Wetland,
-        EAvenorBiomeClass::Oasis,
-        EAvenorBiomeClass::Riverbed,
-        EAvenorBiomeClass::Riverbank,
-        EAvenorBiomeClass::Lakebed,
-        EAvenorBiomeClass::Lakeshore
+        EAvenorBiomeClass::ColdDry, EAvenorBiomeClass::ColdMoist,
+        EAvenorBiomeClass::TemperateDry, EAvenorBiomeClass::TemperateMoist,
+        EAvenorBiomeClass::WarmDry, EAvenorBiomeClass::WarmMoist,
+        EAvenorBiomeClass::HotDry, EAvenorBiomeClass::HotWet,
+        EAvenorBiomeClass::AlpineTundra, EAvenorBiomeClass::SnowIce,
+        EAvenorBiomeClass::Wetland, EAvenorBiomeClass::Oasis,
+        EAvenorBiomeClass::Riverbed, EAvenorBiomeClass::Riverbank,
+        EAvenorBiomeClass::Lakebed, EAvenorBiomeClass::Lakeshore
     };
-
     int64 BestDistance = MAX_int64;
     EAvenorBiomeClass Best = EAvenorBiomeClass::TemperateMoist;
     for (EAvenorBiomeClass Biome : Biomes)
@@ -156,67 +141,17 @@ static const TCHAR* MoistureLabel(double Value)
     return TEXT("Wet");
 }
 
-static const TCHAR* ClassifyFinalLandform(
-    const UAvenorTerrainData& Data,
-    const FVector2D& Position,
-    const FAvenorTerrainSample& Centre,
-    FAvenorTerrainHeightChunkCache& Cache
-)
+static const TCHAR* ClassifyFinalLandform(const FAvenorTerrainSample& Centre)
 {
-    // Diagnose the terrain that actually survived erosion rather than simply
-    // echoing the original structural mask.  Mountain is a geometric landform;
-    // alpine is a separate climate/biome decision.
-    const double NearRadius = FMath::Max(60000.0, Data.CellSize * 12.0);
-    const double FarRadius = FMath::Max(180000.0, Data.CellSize * 36.0);
-    static const FVector2D Directions[] = {
-        FVector2D(1,0), FVector2D(-1,0), FVector2D(0,1), FVector2D(0,-1),
-        FVector2D(0.70710678,0.70710678), FVector2D(-0.70710678,0.70710678),
-        FVector2D(0.70710678,-0.70710678), FVector2D(-0.70710678,-0.70710678)
-    };
-
-    double NearMin = Centre.Height;
-    double NearMax = Centre.Height;
-    double FarMin = Centre.Height;
-    double FarMax = Centre.Height;
-    for (const FVector2D& Direction : Directions)
-    {
-        FAvenorTerrainSample Sample;
-        if (Data.SampleTerrain(Position + Direction * NearRadius, Sample, Cache))
-        {
-            NearMin = FMath::Min(NearMin, static_cast<double>(Sample.Height));
-            NearMax = FMath::Max(NearMax, static_cast<double>(Sample.Height));
-        }
-        if (Data.SampleTerrain(Position + Direction * FarRadius, Sample, Cache))
-        {
-            FarMin = FMath::Min(FarMin, static_cast<double>(Sample.Height));
-            FarMax = FMath::Max(FarMax, static_cast<double>(Sample.Height));
-        }
-    }
-
-    const double NearRelief = FMath::Max(0.0, NearMax - NearMin);
-    const double FarRelief = FMath::Max(0.0, FarMax - FarMin);
-    const double NearProminence = FMath::Max(0.0, static_cast<double>(Centre.Height) - NearMin);
-    const double FarProminence = FMath::Max(0.0, static_cast<double>(Centre.Height) - FarMin);
-    const double ElevationMetres = FMath::Max(0.0, static_cast<double>(Centre.Height)) / 100.0;
-    const double Prominence = FMath::Max(NearProminence, FarProminence * 0.72);
-
-    const bool bMountain = Centre.Mountain >= 0.34f
-        || ((ElevationMetres > 450.0 || Centre.Slope > 0.025f)
-            && FarRelief > 28000.0
-            && Prominence > 12000.0)
-        || (ElevationMetres > 850.0
-            && FarRelief > 18000.0
-            && Centre.Slope > 0.018f);
-    if (bMountain)
+    const double ElevationMetres = FMath::Max(0.0f, Centre.Height) / 100.0;
+    if (Centre.Mountain >= 0.32f
+        || (ElevationMetres > 700.0 && Centre.Slope > 0.014f))
     {
         return TEXT("Mountain");
     }
-
-    const bool bUpland = Centre.Hill >= 0.32f
-        || (NearRelief > 5000.0 && NearProminence > 3500.0)
-        || (ElevationMetres > 250.0
-            && (NearRelief > 3500.0 || Centre.Slope > 0.012f));
-    if (bUpland)
+    if (Centre.Hill >= 0.28f
+        || Centre.Slope > 0.010f
+        || ElevationMetres > 280.0)
     {
         return TEXT("Hills / upland");
     }
@@ -233,10 +168,8 @@ public:
     FCameraProbe()
     {
         TickHandle = FTSTicker::GetCoreTicker().AddTicker(
-            FTickerDelegate::CreateRaw(this, &FCameraProbe::Tick)
-        );
+            FTickerDelegate::CreateRaw(this, &FCameraProbe::Tick));
     }
-
     ~FCameraProbe()
     {
         if (TickHandle.IsValid())
@@ -248,7 +181,7 @@ public:
 private:
     bool Tick(float DeltaSeconds)
     {
-        if (CVarEnabled.GetValueOnGameThread() == 0 || !GEditor)
+        if (CVarEnabled.GetValueOnGameThread() == 0 || !GEditor || !GEngine)
         {
             return true;
         }
@@ -280,92 +213,79 @@ private:
         UAvenorTerrainData* Data = Generator->BakedTerrainData.LoadSynchronous();
         if (!Data || !Data->HasValidData())
         {
+            GEngine->AddOnScreenDebugMessage(
+                0x0A7E0B10, 0.5f, FColor::White,
+                TEXT("AVENOR LOCATION PROBE\nBaked terrain data unavailable"), false);
             return true;
         }
 
         const FVector Camera = ViewClient->GetViewLocation();
         const FVector2D XY(Camera.X, Camera.Y);
-        const FBox2D ClimateBounds = Data->WorldClimateMaps.WorldBounds;
-        if (!ClimateBounds.bIsValid || !ClimateBounds.IsInside(XY))
-        {
-            return true;
-        }
+        FAvenorTerrainSample Terrain;
+        const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
 
+        const FBox2D ClimateBounds = Data->WorldClimateMaps.WorldBounds;
         UTexture2D* ClimateTexture = Data->WorldClimateMaps.ClimateFilterTexture.LoadSynchronous();
         UTexture2D* BaseBiomeTexture = Data->WorldClimateMaps.BaseBiomeTexture.LoadSynchronous();
         UTexture2D* LocalBiomeTexture = Data->WorldClimateMaps.LocalBiomeTexture.LoadSynchronous();
-        if (!ClimatePixels.Refresh(ClimateTexture)
-            || !BaseBiomePixels.Refresh(BaseBiomeTexture)
-            || !LocalBiomePixels.Refresh(LocalBiomeTexture))
+        const bool bClimateReady = ClimateBounds.bIsValid
+            && ClimateBounds.IsInside(XY)
+            && ClimatePixels.Refresh(ClimateTexture)
+            && BaseBiomePixels.Refresh(BaseBiomeTexture)
+            && LocalBiomePixels.Refresh(LocalBiomeTexture);
+
+        FString Status;
+        if (bClimateReady)
         {
-            return true;
+            const FColor* Climate = ClimatePixels.Sample(ClimateBounds, XY);
+            const FColor* BaseBiomePixel = BaseBiomePixels.Sample(ClimateBounds, XY);
+            const FColor* LocalBiomePixel = LocalBiomePixels.Sample(ClimateBounds, XY);
+            if (Climate && BaseBiomePixel)
+            {
+                const EAvenorBiomeClass BaseBiome = ClosestBiomeColour(*BaseBiomePixel);
+                const bool bHasLocalOverride = LocalBiomePixel && LocalBiomePixel->A > 0;
+                const EAvenorBiomeClass FinalBiome = bHasLocalOverride
+                    ? ClosestBiomeColour(*LocalBiomePixel)
+                    : BaseBiome;
+                const double MacroTemperature = Climate->R / 255.0;
+                const double MacroMoisture = Climate->G / 255.0;
+                const double LocalTemperature = Climate->B / 255.0;
+                const double LocalMoisture = Climate->A / 255.0;
+                Status = FString::Printf(
+                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
+                    *BiomeName(FinalBiome),
+                    bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
+                    *BiomeName(BaseBiome),
+                    TemperatureLabel(MacroTemperature), MoistureLabel(MacroMoisture),
+                    MacroTemperature, MacroMoisture,
+                    TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),
+                    LocalTemperature, LocalMoisture,
+                    bTerrain ? ClassifyFinalLandform(Terrain) : TEXT("Unknown"),
+                    bTerrain ? *FString::Printf(TEXT("%.0f m"), Terrain.Height / 100.0f) : TEXT("n/a"),
+                    bTerrain ? *FString::Printf(TEXT("%.1f km2"), Terrain.Accumulation) : TEXT("n/a"),
+                    Camera.X / 100000.0, Camera.Y / 100000.0);
+            }
         }
 
-        const FColor* Climate = ClimatePixels.Sample(ClimateBounds, XY);
-        const FColor* BaseBiomePixel = BaseBiomePixels.Sample(ClimateBounds, XY);
-        const FColor* LocalBiomePixel = LocalBiomePixels.Sample(ClimateBounds, XY);
-        if (!Climate || !BaseBiomePixel)
+        if (Status.IsEmpty())
         {
-            return true;
+            Status = bTerrain
+                ? FString::Printf(
+                    TEXT("AVENOR LOCATION PROBE\nClimate maps temporarily unavailable\nLandform: %s   Elevation: %.0f m   Drainage: %.1f km2\nSlope: %.3f   Mountain %.2f   Hill %.2f\nWorld: X %.2f km   Y %.2f km"),
+                    ClassifyFinalLandform(Terrain), Terrain.Height / 100.0f,
+                    Terrain.Accumulation, Terrain.Slope, Terrain.Mountain, Terrain.Hill,
+                    Camera.X / 100000.0, Camera.Y / 100000.0)
+                : FString::Printf(
+                    TEXT("AVENOR LOCATION PROBE\nOutside baked terrain\nWorld: X %.2f km   Y %.2f km"),
+                    Camera.X / 100000.0, Camera.Y / 100000.0);
         }
 
-        const EAvenorBiomeClass BaseBiome = ClosestBiomeColour(*BaseBiomePixel);
-        const bool bHasLocalOverride = LocalBiomePixel && LocalBiomePixel->A > 0;
-        const EAvenorBiomeClass FinalBiome = bHasLocalOverride
-            ? ClosestBiomeColour(*LocalBiomePixel)
-            : BaseBiome;
-
-        const double MacroTemperature = Climate->R / 255.0;
-        const double MacroMoisture = Climate->G / 255.0;
-        const double LocalTemperature = Climate->B / 255.0;
-        const double LocalMoisture = Climate->A / 255.0;
-
-        FAvenorTerrainSample Terrain;
-        const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
-        const TCHAR* Landform = bTerrain
-            ? ClassifyFinalLandform(*Data, XY, Terrain, TerrainCache)
-            : TEXT("Unknown");
-
-        const FString Status = FString::Printf(
-            TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
-            *BiomeName(FinalBiome),
-            bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
-            *BiomeName(BaseBiome),
-            TemperatureLabel(MacroTemperature), MoistureLabel(MacroMoisture),
-            MacroTemperature, MacroMoisture,
-            TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),
-            LocalTemperature, LocalMoisture,
-            Landform,
-            bTerrain ? *FString::Printf(TEXT("%.0f m"), Terrain.Height / 100.0f) : TEXT("n/a"),
-            bTerrain ? *FString::Printf(TEXT("%.1f km2"), Terrain.Accumulation) : TEXT("n/a"),
-            Camera.X / 100000.0,
-            Camera.Y / 100000.0
-        );
-
-        const FVector TextLocation = Camera
-            + ViewClient->GetViewRotation().Vector() * 1200.0
-            + FVector(0.0, 0.0, 220.0);
-        DrawDebugString(
-            World,
-            TextLocation,
-            Status,
-            nullptr,
+        GEngine->AddOnScreenDebugMessage(
+            0x0A7E0B10,
+            FMath::Max(0.35f, CVarUpdateSeconds.GetValueOnGameThread() * 2.0f),
             FColor::White,
-            FMath::Max(0.10f, CVarUpdateSeconds.GetValueOnGameThread() * 1.35f),
-            true,
-            1.05f
-        );
-        if (GEngine)
-        {
-            GEngine->AddOnScreenDebugMessage(
-                0x0A7E0B10,
-                FMath::Max(0.30f, CVarUpdateSeconds.GetValueOnGameThread() * 2.0f),
-                FColor::White,
-                Status,
-                false
-            );
-        }
-
+            Status,
+            false);
         return true;
     }
 
