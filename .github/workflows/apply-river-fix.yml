@@ -1,15 +1,14 @@
 name: Apply river regression source patch
 
 on:
-  issues:
-    types: [edited]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.event.issue.number == 19 && github.event.issue.title == 'APPLY RIVER FIX NOW'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
