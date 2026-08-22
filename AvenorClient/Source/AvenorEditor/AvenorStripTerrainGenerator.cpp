@@ -3419,37 +3419,21 @@ static double EvaluateLandform(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
     );
 
-    // Arid climate exposes and flattens resistant uplands into mesas and
-    // escarpments, but only where structural hill/upland terrain already exists.
-    const double PlateauSignal = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 0.52,
+    // Lithology is independent from shape. Drainage and differential erosion
+    // strip weak arid uplands while resistant caps survive, so mesas,
+    // escarpments and canyon rims emerge instead of being height stamps.
+    const double Lithology = 0.5 + 0.5 * Fbm(
+        Warped, FMath::Max(90000.0, Scale * 0.22),
         SeedOffset + FVector2D(811.0, 397.0),
-        4, 0.55, 2.0
+        4, 0.58, 2.0
     );
-    const double PlateauMask = Smooth01(FMath::Clamp(
-        (PlateauSignal - 0.57) / 0.25, 0.0, 1.0
-    )) * OutDesertMask
-       * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.55, 0.0, 1.0)
-       * (1.0 - OutMountainMask * 0.72);
-
-    // Terrace the *upper* part of an existing upland rather than building
-    // free-standing desert spikes.
-    const double MesaStep = FMath::Floor(
-        FMath::Clamp(PlateauSignal, 0.0, 0.999) * 5.0
-    ) / 5.0;
-    Height += PlateauMask * Relief
-        * (0.055 + MesaStep * 0.035);
-
-    const double BadlandRidges = RidgedFbm(
-        Warped, FMath::Max(70000.0, Scale * 0.10),
-        SeedOffset + FVector2D(1733.0, 1449.0),
-        4
-    );
-    Height += (BadlandRidges - 0.48) * Relief * 0.018 * PlateauMask;
+    const double ResistantCap = OutDesertMask
+        * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
+        * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
     // Dunes remain low-amplitude regional terrain on quiet arid plains.
     const double DuneSuitability = OutDesertMask * OutPlainsMask
-        * (1.0 - PlateauMask * 0.90)
+        * (1.0 - ResistantCap * 0.85)
         * (1.0 - RiftMask * 0.55);
     if (DuneSuitability > 0.03)
     {
@@ -3478,9 +3462,10 @@ static double EvaluateLandform(
     }
 
     OutResistance = FMath::Clamp(
-        OutMountainMask * 0.28
-            + OutHillMask * 0.11
-            + OutDesertMask * (0.18 + PlateauMask * 0.38)
+        OutMountainMask * 0.24
+            + OutHillMask * 0.09
+            + OutDesertMask * 0.10
+            + ResistantCap * 0.62
             + RiftShoulder * 0.10,
         0.0, 1.0
     );
