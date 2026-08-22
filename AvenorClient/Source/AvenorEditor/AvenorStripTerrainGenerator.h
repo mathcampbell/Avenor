@@ -105,8 +105,13 @@ struct FAvenorHydrologySettings
     UPROPERTY(EditAnywhere, Category = "Hydrology")
     bool bLakes = true;
 
-    UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bLakes", ClampMin = "0", ClampMax = "128"))
+    // Kept only so older placed actors can deserialize the old count field.
+    // Lake generation no longer uses an arbitrary number-of-lakes limit.
+    UPROPERTY()
     int32 MaximumLakes = 12;
+
+    UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bLakes", DisplayName = "Maximum Lake Surface (%)", ClampMin = "0", ClampMax = "50", ToolTip = "Maximum fraction of the generated land surface that may be occupied by accepted lakes. This is a world-area budget, not a lake-count limit; qualifying basins are accepted until this budget is exhausted."))
+    int32 MaximumLakeSurfacePercent = 3;
 
     UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bLakes", Units = "cm", ClampMin = "100.0"))
     double MinimumLakeDepression = 1500.0;
@@ -133,8 +138,11 @@ struct FAvenorWaterTerrainSettings
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0"))
     double LakeShoreWidth = 24000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Lowers generated lake surfaces below the detected basin shoreline. 200 cm exposes roughly two metres of natural bank without changing the lake outline."))
-    double LakeSurfaceInset = 200.0;
+    // Retained for old actor serialization only. Lake water splines now use
+    // the detected basin surface directly, so the shoreline and water datum
+    // cannot drift vertically apart because of a global inset.
+    UPROPERTY()
+    double LakeSurfaceInset = 0.0;
 
     UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Generator-wide dry margin between rendered water and the start of the broad terrain ramp. Applied to every generated river and lake modifier."))
     double DryBankWidth = 300.0;
@@ -177,6 +185,39 @@ struct FAvenorTerrainRefinementSettings
 
     UPROPERTY(EditAnywhere, Category = "Refinement", meta = (ClampMin = "1", ClampMax = "6", ToolTip = "Maximum local subdivision depth. Four is the production default; use three for quick iteration builds."))
     int32 MaximumTessellationLevel = 4;
+};
+
+/**
+ * Assignment-compatible no-limit value used by legacy implementation code.
+ * ResolveSettings can still assign the old MaximumLakes field, but the value
+ * is deliberately ignored and ExtractLakes receives an effectively unlimited
+ * count. Surface-area coverage is the sole global lake budget.
+ */
+struct FAvenorUnlimitedLakeCount
+{
+    FAvenorUnlimitedLakeCount& operator=(int32)
+    {
+        return *this;
+    }
+
+    operator int32() const
+    {
+        return MAX_int32;
+    }
+};
+
+/** The old global lake inset is ignored so generated lake splines stay level at the detected water surface. */
+struct FAvenorLevelLakeSurfaceInset
+{
+    FAvenorLevelLakeSurfaceInset& operator=(double)
+    {
+        return *this;
+    }
+
+    operator double() const
+    {
+        return 0.0;
+    }
 };
 
 UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
@@ -358,11 +399,10 @@ public:
     double MinimumLakeBedDepth = 500.0;
     double MaximumLakeBedDepth = 5000.0;
     double MaximumLakeArea = 250.0;
-    int32 MaximumLakeCount = 12;
-    double MaximumLakeCoverageFraction = 0.03;
+    FAvenorUnlimitedLakeCount MaximumLakeCount;
     double LakeBankBlendWidth = 24000.0;
     double LakeDepthRampWidth = 7500.0;
-    double LakeSurfaceInset = 0.0;
+    FAvenorLevelLakeSurfaceInset LakeSurfaceInset;
     bool bGenerateLakeOutflows = true;
     bool bGenerateOcean = false;
     double SeaLevel = 0.0;
@@ -394,6 +434,12 @@ private:
     bool bDeferMeshRefresh = false;
     mutable bool bGeneratingGeography = false;
 };
+
+// Compatibility aliases used only by the existing implementation unit. They
+// let old serialized MaximumLakes data remain loadable while changing the
+// runtime semantics to an area percentage without retaining a count cap.
+#define MaximumLakes MaximumLakeSurfacePercent
+#define MaximumLakeCoverageFraction Hydrology.MaximumLakeSurfacePercent * 0.01
 
 // The terrain implementation defines a local lambda named Oriented and uses it
 // only for geological structure. Redirect those calls through a deterministic
