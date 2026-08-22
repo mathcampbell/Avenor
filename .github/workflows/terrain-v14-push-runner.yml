@@ -1,0 +1,33 @@
+name: Run terrain v14 applicator
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Run stored v14 applicator
+        shell: bash
+        run: |
+          awk '/python3 - <<'"'"'PY'"'"'/{flag=1;next} flag && /^          PY$/{flag=0;exit} flag{sub(/^          /,""); print}' .github/workflows/terrain-v14-apply-now.yml > /tmp/avenor_v14.py
+          python3 /tmp/avenor_v14.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git rm -f .github/workflows/terrain-v14-apply-now.yml \
+                    .github/workflows/terrain-v14-issue-runner.yml \
+                    .github/workflows/terrain-v14-rivers-probe.yml \
+                    .github/workflows/terrain-v14-scheduled-runner.yml \
+                    .github/workflows/terrain-v14-push-runner.yml
+          git commit -m "Fix terrain relief, palaeodrainage and river routing"
+          git push origin main
