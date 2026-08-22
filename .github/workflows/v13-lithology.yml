@@ -13,12 +13,14 @@ jobs:
         with:
           fetch-depth: 0
       - run: |
-          python3 - <<'PY'
+          set +e
+          python3 - <<'PY' >/tmp/v13log.txt 2>&1
           from pathlib import Path
           p=Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
           s=p.read_text()
           start=s.find('    // Arid climate exposes and flattens resistant uplands into mesas and')
           end=s.find('    // Dunes remain low-amplitude regional terrain on quiet arid plains.',start)
+          print('markers', start, end)
           if start < 0 or end < 0:
               raise SystemExit('mesa markers missing')
           block='''    // Lithology is independent from shape. Drainage and differential erosion
@@ -40,9 +42,16 @@ jobs:
           s=s.replace('+ OutHillMask * 0.11','+ OutHillMask * 0.09',1)
           s=s.replace('+ OutDesertMask * (0.18 + PlateauMask * 0.38)','+ OutDesertMask * 0.10\n            + ResistantCap * 0.62',1)
           p.write_text(s)
+          print('patched')
           PY
+          STATUS=$?
+          mkdir -p .github
+          printf 'exit=%s\n' "$STATUS" > .github/lithology-log.txt
+          cat /tmp/v13log.txt >> .github/lithology-log.txt
+          cat /tmp/v13log.txt
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
-          git commit -m "Replace stamped mesas with resistant lithology"
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp .github/lithology-log.txt
+          git commit -m "Apply v13 resistant lithology"
+          git pull --rebase origin main
           git push
