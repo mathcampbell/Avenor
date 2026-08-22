@@ -292,7 +292,7 @@ private:
         return true;
     }
 
-    FDelegateHandle TickHandle;
+    FTSTicker::FDelegateHandle TickHandle;
     float Accumulator = 0.0f;
     FTexturePixels ClimatePixels;
     FTexturePixels BaseBiomePixels;
