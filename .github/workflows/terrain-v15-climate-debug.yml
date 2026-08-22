@@ -1,0 +1,669 @@
+name: Apply terrain v15 climate provinces and biome probe
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch climate, terrain expression and editor camera probe
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          cpp = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          hdr = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.h')
+          data_h = Path('AvenorClient/Source/Avenor/AvenorTerrainData.h')
+          data_cpp = Path('AvenorClient/Source/Avenor/AvenorTerrainData.cpp')
+          s = cpp.read_text(encoding='utf-8')
+          h = hdr.read_text(encoding='utf-8')
+          dh = data_h.read_text(encoding='utf-8')
+          dc = data_cpp.read_text(encoding='utf-8')
+
+          def one(text, old, new, label):
+              if old not in text:
+                  if new in text:
+                      print(label, 'already applied')
+                      return text
+                  raise RuntimeError(f'missing target: {label}')
+              return text.replace(old, new, 1)
+
+          # Remove the previous invalid header-level Oriented macro experiment.
+          marker = '// The terrain implementation defines a local lambda named Oriented'
+          if marker in h:
+              h = h[:h.index(marker)].rstrip() + '\n'
+
+          # Baked climate values are now first-class sample data for the editor probe.
+          dh = one(dh, 'static constexpr int32 CurrentFormatVersion = 6;',
+                   'static constexpr int32 CurrentFormatVersion = 7;', 'data format v7')
+          dh = one(dh,
+          '''struct AVENOR_API FAvenorTerrainSample
+{
+    float Height = 0.0f;
+    float Slope = 0.0f;
+    float Accumulation = 0.0f;
+    float Mountain = 0.0f;
+    float Hill = 0.0f;
+    float Desert = 0.0f;
+    float Plains = 0.0f;
+};''',
+          '''struct AVENOR_API FAvenorTerrainSample
+{
+    float Height = 0.0f;
+    float Slope = 0.0f;
+    float Accumulation = 0.0f;
+    float Mountain = 0.0f;
+    float Hill = 0.0f;
+    float Desert = 0.0f;
+    float Plains = 0.0f;
+    float MacroTemperature = 0.5f;
+    float MacroMoisture = 0.5f;
+    float Temperature = 0.5f;
+    float Moisture = 0.5f;
+    uint8 Biome = static_cast<uint8>(EAvenorBiomeClass::TemperateMoist);
+};''', 'terrain sample climate')
+          dh = one(dh,
+          '''    TArray<float> Accumulation;
+    TArray<float> Slope;
+};''',
+          '''    TArray<float> Accumulation;
+    TArray<float> Slope;
+    TArray<float> MacroTemperature;
+    TArray<float> MacroMoisture;
+    TArray<float> Temperature;
+    TArray<float> Moisture;
+    TArray<uint8> Biome;
+};''', 'sample chunk climate')
+
+          # Add a lightweight live camera probe without adding a forest of settings.
+          h = one(h,
+          '''    AAvenorStripTerrainGenerator();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Generate and Bake Geography"))''',
+          '''    AAvenorStripTerrainGenerator();
+    virtual void Tick(float DeltaSeconds) override;
+    virtual bool ShouldTickIfViewportsOnly() const override { return true; }
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Generate and Bake Geography"))''', 'tick declarations')
+          h = one(h,
+          '''    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
+    bool bRefinementPlanReadyForWater = false;
+
+    // Internal resolved constants.''',
+          '''    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
+    bool bRefinementPlanReadyForWater = false;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Debug", meta = (ToolTip = "Shows the active editor camera position, regional climate, local climate, biome and terrain class directly in the level viewport."))
+    bool bShowCameraBiomeOverlay = true;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Debug")
+    FString CameraBiomeStatus;
+
+    // Internal resolved constants.''', 'debug properties')
+          h = one(h,
+          '''    mutable TSharedPtr<const FAvenorStripData> CachedData;
+    bool bDeferMeshRefresh = false;
+    mutable bool bGeneratingGeography = false;
+};''',
+          '''    mutable TSharedPtr<const FAvenorStripData> CachedData;
+    bool bDeferMeshRefresh = false;
+    mutable bool bGeneratingGeography = false;
+    double CameraProbeUpdateAccumulator = 0.0;
+    FAvenorTerrainHeightChunkCache CameraProbeChunkCache;
+};''', 'debug cache')
+          # Need the terrain sample/cache definitions in this header.
+          h = one(h,
+          '#include "MeshPartitionModifierComponent.h"\n\n#include "AvenorStripTerrainGenerator.generated.h"',
+          '#include "MeshPartitionModifierComponent.h"\n#include "AvenorTerrainData.h"\n\n#include "AvenorStripTerrainGenerator.generated.h"', 'terrain data include')
+
+          # Chunk payload gains climate values and the final biome ID.
+          s = one(s, 'static constexpr int32 ChunkPayloadVersion = 5;\nstatic constexpr int32 GeneratorAlgorithmVersion = 13;',
+                  'static constexpr int32 ChunkPayloadVersion = 6;\nstatic constexpr int32 GeneratorAlgorithmVersion = 15;', 'generator versions')
+          s = one(s,
+          '''    auto WriteInt = [&](const TArray<int32>& Source)
+    {
+        ExtractIntChunk(Source, Data, StartX, StartY, CountX, CountY, IntValues);
+        Archive << IntValues;
+    };
+
+    WriteFloat(Data.Height);''',
+          '''    auto WriteInt = [&](const TArray<int32>& Source)
+    {
+        ExtractIntChunk(Source, Data, StartX, StartY, CountX, CountY, IntValues);
+        Archive << IntValues;
+    };
+    auto WriteByte = [&](const TArray<uint8>& Source)
+    {
+        TArray<uint8> Values;
+        Values.SetNumUninitialized(CountX * CountY);
+        const bool bHasSource = Source.Num() == Data.Columns * Data.Rows;
+        for (int32 LocalY = 0; LocalY < CountY; ++LocalY)
+        {
+            for (int32 LocalX = 0; LocalX < CountX; ++LocalX)
+            {
+                const int32 LocalIndex = LocalY * CountX + LocalX;
+                const int32 SourceIndex = Data.Index(StartX + LocalX, StartY + LocalY);
+                Values[LocalIndex] = bHasSource ? Source[SourceIndex] : 0;
+            }
+        }
+        Archive << Values;
+    };
+
+    WriteFloat(Data.Height);''', 'write byte helper')
+          s = one(s,
+          '''    WriteInt(Data.FillParent);
+    WriteInt(Data.LakeIndex);
+
+    Chunk.UncompressedBytes = static_cast<int64>(CountX) * CountY
+        * 14 * sizeof(uint32);''',
+          '''    WriteInt(Data.FillParent);
+    WriteInt(Data.LakeIndex);
+    WriteFloat(Data.MacroTemperature);
+    WriteFloat(Data.MacroMoisture);
+    WriteFloat(Data.Temperature);
+    WriteFloat(Data.Moisture);
+    WriteByte(Data.Biome);
+
+    Chunk.UncompressedBytes = static_cast<int64>(CountX) * CountY
+        * (18 * sizeof(uint32) + sizeof(uint8));''', 'write climate payload')
+          s = one(s,
+          '''static bool CopyIntChunkToGrid(
+    FArchive& Archive,
+    TArray<int32>& Destination,
+    const FAvenorTerrainDataChunk& Chunk,
+    const FAvenorStripData& Data
+)''',
+          '''static bool CopyByteChunkToGrid(
+    FArchive& Archive,
+    TArray<uint8>& Destination,
+    const FAvenorTerrainDataChunk& Chunk,
+    const FAvenorStripData& Data
+)
+{
+    TArray<uint8> Values;
+    Archive << Values;
+    const int32 Expected = Chunk.CellCount.X * Chunk.CellCount.Y;
+    if (Values.Num() != Expected)
+    {
+        return false;
+    }
+    for (int32 LocalY = 0; LocalY < Chunk.CellCount.Y; ++LocalY)
+    {
+        for (int32 LocalX = 0; LocalX < Chunk.CellCount.X; ++LocalX)
+        {
+            Destination[Data.Index(
+                Chunk.StartCell.X + LocalX,
+                Chunk.StartCell.Y + LocalY
+            )] = Values[LocalY * Chunk.CellCount.X + LocalX];
+        }
+    }
+    return true;
+}
+
+static bool CopyIntChunkToGrid(
+    FArchive& Archive,
+    TArray<int32>& Destination,
+    const FAvenorTerrainDataChunk& Chunk,
+    const FAvenorStripData& Data
+)''', 'copy byte helper')
+          s = one(s,
+          '''        && CopyFloatChunkToGrid(Archive, Data.ReceiverWeightA, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.FillParent, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.LakeIndex, Chunk, Data)
+        && !Archive.GetError();''',
+          '''        && CopyFloatChunkToGrid(Archive, Data.ReceiverWeightA, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.FillParent, Chunk, Data)
+        && CopyIntChunkToGrid(Archive, Data.LakeIndex, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.MacroTemperature, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.MacroMoisture, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.Temperature, Chunk, Data)
+        && CopyFloatChunkToGrid(Archive, Data.Moisture, Chunk, Data)
+        && CopyByteChunkToGrid(Archive, Data.Biome, Chunk, Data)
+        && !Archive.GetError();''', 'read climate payload')
+
+          # Replace the random-walk climate with broad deterministic regimes.
+          climate_start = s.index('    const double Spacing = FMath::Max(\n        100000.0, Generator.ClimateRegionSpacing\n    );', s.index('static void BuildMacroClimate'))
+          climate_end = s.index('    const FVector2D NoiseSeed(', climate_start)
+          new_climate = '''    // RegionSpacing remains the fine transition/noise scale. Broad climate
+    // provinces are deliberately larger so a 100 km strip contains several
+    // recognisable climatic regions rather than dozens of narrow stripes.
+    const double Spacing = FMath::Max(
+        100000.0, Generator.ClimateRegionSpacing
+    );
+    const double ProvinceLength = FMath::Clamp(
+        Spacing * 3.0, 1000000.0, 2200000.0
+    );
+    const int32 ProvinceCount = FMath::Max(
+        2, FMath::CeilToInt(LongLength / ProvinceLength) + 1
+    );
+
+    // Climate wheel: neighbouring entries are plausible transitions, while a
+    // complete long strip naturally samples cold/wet, temperate, tropical and
+    // arid regimes. The user's baseline still pulls every target toward it.
+    const TArray<FVector2D> ClimateWheel = {
+        FVector2D(0.16, 0.30), // cold dry
+        FVector2D(0.18, 0.76), // cold wet
+        FVector2D(0.40, 0.76), // temperate wet
+        FVector2D(0.62, 0.78), // warm wet
+        FVector2D(0.84, 0.82), // hot wet
+        FVector2D(0.86, 0.22), // hot dry
+        FVector2D(0.64, 0.28), // warm dry
+        FVector2D(0.40, 0.32)  // temperate dry
+    };
+    const FVector2D Baseline(
+        Generator.ClimateTemperature,
+        Generator.ClimateMoisture
+    );
+    int32 StartIndex = 0;
+    double BestStartDistance = TNumericLimits<double>::Max();
+    for (int32 Index = 0; Index < ClimateWheel.Num(); ++Index)
+    {
+        const double Distance = FVector2D::DistSquared(
+            ClimateWheel[Index], Baseline
+        );
+        if (Distance < BestStartDistance)
+        {
+            BestStartDistance = Distance;
+            StartIndex = Index;
+        }
+    }
+    FRandomStream Random(Generator.Seed ^ 0x4a6f7921);
+    const int32 Direction = Random.RandRange(0, 1) == 0 ? -1 : 1;
+    const double Diversity = Generator.bShowcaseClimateCompression
+        ? 1.0
+        : FMath::Lerp(
+            0.38, 0.82,
+            FMath::Clamp(Generator.ClimateRegionalVariation, 0.0, 1.0)
+        );
+    TArray<double> TemperatureAnchors;
+    TArray<double> MoistureAnchors;
+    TemperatureAnchors.SetNumUninitialized(ProvinceCount);
+    MoistureAnchors.SetNumUninitialized(ProvinceCount);
+    for (int32 Index = 0; Index < ProvinceCount; ++Index)
+    {
+        const int32 WheelIndex = (
+            StartIndex + Direction * Index + ClimateWheel.Num() * 8
+        ) % ClimateWheel.Num();
+        FVector2D Target = FMath::Lerp(
+            Baseline, ClimateWheel[WheelIndex], Diversity
+        );
+        const double Jitter = Generator.ClimateRegionalVariation
+            * (Generator.bShowcaseClimateCompression ? 0.045 : 0.025);
+        Target.X += Random.FRandRange(-1.0f, 1.0f) * Jitter;
+        Target.Y += Random.FRandRange(-1.0f, 1.0f) * Jitter;
+        TemperatureAnchors[Index] = FMath::Clamp(Target.X, 0.03, 0.97);
+        MoistureAnchors[Index] = FMath::Clamp(Target.Y, 0.03, 0.97);
+    }
+
+'''
+          s = s[:climate_start] + new_climate + s[climate_end:]
+          s = one(s,
+          '''        const double AnchorPosition = FMath::Clamp(
+            (LongPosition - LongMin) / Spacing,
+            0.0,
+            static_cast<double>(AnchorCount - 1)
+        );
+        const int32 A = FMath::Min(
+            FMath::FloorToInt(AnchorPosition), AnchorCount - 2
+        );''',
+          '''        const double AnchorPosition = FMath::Clamp(
+            (LongPosition - LongMin) / ProvinceLength,
+            0.0,
+            static_cast<double>(ProvinceCount - 1)
+        );
+        const int32 A = FMath::Min(
+            FMath::FloorToInt(AnchorPosition), ProvinceCount - 2
+        );''', 'province interpolation')
+
+          # Correct the geology orientation in the implementation itself.
+          s = one(s,
+          '''    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);''',
+          '''    const double SeedAngleC = FMath::Fmod(
+        SeedAngleB + 0.731
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000163,
+        PI
+    );
+    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AxisC(FMath::Cos(SeedAngleC), FMath::Sin(SeedAngleC));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);
+    const FVector2D AcrossC = Rotate90(AxisC);''', 'geology axis C')
+          s = one(s,
+          '''    const double RegionalTilt = Fbm(
+        Oriented(Warped, StripAxis, StripAcross, 2.8, 0.9),
+        Scale * 3.0,
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4, 0.55, 2.0
+    );
+    const double Uplift = FMath::Clamp(
+        PlateField * 0.72 + RegionalTilt * 0.28,
+        -1.0, 1.0
+    );''',
+          '''    const FVector2D RegionalWarp = Warped + FVector2D(
+        Fbm(Warped, Scale * 2.2,
+            SeedOffset + FVector2D(229.0, 1549.0), 3) * Scale * 0.18,
+        Fbm(Warped, Scale * 2.0,
+            SeedOffset + FVector2D(1663.0, 593.0), 3) * Scale * 0.18
+    );
+    const double RegionalStructure = Fbm(
+        Oriented(RegionalWarp, AxisC, AcrossC, 2.6, 0.88),
+        Scale * 3.0,
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4, 0.55, 2.0
+    );
+    const double Uplift = FMath::Clamp(
+        PlateField * 0.72 + RegionalStructure * 0.28,
+        -1.0, 1.0
+    );''', 'strip independent uplift')
+          s = one(s,
+          '''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift);''',
+          '''    const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
+        ? Position.Y - Bounds.GetCenter().Y
+        : Position.X - Bounds.GetCenter().X;
+    const double SpineMountainRecovery = Smooth01(FMath::Clamp(
+        (FMath::Abs(AcrossCoordinate) - ShortExtent * 0.05)
+            / FMath::Max(1.0, ShortExtent * 0.18),
+        0.0, 1.0
+    ));
+    const double SpineMountainBias = FMath::Lerp(
+        0.72, 1.0, SpineMountainRecovery
+    );
+    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift)
+       * SpineMountainBias;''', 'soft spine bias')
+          s = one(s,
+          '''    double Height = Uplift * Relief * 0.075
+        + RegionalTilt * Relief * 0.025;''',
+          '''    double Height = Uplift * Relief * 0.075
+        + RegionalStructure * Relief * 0.025;''', 'regional structure height')
+
+          # Climate changes how geology is expressed without dictating where geology exists.
+          s = one(s,
+          '''    const double MountainHeight = Smooth01(OutMountainMask);
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.54, 0.82, Activity)
+        * CrestShape;''',
+          '''    const double ClimateCold = bClimateEnabled
+        ? Smooth01(FMath::Clamp((0.48 - ClimateTemperature) / 0.42, 0.0, 1.0))
+        : 0.0;
+    const double ClimateHumid = bClimateEnabled
+        ? Smooth01(FMath::Clamp((ClimateMoisture - 0.42) / 0.48, 0.0, 1.0))
+        : 0.0;
+    const double ClimateArid = bClimateEnabled
+        ? Smooth01(FMath::Clamp((0.48 - ClimateMoisture) / 0.40, 0.0, 1.0))
+            * Smooth01(FMath::Clamp((ClimateTemperature - 0.40) / 0.48, 0.0, 1.0))
+        : 0.0;
+    const double MountainHeight = Smooth01(OutMountainMask);
+    const double MountainClimateExpression = FMath::Clamp(
+        0.96 + ClimateCold * ClimateHumid * 0.10
+            - (1.0 - ClimateCold) * ClimateHumid * 0.04,
+        0.90, 1.08
+    );
+    Height += MountainHeight * Relief
+        * FMath::Lerp(0.54, 0.82, Activity)
+        * CrestShape * MountainClimateExpression;''', 'climate mountain expression')
+          s = one(s,
+          '''    Height += IndependentHills * Relief * (
+        0.050
+        + (0.5 + 0.5 * Rolling) * 0.052
+        + UplandRidges * 0.040
+        + HillDetail * 0.016
+    );''',
+          '''    const double HillClimateExpression = FMath::Clamp(
+        0.88 + ClimateHumid * 0.22 - ClimateArid * 0.10,
+        0.78, 1.12
+    );
+    Height += IndependentHills * Relief * (
+        0.050
+        + (0.5 + 0.5 * Rolling) * 0.052
+        + UplandRidges * 0.040
+        + HillDetail * 0.016
+    ) * HillClimateExpression;''', 'climate hill expression')
+          s = one(s,
+          '''    Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
+        * FMath::Lerp(0.86, 1.08, RiftLine);''',
+          '''    Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
+        * FMath::Lerp(0.86, 1.08, RiftLine)
+        * FMath::Lerp(1.0, 1.14, ClimateArid);''', 'arid basins/rifts')
+          s = one(s,
+          '''    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.024
+        + (PlainRidges - 0.46) * 0.016
+    );''',
+          '''    const double PlainClimateExpression = FMath::Clamp(
+        0.94 + ClimateHumid * 0.10 - ClimateArid * 0.12,
+        0.80, 1.08
+    );
+    Height += OutPlainsMask * Relief * (
+        PlainRoll * 0.024
+        + (PlainRidges - 0.46) * 0.016
+    ) * PlainClimateExpression;''', 'climate plains expression')
+
+          # Data load needs climate arrays for camera sampling.
+          s = one(s,
+          '''    Data->LakeIndex.Init(INDEX_NONE, TotalCells);
+
+    TSet<FIntPoint> SeenChunkCoordinates;''',
+          '''    Data->LakeIndex.Init(INDEX_NONE, TotalCells);
+    Data->MacroTemperature.SetNumZeroed(TotalCells);
+    Data->MacroMoisture.SetNumZeroed(TotalCells);
+    Data->Temperature.SetNumZeroed(TotalCells);
+    Data->Moisture.SetNumZeroed(TotalCells);
+    Data->Biome.SetNumZeroed(TotalCells);
+
+    TSet<FIntPoint> SeenChunkCoordinates;''', 'load climate arrays')
+
+          # Editor overlay implementation.
+          s = one(s,
+          '#include "Editor.h"\n#include "Engine/Blueprint.h"',
+          '#include "Editor.h"\n#include "EditorViewportClient.h"\n#include "DrawDebugHelpers.h"\n#include "Engine/Blueprint.h"', 'debug includes')
+          s = one(s,
+          '''AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
+{
+    PrimaryActorTick.bCanEverTick = false;''',
+          '''AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
+{
+    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bStartWithTickEnabled = true;''', 'enable editor tick')
+          ctor_end = '''    ResolveSettings();
+}
+
+void AAvenorStripTerrainGenerator::ResolveSettings()'''
+          overlay = '''    ResolveSettings();
+}
+
+void AAvenorStripTerrainGenerator::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+#if WITH_EDITOR
+    if (!bShowCameraBiomeOverlay || !GEditor || !GetWorld())
+    {
+        return;
+    }
+    CameraProbeUpdateAccumulator += DeltaSeconds;
+    if (CameraProbeUpdateAccumulator < 0.12)
+    {
+        return;
+    }
+    CameraProbeUpdateAccumulator = 0.0;
+
+    FViewport* ActiveViewport = GEditor->GetActiveViewport();
+    FEditorViewportClient* ViewportClient = ActiveViewport
+        ? static_cast<FEditorViewportClient*>(ActiveViewport->GetClient())
+        : nullptr;
+    if (!ViewportClient)
+    {
+        return;
+    }
+    const FVector CameraLocation = ViewportClient->GetViewLocation();
+    const FRotator CameraRotation = ViewportClient->GetViewRotation();
+    const FVector2D CameraXY(CameraLocation.X, CameraLocation.Y);
+    const UAvenorTerrainData* Asset = BakedTerrainData.LoadSynchronous();
+    if (!Asset || !Asset->HasValidData())
+    {
+        CameraBiomeStatus = TEXT("Avenor biome probe: no valid baked terrain data");
+        return;
+    }
+    if (CameraXY.X < Asset->WorldBounds.Min.X || CameraXY.X > Asset->WorldBounds.Max.X
+        || CameraXY.Y < Asset->WorldBounds.Min.Y || CameraXY.Y > Asset->WorldBounds.Max.Y)
+    {
+        CameraBiomeStatus = FString::Printf(
+            TEXT("Avenor biome probe | camera outside generated world | X %.2f km  Y %.2f km"),
+            CameraLocation.X / 100000.0,
+            CameraLocation.Y / 100000.0
+        );
+    }
+    else
+    {
+        FAvenorTerrainSample Sample;
+        if (Asset->SampleTerrain(CameraXY, Sample, CameraProbeChunkCache))
+        {
+            const EAvenorBiomeClass Biome = static_cast<EAvenorBiomeClass>(Sample.Biome);
+            const UEnum* BiomeEnum = StaticEnum<EAvenorBiomeClass>();
+            const FString BiomeName = BiomeEnum
+                ? BiomeEnum->GetDisplayNameTextByValue(static_cast<int64>(Biome)).ToString()
+                : TEXT("Unknown");
+            const TCHAR* TerrainClass = Sample.Mountain >= 0.45f
+                ? TEXT("Mountain")
+                : (Sample.Hill >= 0.40f ? TEXT("Hills/Upland")
+                : (Sample.Desert >= 0.45f ? TEXT("Arid terrain")
+                : TEXT("Lowland/Plains")));
+            CameraBiomeStatus = FString::Printf(
+                TEXT("AVENOR BIOME PROBE\\nBiome: %s   Terrain: %s\\nRegional climate: T %.2f  M %.2f   Local: T %.2f  M %.2f\\nElevation: %.0f m   Flow: %.1f km2   X %.2f km  Y %.2f km"),
+                *BiomeName,
+                TerrainClass,
+                Sample.MacroTemperature, Sample.MacroMoisture,
+                Sample.Temperature, Sample.Moisture,
+                Sample.Height / 100.0,
+                Sample.Accumulation,
+                CameraLocation.X / 100000.0,
+                CameraLocation.Y / 100000.0
+            );
+        }
+        else
+        {
+            CameraBiomeStatus = TEXT("Avenor biome probe: terrain sample unavailable");
+        }
+    }
+
+    const FVector TextLocation = CameraLocation
+        + CameraRotation.Vector() * 1400.0
+        + FVector(0.0, 0.0, 260.0);
+    DrawDebugString(
+        GetWorld(), TextLocation, CameraBiomeStatus,
+        nullptr, FColor::White, 0.16f, true, 1.15f
+    );
+#endif
+}
+
+void AAvenorStripTerrainGenerator::ResolveSettings()'''
+          s = one(s, ctor_end, overlay, 'camera overlay tick')
+          s = one(s,
+          '''    CachedData.Reset();
+    bTerrainPlanReadyForWater = false;
+    bRefinementPlanReadyForWater = false;''',
+          '''    CachedData.Reset();
+    CameraProbeChunkCache.Chunks.Reset();
+    CameraProbeChunkCache.RiverBounds.Reset();
+    CameraProbeChunkCache.LakeBounds.Reset();
+    bTerrainPlanReadyForWater = false;
+    bRefinementPlanReadyForWater = false;''', 'invalidate camera cache')
+          s = one(s,
+                  'static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }',
+                  'static FGuid Version() { return FGuid(TEXT("e77863a4-d1ba-48df-8aa9-e56249569130")); }', 'terrain DDC guid')
+
+          # Runtime chunk reader mirrors generator payload v6.
+          dc = one(dc, 'constexpr int32 TerrainChunkPayloadVersion = 5;',
+                   'constexpr int32 TerrainChunkPayloadVersion = 6;', 'runtime payload v6')
+          dc = one(dc,
+          '''    TArray<float> DiscardFloat;
+    TArray<int32> DiscardInt;
+    Archive << OutChunk.Height;''',
+          '''    TArray<float> DiscardFloat;
+    TArray<int32> DiscardInt;
+    Archive << OutChunk.Height;''', 'reader preamble')
+          dc = one(dc,
+          '''    Archive << DiscardInt;   // FillParent
+    Archive << DiscardInt;   // LakeIndex
+
+    OutChunk.StartCell = Chunk->StartCell;''',
+          '''    Archive << DiscardInt;   // FillParent
+    Archive << DiscardInt;   // LakeIndex
+    Archive << OutChunk.MacroTemperature;
+    Archive << OutChunk.MacroMoisture;
+    Archive << OutChunk.Temperature;
+    Archive << OutChunk.Moisture;
+    Archive << OutChunk.Biome;
+
+    OutChunk.StartCell = Chunk->StartCell;''', 'runtime climate read')
+          dc = one(dc,
+          '''        && OutChunk.Accumulation.Num() == Expected
+        && OutChunk.Slope.Num() == Expected;''',
+          '''        && OutChunk.Accumulation.Num() == Expected
+        && OutChunk.Slope.Num() == Expected
+        && OutChunk.MacroTemperature.Num() == Expected
+        && OutChunk.MacroMoisture.Num() == Expected
+        && OutChunk.Temperature.Num() == Expected
+        && OutChunk.Moisture.Num() == Expected
+        && OutChunk.Biome.Num() == Expected;''', 'runtime climate validation')
+          dc = one(dc,
+          '''        Value.Accumulation = SampleChunk->Accumulation[LocalIndex];
+        Value.Slope = SampleChunk->Slope[LocalIndex];
+        return true;''',
+          '''        Value.Accumulation = SampleChunk->Accumulation[LocalIndex];
+        Value.Slope = SampleChunk->Slope[LocalIndex];
+        Value.MacroTemperature = SampleChunk->MacroTemperature[LocalIndex];
+        Value.MacroMoisture = SampleChunk->MacroMoisture[LocalIndex];
+        Value.Temperature = SampleChunk->Temperature[LocalIndex];
+        Value.Moisture = SampleChunk->Moisture[LocalIndex];
+        Value.Biome = SampleChunk->Biome[LocalIndex];
+        return true;''', 'sample cell climate')
+          dc = one(dc,
+          '''    OutSample.Accumulation = Bilinear(S00.Accumulation, S10.Accumulation, S01.Accumulation, S11.Accumulation);
+    OutSample.Slope = Bilinear(S00.Slope, S10.Slope, S01.Slope, S11.Slope);
+    return true;''',
+          '''    OutSample.Accumulation = Bilinear(S00.Accumulation, S10.Accumulation, S01.Accumulation, S11.Accumulation);
+    OutSample.Slope = Bilinear(S00.Slope, S10.Slope, S01.Slope, S11.Slope);
+    OutSample.MacroTemperature = Bilinear(S00.MacroTemperature, S10.MacroTemperature, S01.MacroTemperature, S11.MacroTemperature);
+    OutSample.MacroMoisture = Bilinear(S00.MacroMoisture, S10.MacroMoisture, S01.MacroMoisture, S11.MacroMoisture);
+    OutSample.Temperature = Bilinear(S00.Temperature, S10.Temperature, S01.Temperature, S11.Temperature);
+    OutSample.Moisture = Bilinear(S00.Moisture, S10.Moisture, S01.Moisture, S11.Moisture);
+    const FAvenorTerrainSample& Nearest = AlphaY < 0.5f
+        ? (AlphaX < 0.5f ? S00 : S10)
+        : (AlphaX < 0.5f ? S01 : S11);
+    OutSample.Biome = Nearest.Biome;
+    return true;''', 'bilinear climate sample')
+
+          cpp.write_text(s, encoding='utf-8')
+          hdr.write_text(h, encoding='utf-8')
+          data_h.write_text(dh, encoding='utf-8')
+          data_cpp.write_text(dc, encoding='utf-8')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp \
+                  AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.h \
+                  AvenorClient/Source/Avenor/AvenorTerrainData.h \
+                  AvenorClient/Source/Avenor/AvenorTerrainData.cpp
+          git commit -m "Add broad climate provinces and editor biome probe"
+          git push
