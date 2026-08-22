@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 13;
+static constexpr int32 GeneratorAlgorithmVersion = 14;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1712,6 +1712,24 @@ static double DrainageSourceMultiplier(
         + AridSourcePenalty * 1.65;
 }
 
+// Geomorphic erosion preserves palaeodrainage more readily than the modern
+// river selector. Dry climates can therefore retain old canyons and valleys
+// after permanent surface flow has disappeared.
+static double ErosionDrainageSourceMultiplier(
+    const FAvenorStripData& Data,
+    int32 Cell
+)
+{
+    const double Active = DrainageSourceMultiplier(Data, Cell);
+    const double Desert = Data.DesertMask.IsValidIndex(Cell)
+        ? FMath::Clamp(Data.DesertMask[Cell], 0.0, 1.0) : 0.0;
+    return FMath::Lerp(
+        FMath::Min(Active, 1.85),
+        FMath::Min(Active, 1.20),
+        Desert
+    );
+}
+
 static void ApplyStreamPowerErosion(
     FAvenorStripData& Data,
     int32 Iterations,
@@ -1735,7 +1753,7 @@ static void ApplyStreamPowerErosion(
             const double MountainFraction = FMath::Clamp(Data.Slope[Cell] / 0.18, 0.0, 1.0);
             const double StreamStartArea = FMath::Lerp(
                 LowlandStartArea, MountainStartArea, MountainFraction
-            ) * DrainageSourceMultiplier(Data, Cell);
+            ) * ErosionDrainageSourceMultiplier(Data, Cell);
             if (Data.Accumulation[Cell] < StreamStartArea || Data.ReceiverA[Cell] == INDEX_NONE)
             {
                 continue;
@@ -1806,7 +1824,7 @@ static void EvolveTerrainFromDrainage(
             );
             const double StartArea = FMath::Lerp(
                 LowlandStartArea, MountainStartArea, ReliefClass
-            ) * DrainageSourceMultiplier(Data, Cell);
+            ) * ErosionDrainageSourceMultiplier(Data, Cell);
             const double AreaRatio = Data.Accumulation[Cell]
                 / FMath::Max(0.01, StartArea);
             const double ChannelPower = Smooth01(FMath::Clamp(
@@ -2601,6 +2619,75 @@ static void ConstrainMeandersToValley(
     }
 }
 
+// Smoothing is visual only: after it, project each interior point back toward
+// the local thalweg. On steep terrain this is deliberately strong so a river
+// cannot run sideways along a contour and force a canal-like shelf.
+static void ProjectRiverToLocalThalweg(
+    const FAvenorStripData& Data,
+    TArray<FVector>& Points
+)
+{
+    if (Points.Num() < 3)
+    {
+        return;
+    }
+    for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+    {
+        const FVector2D Previous(Points[Index - 1]);
+        const FVector2D Current(Points[Index]);
+        const FVector2D Next(Points[Index + 1]);
+        const FVector2D Tangent = (Next - Previous).GetSafeNormal();
+        if (Tangent.IsNearlyZero())
+        {
+            continue;
+        }
+        const FVector2D Normal = Rotate90(Tangent);
+        const double LocalSlope = Data.SampleGrid(Data.Slope, Current);
+        const double Steepness = Smooth01(FMath::Clamp(
+            (LocalSlope - 0.025) / 0.10, 0.0, 1.0
+        ));
+        const double SearchRadius = Data.CellSize
+            * FMath::Lerp(1.45, 0.75, Steepness);
+        FVector2D Best = Current;
+        double BestHeight = Data.SampleGrid(Data.Height, Current);
+        double BestScore = BestHeight;
+        for (int32 Step = -6; Step <= 6; ++Step)
+        {
+            if (Step == 0)
+            {
+                continue;
+            }
+            const double Offset = SearchRadius
+                * static_cast<double>(Step) / 6.0;
+            const FVector2D Candidate = Current + Normal * Offset;
+            if (!Data.Bounds.IsInside(
+                FVector(Candidate.X, Candidate.Y, Data.Bounds.GetCenter().Z)))
+            {
+                continue;
+            }
+            const double CandidateHeight = Data.SampleGrid(Data.Height, Candidate);
+            const double CandidateSlope = Data.SampleGrid(Data.Slope, Candidate);
+            const double UphillPenalty = FMath::Max(
+                0.0, CandidateHeight - BestHeight
+            ) * FMath::Lerp(0.6, 1.8, Steepness);
+            const double Score = CandidateHeight
+                + FMath::Abs(Offset) * 0.025
+                + CandidateSlope * Data.CellSize * 0.10
+                + UphillPenalty;
+            if (Score < BestScore - 25.0)
+            {
+                BestScore = Score;
+                BestHeight = CandidateHeight;
+                Best = Candidate;
+            }
+        }
+        const double Snap = FMath::Lerp(0.62, 0.95, Steepness);
+        Points[Index].X = FMath::Lerp(Current.X, Best.X, Snap);
+        Points[Index].Y = FMath::Lerp(Current.Y, Best.Y, Snap);
+        Points[Index].Z = BestHeight;
+    }
+}
+
 static void SuppressPathologicalMeanders(
     const TArray<FVector>& BasePoints,
     TArray<FVector>& Points,
@@ -3090,6 +3177,7 @@ static void ExtractRivers(
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
             false
         );
+        ProjectRiverToLocalThalweg(Data, Points);
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
@@ -3131,6 +3219,14 @@ static void ExtractRivers(
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
         River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
         River.ChannelSteepness = ChannelSteepness;
+        // Erosion formed the valley already. On steep ground the final Water
+        // Body modifier must stay close to the active channel, otherwise it
+        // manufactures a broad road-like bench on the hillside.
+        const double SteepValley = Smooth01(FMath::Clamp(
+            (MeanSlope - 0.025) / 0.10, 0.0, 1.0
+        ));
+        River.ValleyHalfWidth *= FMath::Lerp(1.0, 0.36, SteepValley);
+        River.ValleyDepth *= FMath::Lerp(1.0, 0.76, SteepValley);
         const double HumidValley = Smooth01(FMath::Clamp(
             (MeanMoisture - 0.48) / 0.42, 0.0, 1.0
         ));
@@ -3306,10 +3402,17 @@ static double EvaluateLandform(
             + FMath::Abs(static_cast<double>(Seed)) * 0.000217,
         PI
     );
+    const double SeedAngleC = FMath::Fmod(
+        SeedAngleB + 0.731
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000137,
+        PI
+    );
     const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
     const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AxisC(FMath::Cos(SeedAngleC), FMath::Sin(SeedAngleC));
     const FVector2D AcrossA = Rotate90(AxisA);
     const FVector2D AcrossB = Rotate90(AxisB);
+    const FVector2D AcrossC = Rotate90(AxisC);
 
     auto Oriented = [](const FVector2D& P,
                        const FVector2D& Along,
@@ -3348,13 +3451,13 @@ static double EvaluateLandform(
         4, 0.55, 2.07
     );
     const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.56) / 0.30,
+        (Province * 0.62 + Province2 * 0.38 - 0.59) / 0.29,
         0.0, 1.0
     ));
     const double HillProvince = Smooth01(FMath::Clamp(
-        (Province * 0.42 + Province2 * 0.58 - 0.30) / 0.46,
+        (Province * 0.42 + Province2 * 0.58 - 0.35) / 0.44,
         0.0, 1.0
-    )) * (1.0 - MountainProvince * 0.42);
+    )) * (1.0 - MountainProvince * 0.46);
     const double QuietProvince = FMath::Clamp(
         1.0 - MountainProvince * 0.70 - HillProvince * 0.46,
         0.0, 1.0
@@ -3367,14 +3470,34 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(1201.0, 331.0),
         5, 0.57, 2.0
     );
-    const double RegionalTilt = Fbm(
-        Oriented(Warped, StripAxis, StripAcross, 2.8, 0.9),
+    // Geology has no preferred relationship to the rectangular strip. The
+    // strip only crops a larger conceptual geological field; climate remains
+    // long-axis aware separately. Broad coordinate warps make structures bend,
+    // terminate and intersect instead of holding one mathematical bearing.
+    const FVector2D StructureWarp(
+        Fbm(Warped, Scale * 2.1,
+            SeedOffset + FVector2D(229.0, 1871.0), 3, 0.57, 2.0),
+        Fbm(Warped, Scale * 2.0,
+            SeedOffset + FVector2D(1619.0, 503.0), 3, 0.57, 2.0)
+    );
+    const FVector2D RegionalWarped = Warped + StructureWarp * Scale * 0.24;
+    const double RegionalA = Fbm(
+        Oriented(RegionalWarped, AxisC, AcrossC, 2.7, 0.95),
         Scale * 3.0,
         SeedOffset + FVector2D(149.0, 1267.0),
         4, 0.55, 2.0
     );
+    const double RegionalB = Fbm(
+        Oriented(RegionalWarped, AxisA, AcrossA, 2.2, 1.10),
+        Scale * 2.55,
+        SeedOffset + FVector2D(2011.0, 317.0),
+        4, 0.55, 2.03
+    );
+    const double RegionalStructure = FMath::Clamp(
+        RegionalA * 0.62 + RegionalB * 0.38, -1.0, 1.0
+    );
     const double Uplift = FMath::Clamp(
-        PlateField * 0.72 + RegionalTilt * 0.28,
+        PlateField * 0.72 + RegionalStructure * 0.28,
         -1.0, 1.0
     );
     const double PositiveUplift = Smooth01(FMath::Clamp(
@@ -3387,14 +3510,22 @@ static double EvaluateLandform(
     // Broad orogenic envelopes define where a range exists. Narrow ridge
     // noise is only allowed to sculpt the range by a modest amount, so it
     // cannot turn one sample into a kilometre-high needle.
+    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
+        Warped, Scale * 1.55,
+        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
+    ) * Scale * 0.24;
+    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
+        Warped, Scale * 1.35,
+        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
+    ) * Scale * 0.22;
     const double BeltA = RidgedFbm(
-        Oriented(Warped, AxisA, AcrossA, 4.2, 0.82),
+        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
         Scale * 0.95,
         SeedOffset + FVector2D(421.0, 719.0),
         5
     );
     const double BeltB = RidgedFbm(
-        Oriented(Warped, AxisB, AcrossB, 3.4, 0.90),
+        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
         Scale * 1.05,
         SeedOffset + FVector2D(877.0, 149.0),
         5
@@ -3402,11 +3533,26 @@ static double EvaluateLandform(
     const double BeltSignal = FMath::Clamp(
         BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
-    const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+    double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.48, 0.38, Activity)) / 0.40,
         0.0, 1.0
-    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+    )) * FMath::Lerp(0.42, 1.0, MountainProvince)
        * FMath::Lerp(0.70, 1.0, PositiveUplift);
+
+    // Discourage only the biggest summit cores immediately on the eventual
+    // central development corridor. This is a soft bias, not a flat trench:
+    // hills, passes, valleys and rivers remain free to cross the centre.
+    const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
+        ? Position.Y - Bounds.GetCenter().Y
+        : Position.X - Bounds.GetCenter().X;
+    const double SpineCoreHalfWidth = ShortExtent * 0.07;
+    const double SpineRecoveryWidth = ShortExtent * 0.18;
+    const double SpineRecovery = Smooth01(FMath::Clamp(
+        (FMath::Abs(AcrossCoordinate) - SpineCoreHalfWidth)
+            / FMath::Max(1.0, SpineRecoveryWidth),
+        0.0, 1.0
+    ));
+    BroadRange *= FMath::Lerp(0.45, 1.0, SpineRecovery);
 
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
@@ -3444,12 +3590,12 @@ static double EvaluateLandform(
         4, 0.52, 2.1
     );
     const double FoothillEnvelope = Smooth01(FMath::Clamp(
-        (BeltSignal - 0.34) / 0.38, 0.0, 1.0
+        (BeltSignal - 0.38) / 0.38, 0.0, 1.0
     )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
     const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
         (0.40 * UplandRidges
             + 0.40 * (0.5 + 0.5 * Rolling)
-            + 0.20 * Province2 - 0.33) / 0.46,
+            + 0.20 * Province2 - 0.38) / 0.44,
         0.0, 1.0
     ));
     OutHillMask = FMath::Clamp(
@@ -3501,8 +3647,18 @@ static double EvaluateLandform(
         0.0, 1.0
     );
 
-    double Height = Uplift * Relief * 0.075
-        + RegionalTilt * Relief * 0.025;
+    // Zero is a world datum, not a mountain-top datum. Broad ordinary country
+    // occupies a modest positive elevation range; mountains rise above it,
+    // while basins, rifts and drainage can cut below it.
+    const double RegionalElevation = Fbm(
+        RegionalWarped, Scale * 2.35,
+        SeedOffset + FVector2D(2273.0, 1291.0),
+        4, 0.56, 2.0
+    );
+    double Height = Relief * 0.060
+        + RegionalElevation * Relief * 0.080
+        + Uplift * Relief * 0.075
+        + RegionalStructure * Relief * 0.025;
 
     // Mountains occupy broad bases and are capped by the envelope. The
     // crest texture changes their profile by only +/- ~20 percent.
@@ -4163,7 +4319,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }
+    static FGuid Version() { return FGuid(TEXT("b96f4c24-6fb4-49c2-9e1e-7b43ef405e14")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
