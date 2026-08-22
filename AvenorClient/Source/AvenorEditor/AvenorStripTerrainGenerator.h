@@ -348,7 +348,11 @@ public:
     double MaximumValleyDepth = 14000.0;
     double LowlandMeanderStrength = 0.75;
     double FeatureSplinePointSpacing = 500.0;
-    int32 MaximumRiverReaches = 256;
+    // Do not truncate the extracted reach graph. River density and minimum
+    // catchment/length controls determine how much river exists; an arbitrary
+    // reach-count cap can retain tributaries while dropping their downstream
+    // trunk, producing impossible inland termini.
+    int32 MaximumRiverReaches = MAX_int32;
     bool bGenerateLakes = true;
     double MinimumLakeDepth = 1500.0;
     double MinimumLakeBedDepth = 500.0;
@@ -390,3 +394,47 @@ private:
     bool bDeferMeshRefresh = false;
     mutable bool bGeneratingGeography = false;
 };
+
+// The terrain implementation defines a local lambda named Oriented and uses it
+// only for geological structure. Redirect those calls through a deterministic
+// seed- and position-dependent rotation. This deliberately leaves LongAxis for
+// the macro climate system, while ridges, rifts and uplift no longer inherit
+// the rectangular strip's compass direction. The low-frequency bend prevents
+// an otherwise realistic range from staying ruler-straight for tens of km.
+namespace UE::Avenor::Strip::StructuralOrientation
+{
+static FORCEINLINE FVector2D RotateAxis(
+    const FVector2D& Axis,
+    int32 Seed,
+    const FVector2D& Position,
+    double StructuralScale
+)
+{
+    const double SafeScale = FMath::Max(250000.0, StructuralScale);
+    const double SeedAngle = FMath::Fmod(
+        FMath::Abs(static_cast<double>(Seed)) * 0.000827 + 0.617,
+        PI
+    );
+    const double Bend =
+        FMath::Sin((Position.X + Position.Y * 0.61
+            + static_cast<double>(Seed) * 173.0) / (SafeScale * 1.65)) * 0.20
+        + FMath::Sin((Position.Y - Position.X * 0.37
+            - static_cast<double>(Seed) * 97.0) / (SafeScale * 2.75)) * 0.11;
+    const double Angle = SeedAngle + Bend;
+    const double C = FMath::Cos(Angle);
+    const double S = FMath::Sin(Angle);
+    return FVector2D(
+        Axis.X * C - Axis.Y * S,
+        Axis.X * S + Axis.Y * C
+    );
+}
+}
+
+#define Oriented(P, Along, Across, AlongStretch, AcrossStretch) \
+    Oriented( \
+        (P), \
+        UE::Avenor::Strip::StructuralOrientation::RotateAxis( \
+            (Along), Seed, Position, Scale), \
+        UE::Avenor::Strip::StructuralOrientation::RotateAxis( \
+            (Across), Seed, Position, Scale), \
+        (AlongStretch), (AcrossStretch))
