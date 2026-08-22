@@ -3264,10 +3264,10 @@ static double EvaluateLandform(
         BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
     const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40,
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
         0.0, 1.0
-    )) * FMath::Lerp(0.30, 1.0, MountainProvince)
-       * FMath::Lerp(0.62, 1.0, PositiveUplift);
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift);
 
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
@@ -3280,10 +3280,10 @@ static double EvaluateLandform(
         4, 0.54, 2.07
     );
     const double CrestShape = FMath::Clamp(
-        0.82
-            + (CrestRidges - 0.50) * 0.22
-            + (CrestVariation - 0.50) * 0.16,
-        0.68, 1.04
+        0.88
+            + (CrestRidges - 0.50) * 0.16
+            + (CrestVariation - 0.50) * 0.12,
+        0.76, 1.03
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3369,12 +3369,12 @@ static double EvaluateLandform(
     // crest texture changes their profile by only +/- ~20 percent.
     const double MountainHeight = Smooth01(OutMountainMask);
     Height += MountainHeight * Relief
-        * FMath::Lerp(0.36, 0.60, Activity)
+        * FMath::Lerp(0.54, 0.82, Activity)
         * CrestShape;
 
     // Foothills and hill country are deliberately much lower than mountains.
-    Height += FoothillEnvelope * Relief * 0.14
-        * (0.74 + UplandRidges * 0.26);
+    Height += FoothillEnvelope * Relief * 0.18
+        * (0.72 + UplandRidges * 0.28);
     Height += IndependentHills * Relief * (
         0.050
         + (0.5 + 0.5 * Rolling) * 0.052
@@ -4023,7 +4023,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }
+    static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
