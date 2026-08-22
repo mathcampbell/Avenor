@@ -6,7 +6,6 @@ permissions:
   contents: write
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +18,9 @@ jobs:
           from pathlib import Path
           p=Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
           s=p.read_text(encoding='utf-8')
+          if 'static constexpr int32 GeneratorAlgorithmVersion = 14;' in s:
+              print('v14 already applied')
+              raise SystemExit(0)
           def one(old,new,label):
               global s
               if old not in s:
@@ -166,6 +168,10 @@ jobs:
 
           p.write_text(s, encoding='utf-8')
           PY
+          if git diff --quiet; then
+            echo "No terrain changes required"
+            exit 0
+          fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
