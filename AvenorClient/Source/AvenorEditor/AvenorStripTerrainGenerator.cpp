@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 11;
+static constexpr int32 GeneratorAlgorithmVersion = 12;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3199,25 +3199,25 @@ static double EvaluateLandform(
     // uplands and active mountain belts; it prevents ruggedness from
     // saturating the whole strip.
     const double Province = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 2.8,
+        Warped, Scale * 1.55,
         SeedOffset + FVector2D(1901.0, 331.0),
         4, 0.57, 2.0
     );
     const double Province2 = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 2.1,
+        Warped, Scale * 1.15,
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
     const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.70 + Province2 * 0.30 - 0.64) / 0.24,
+        (Province * 0.62 + Province2 * 0.38 - 0.56) / 0.30,
         0.0, 1.0
     ));
     const double HillProvince = Smooth01(FMath::Clamp(
-        (Province * 0.46 + Province2 * 0.54 - 0.37) / 0.34,
+        (Province * 0.42 + Province2 * 0.58 - 0.30) / 0.46,
         0.0, 1.0
-    )) * (1.0 - MountainProvince * 0.72);
+    )) * (1.0 - MountainProvince * 0.42);
     const double QuietProvince = FMath::Clamp(
-        1.0 - MountainProvince * 0.90 - HillProvince * 0.58,
+        1.0 - MountainProvince * 0.70 - HillProvince * 0.46,
         0.0, 1.0
     );
 
@@ -3264,10 +3264,10 @@ static double EvaluateLandform(
         BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
     const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.54, 0.46, Activity)) / 0.34,
+        (BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40,
         0.0, 1.0
-    )) * MountainProvince
-       * FMath::Lerp(0.58, 1.0, PositiveUplift);
+    )) * FMath::Lerp(0.30, 1.0, MountainProvince)
+       * FMath::Lerp(0.62, 1.0, PositiveUplift);
 
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
@@ -3280,10 +3280,10 @@ static double EvaluateLandform(
         4, 0.54, 2.07
     );
     const double CrestShape = FMath::Clamp(
-        0.78
-            + (CrestRidges - 0.50) * 0.30
-            + (CrestVariation - 0.50) * 0.20,
-        0.62, 1.12
+        0.82
+            + (CrestRidges - 0.50) * 0.22
+            + (CrestVariation - 0.50) * 0.16,
+        0.68, 1.04
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3308,9 +3308,9 @@ static double EvaluateLandform(
         (BeltSignal - 0.34) / 0.38, 0.0, 1.0
     )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
     const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
-        (0.48 * UplandRidges
-            + 0.34 * (0.5 + 0.5 * Rolling)
-            + 0.18 * Province2 - 0.42) / 0.34,
+        (0.40 * UplandRidges
+            + 0.40 * (0.5 + 0.5 * Rolling)
+            + 0.20 * Province2 - 0.33) / 0.46,
         0.0, 1.0
     ));
     OutHillMask = FMath::Clamp(
@@ -3369,16 +3369,17 @@ static double EvaluateLandform(
     // crest texture changes their profile by only +/- ~20 percent.
     const double MountainHeight = Smooth01(OutMountainMask);
     Height += MountainHeight * Relief
-        * FMath::Lerp(0.42, 0.72, Activity)
+        * FMath::Lerp(0.36, 0.60, Activity)
         * CrestShape;
 
     // Foothills and hill country are deliberately much lower than mountains.
-    Height += FoothillEnvelope * Relief * 0.11
-        * (0.72 + UplandRidges * 0.28);
+    Height += FoothillEnvelope * Relief * 0.14
+        * (0.74 + UplandRidges * 0.26);
     Height += IndependentHills * Relief * (
-        Rolling * 0.055
-        + (UplandRidges - 0.48) * 0.070
-        + HillDetail * 0.025
+        0.050
+        + (0.5 + 0.5 * Rolling) * 0.052
+        + UplandRidges * 0.040
+        + HillDetail * 0.016
     );
 
     // Rift floors and basins provide the large negative landforms needed
@@ -3401,8 +3402,8 @@ static double EvaluateLandform(
         4
     );
     Height += OutPlainsMask * Relief * (
-        PlainRoll * 0.018
-        + (PlainRidges - 0.46) * 0.012
+        PlainRoll * 0.024
+        + (PlainRidges - 0.46) * 0.016
     );
 
     const double Warmth = bClimateEnabled
@@ -4022,7 +4023,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("0d67db9f-1539-4d60-8fba-269d8d459e61")); }
+    static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
