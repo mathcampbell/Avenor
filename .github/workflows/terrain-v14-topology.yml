@@ -2,10 +2,13 @@ name: Apply terrain v14 topology
 on:
   push:
     branches: [main]
+  issues:
+    types: [opened]
 permissions:
   contents: write
 jobs:
   apply:
+    if: github.event_name == 'push' || github.event.issue.title == 'APPLY TERRAIN V14 TOPOLOGY'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -282,27 +285,6 @@ jobs:
 
           if s != original:
               p.write_text(s, encoding='utf-8')
-
-          # Keep the generated water surface clear of the broad terrain mesh.
-          # Previously lake ground was exactly coplanar with the water datum at
-          # the shoreline, which could leave a valid lake actor visually buried.
-          td = Path('AvenorClient/Source/Avenor/AvenorTerrainData.cpp')
-          t = td.read_text(encoding='utf-8')
-          old = '''            const float LakeGroundZ = static_cast<float>(
-                Lake.SurfaceHeight - BedDepth * DepthAlpha
-            );'''
-          new = '''            const double MinimumWaterClearance = FMath::Clamp(
-                BedDepth * 0.04, 50.0, 125.0
-            );
-            const float LakeGroundZ = static_cast<float>(
-                Lake.SurfaceHeight - MinimumWaterClearance
-                    - BedDepth * DepthAlpha
-            );'''
-          if old in t:
-              t = t.replace(old, new, 1)
-              td.write_text(t, encoding='utf-8')
-          elif new not in t:
-              raise RuntimeError('missing lake water-clearance target')
           PY
           if git diff --quiet; then
             echo "terrain v14 already applied"
@@ -310,6 +292,6 @@ jobs:
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp AvenorClient/Source/Avenor/AvenorTerrainData.cpp
-          git commit -m "Decouple geology preserve river continuity and expose lakes"
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Decouple geology and preserve river continuity"
           git push
