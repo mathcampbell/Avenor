@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -17,8 +19,9 @@ jobs:
           s=p.read_text()
           start=s.find('    // Arid climate exposes and flattens resistant uplands into mesas and')
           end=s.find('    // Dunes remain low-amplitude regional terrain on quiet arid plains.',start)
-          if start<0 or end<0: raise RuntimeError('mesa block not found')
-          s=s[:start]+'''    // Lithology is independent from shape. Drainage and differential erosion
+          if start < 0 or end < 0:
+              raise SystemExit('mesa markers missing')
+          block='''    // Lithology is independent from shape. Drainage and differential erosion
     // strip weak arid uplands while resistant caps survive, so mesas,
     // escarpments and canyon rims emerge instead of being height stamps.
     const double Lithology = 0.5 + 0.5 * Fbm(
@@ -30,27 +33,12 @@ jobs:
         * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
-'''+s[end:]
-          old='const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - PlateauMask * 0.90)'
-          if old not in s: raise RuntimeError('dune dependency')
-          s=s.replace(old,'const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - ResistantCap * 0.85)',1)
-          old='''    OutResistance = FMath::Clamp(
-        OutMountainMask * 0.28
-            + OutHillMask * 0.11
-            + OutDesertMask * (0.18 + PlateauMask * 0.38)
-            + RiftShoulder * 0.10,
-        0.0, 1.0
-    );'''
-          new='''    OutResistance = FMath::Clamp(
-        OutMountainMask * 0.24
-            + OutHillMask * 0.09
-            + OutDesertMask * 0.10
-            + ResistantCap * 0.62
-            + RiftShoulder * 0.10,
-        0.0, 1.0
-    );'''
-          if old not in s: raise RuntimeError('resistance block')
-          s=s.replace(old,new,1)
+'''
+          s=s[:start]+block+s[end:]
+          s=s.replace('(1.0 - PlateauMask * 0.90)','(1.0 - ResistantCap * 0.85)',1)
+          s=s.replace('OutMountainMask * 0.28','OutMountainMask * 0.24',1)
+          s=s.replace('+ OutHillMask * 0.11','+ OutHillMask * 0.09',1)
+          s=s.replace('+ OutDesertMask * (0.18 + PlateauMask * 0.38)','+ OutDesertMask * 0.10\n            + ResistantCap * 0.62',1)
           p.write_text(s)
           PY
           git config user.name github-actions[bot]
