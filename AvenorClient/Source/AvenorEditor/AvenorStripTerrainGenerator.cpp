@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 15;
+static constexpr int32 GeneratorAlgorithmVersion = 16;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3149,8 +3149,10 @@ static void ExtractRivers(
         // Hydrological receiver cells are the authoritative route. On steeper
         // reaches, smoothing is suppressed so the visual spline cannot cut
         // sideways across the valley wall.
-        const int32 InitialSmoothIterations = MeanSlope > 0.035 ? 0 : 1;
-        Points = ChaikinSmooth(Points, false, InitialSmoothIterations);
+        // Always round the raw drainage-grid corners once. The valley
+        // constraint below remains authoritative and prevents the curve from
+        // escaping onto a hillside.
+        Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
         const double ValleyFreedom = FMath::Clamp(
@@ -3176,9 +3178,25 @@ static void ExtractRivers(
         SuppressPathologicalMeanders(
             BaseMeanderPoints, Points, Data.CellSize
         );
+        const TArray<FVector> PreFinalSmoothPoints = Points;
         const int32 FinalSmoothIterations = MeanSlope > 0.035
-            ? 0 : (MeanSlope > 0.018 ? 1 : 2);
+            ? 1 : (MeanSlope > 0.018 ? 1 : 2);
         Points = ChaikinSmooth(Points, false, FinalSmoothIterations);
+        // Chaikin changes the point count, so resample both lines to a common
+        // count before applying the same terrain-rise constraint used for
+        // meanders. This removes cell-grid sawteeth without reintroducing the
+        // old cross-slope/canal regression.
+        TArray<FVector> FinalConstraintBase = ResamplePolyline(
+            PreFinalSmoothPoints, Data.CellSize * 0.70, false
+        );
+        Points = ResamplePolyline(Points, Data.CellSize * 0.70, false);
+        if (FinalConstraintBase.Num() == Points.Num())
+        {
+            ConstrainMeandersToValley(
+                Data, FinalConstraintBase, Points,
+                FMath::Clamp(LowlandFraction * 0.65, 0.0, 1.0)
+            );
+        }
         Points = ResamplePolyline(
             Points,
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
@@ -3455,7 +3473,7 @@ static double EvaluateLandform(
         4, 0.55, 2.07
     );
     const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.59) / 0.29,
+        (Province * 0.62 + Province2 * 0.38 - 0.55) / 0.31,
         0.0, 1.0
     ));
     const double HillProvince = Smooth01(FMath::Clamp(
@@ -3529,10 +3547,10 @@ static double EvaluateLandform(
         BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
     double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.48, 0.38, Activity)) / 0.40,
+        (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
         0.0, 1.0
-    )) * FMath::Lerp(0.42, 1.0, MountainProvince)
-       * FMath::Lerp(0.70, 1.0, PositiveUplift);
+    )) * FMath::Lerp(0.50, 1.0, MountainProvince)
+       * FMath::Lerp(0.68, 1.0, PositiveUplift);
 
     const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
         ? Position.Y - Bounds.GetCenter().Y
@@ -3646,8 +3664,12 @@ static double EvaluateLandform(
         + RegionalStructure * Relief * 0.025;
 
     const double MountainHeight = Smooth01(OutMountainMask);
-    Height += MountainHeight * Relief
-        * FMath::Lerp(0.54, 0.82, Activity)
+    // Strong coherent uplift accelerates non-linearly so true mountain belts
+    // can reach kilometre-scale relief without lifting quiet plains with them.
+    const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
+    Height += MountainRelief * Relief
+        * FMath::Lerp(0.72, 1.12, Activity)
+        * FMath::Lerp(0.82, 1.72, MountainRelief)
         * CrestShape;
 
     Height += FoothillEnvelope * Relief * 0.18
@@ -3899,21 +3921,31 @@ static void ApplyTerrainClimate(
     }
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
+        // Always derive local climate from the regional baseline so this pass
+        // can safely be repeated after erosion reshapes the final surface.
+        const double RegionalTemperature = Data.MacroTemperature.IsValidIndex(Cell)
+            ? Data.MacroTemperature[Cell] : Data.Temperature[Cell];
+        const double RegionalMoisture = Data.MacroMoisture.IsValidIndex(Cell)
+            ? Data.MacroMoisture[Cell] : Data.Moisture[Cell];
+        const double ElevationMetres = FMath::Max(0.0, Data.Height[Cell]) / 100.0;
         const double ElevationFraction = FMath::Clamp(
-            FMath::Max(0.0, Data.Height[Cell]) / 300000.0,
-            0.0, 1.25
+            ElevationMetres / 3000.0, 0.0, 1.5
         );
         const double MountainExposure = FMath::Clamp(
             Data.MountainMask[Cell], 0.0, 1.0
         );
+        // Roughly lapse-rate-like cooling: modest on foothills, substantial on
+        // kilometre-scale massifs. Final biome classification below determines
+        // the snowline from the resulting temperature rather than a fixed Z.
         Data.Temperature[Cell] = FMath::Clamp(
-            Data.Temperature[Cell] - ElevationFraction * 0.38,
+            RegionalTemperature - ElevationFraction * 0.46
+                - MountainExposure * ElevationFraction * 0.05,
             0.0, 1.0
         );
         Data.Moisture[Cell] = FMath::Clamp(
-            Data.Moisture[Cell]
-                - ElevationFraction * 0.12
-                - MountainExposure * 0.04,
+            RegionalMoisture
+                - ElevationFraction * 0.11
+                - MountainExposure * 0.035,
             0.0, 1.0
         );
         Data.Runoff[Cell] = FMath::Clamp(
@@ -3922,6 +3954,80 @@ static void ApplyTerrainClimate(
             0.08, 1.75
         );
     }
+}
+
+// Reinterpret the structural masks from the surface that actually survives
+// erosion. This is deliberately continuous: it does not place mountains. It
+// recognises mountain/upland morphology from prominence, relief, slope and the
+// underlying structural support after valleys, rifts and drainage are carved.
+static void ReclassifyFinalLandforms(FAvenorStripData& Data)
+{
+    const int32 CellCount = Data.Columns * Data.Rows;
+    if (CellCount <= 0)
+    {
+        return;
+    }
+    TArray<double> NewMountain;
+    TArray<double> NewHill;
+    TArray<double> NewPlains;
+    NewMountain.SetNumUninitialized(CellCount);
+    NewHill.SetNumUninitialized(CellCount);
+    NewPlains.SetNumUninitialized(CellCount);
+    const double Radius = FMath::Max(100000.0, Data.CellSize * 24.0);
+    static const FVector2D Directions[] = {
+        FVector2D(1,0), FVector2D(-1,0), FVector2D(0,1), FVector2D(0,-1),
+        FVector2D(0.70710678,0.70710678), FVector2D(-0.70710678,0.70710678),
+        FVector2D(0.70710678,-0.70710678), FVector2D(-0.70710678,-0.70710678)
+    };
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const FVector2D Position = Data.CellPosition(Cell);
+        const double Height = Data.Height[Cell];
+        double LocalMin = Height;
+        double LocalMax = Height;
+        for (const FVector2D& Direction : Directions)
+        {
+            for (double Scale : {0.45, 1.0})
+            {
+                const FVector2D SamplePosition = Position + Direction * Radius * Scale;
+                const double SampleHeight = Data.SampleGrid(Data.Height, SamplePosition);
+                LocalMin = FMath::Min(LocalMin, SampleHeight);
+                LocalMax = FMath::Max(LocalMax, SampleHeight);
+            }
+        }
+        const double Prominence = FMath::Max(0.0, Height - LocalMin);
+        const double Relief = FMath::Max(0.0, LocalMax - LocalMin);
+        const double ProminenceFactor = Smooth01(FMath::Clamp(
+            (Prominence - 25000.0) / 105000.0, 0.0, 1.0));
+        const double ReliefFactor = Smooth01(FMath::Clamp(
+            (Relief - 40000.0) / 125000.0, 0.0, 1.0));
+        const double ElevationFactor = Smooth01(FMath::Clamp(
+            (Height - 55000.0) / 145000.0, 0.0, 1.0));
+        const double SlopeFactor = Smooth01(FMath::Clamp(
+            (Data.Slope[Cell] - 0.018) / 0.12, 0.0, 1.0));
+        const double StructuralMountain = FMath::Clamp(Data.MountainMask[Cell], 0.0, 1.0);
+        const double StructuralHill = FMath::Clamp(Data.HillMask[Cell], 0.0, 1.0);
+        const double EmergentMountain = ProminenceFactor * ReliefFactor
+            * FMath::Lerp(0.62, 1.0, FMath::Max(ElevationFactor, SlopeFactor));
+        const double Mountain = FMath::Clamp(FMath::Max(
+            StructuralMountain * FMath::Lerp(0.58, 1.0, ReliefFactor),
+            EmergentMountain
+        ), 0.0, 1.0);
+        const double HillRelief = Smooth01(FMath::Clamp(
+            (Relief - 12000.0) / 65000.0, 0.0, 1.0));
+        const double HillProminence = Smooth01(FMath::Clamp(
+            (Prominence - 8000.0) / 52000.0, 0.0, 1.0));
+        const double Hill = FMath::Clamp(FMath::Max(
+            StructuralHill * 0.72, HillRelief * HillProminence * 0.92
+        ) * (1.0 - Mountain * 0.78), 0.0, 1.0);
+        NewMountain[Cell] = Mountain;
+        NewHill[Cell] = Hill;
+        NewPlains[Cell] = FMath::Clamp(
+            1.0 - Mountain * 0.95 - Hill * 0.72, 0.0, 1.0);
+    }
+    Data.MountainMask = MoveTemp(NewMountain);
+    Data.HillMask = MoveTemp(NewHill);
+    Data.PlainsMask = MoveTemp(NewPlains);
 }
 
 static void RefineClimateFromHydrology(
@@ -4019,13 +4125,16 @@ static void RefineClimateFromHydrology(
 
         EAvenorBiomeClass Biome = EAvenorBiomeClass::TemperateMoist;
         const double Temperature = Data.Temperature[Cell];
-        if (Temperature < 0.075
-            && Data.MountainMask[Cell] > 0.2)
+        const double FinalMountain = FMath::Clamp(
+            Data.MountainMask[Cell], 0.0, 1.0
+        );
+        const double ElevationMetres = FMath::Max(0.0, Data.Height[Cell]) / 100.0;
+        const bool bHighTerrain = FinalMountain > 0.28 || ElevationMetres > 1400.0;
+        if (Temperature < 0.105 && bHighTerrain)
         {
             Biome = EAvenorBiomeClass::SnowIce;
         }
-        else if (Temperature < 0.19
-            && Data.MountainMask[Cell] > 0.3)
+        else if (Temperature < 0.32 && bHighTerrain)
         {
             Biome = EAvenorBiomeClass::AlpineTundra;
         }
@@ -4146,6 +4255,12 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     );
     PriorityFlood(*Data, Generator.DrainageEpsilon);
     BuildContinuousFlow(*Data);
+
+    // Erosion is now authoritative for the final landform identity. Rebuild
+    // mountain/hill/plains masks from the surviving surface, then reapply the
+    // regional climate so altitude and final relief drive alpine transitions.
+    ReclassifyFinalLandforms(*Data);
+    ApplyTerrainClimate(*Data, Generator);
 
     TArray<bool> AuthoritativeRiverNetwork;
     if (Generator.bGenerateRivers)
@@ -4290,7 +4405,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("5e0174a3-4ad9-4bb1-9f8e-71e5079ce9c2")); }
+    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8ae")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
