@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 12;
+static constexpr int32 GeneratorAlgorithmVersion = 13;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
