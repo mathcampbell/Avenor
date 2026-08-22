@@ -1,14 +1,15 @@
 name: Apply river regression source patch
 
 on:
-  push:
-    branches: [main]
+  issues:
+    types: [opened]
 
 permissions:
   contents: write
 
 jobs:
   patch:
+    if: github.event.issue.title == 'APPLY RIVER FIX NOW'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +59,6 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
-          git rm -f .github/workflows/apply-river-fix.yml
+          git rm -f .github/workflows/apply-river-fix.yml .river-fix-trigger
           git commit -m "Fix river spline regression and excessive channel carving"
           git push origin main
