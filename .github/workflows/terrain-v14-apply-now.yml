@@ -2,14 +2,14 @@ name: Apply terrain v14 now
 
 on:
   issues:
-    types: [opened]
+    types: [edited]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event.issue.title == 'RUN TERRAIN V14 APPLY'
+    if: github.event.issue.title == 'RUN TERRAIN V14 PATCH'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -291,6 +291,7 @@ static void ProjectRiverToLocalThalweg(
           git rm -f .github/workflows/terrain-v14-apply-now.yml \
                     .github/workflows/terrain-v14-issue-runner.yml \
                     .github/workflows/terrain-v14-rivers-probe.yml \
-                    .github/workflows/terrain-v14-scheduled-runner.yml
+                    .github/workflows/terrain-v14-scheduled-runner.yml \
+                    .github/workflows/terrain-v14-push-runner.yml
           git commit -m "Fix terrain relief, palaeodrainage and river routing"
           git push origin main
