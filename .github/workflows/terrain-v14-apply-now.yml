@@ -1,15 +1,15 @@
 name: Apply terrain v14 now
 
 on:
-  issues:
-    types: [edited]
+  pull_request:
+    types: [opened]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event.issue.title == 'RUN TERRAIN V14 PATCH'
+    if: github.event.pull_request.title == 'RUN TERRAIN V14 PATCH'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
