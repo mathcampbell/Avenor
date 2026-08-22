@@ -1757,6 +1757,145 @@ static void ApplyStreamPowerErosion(
     BuildContinuousFlow(Data);
 }
 
+// Evolve structural terrain through its drainage network before final water
+// features are selected. Weak terrain develops broad valleys; resistant arid
+// uplands concentrate incision and survive as canyon rims and residual mesas.
+static void EvolveTerrainFromDrainage(
+    FAvenorStripData& Data,
+    int32 Passes,
+    double Strength,
+    double MountainStartArea,
+    double LowlandStartArea,
+    double Epsilon,
+    double ResistanceStrength
+)
+{
+    if (Passes <= 0 || Strength <= 0.0 || Data.Height.Num() == 0)
+    {
+        return;
+    }
+    const bool bUseResistance = Data.Resistance.Num() == Data.Height.Num();
+    const double EffectiveResistance = FMath::Clamp(ResistanceStrength, 0.0, 1.5);
+    for (int32 Pass = 0; Pass < Passes; ++Pass)
+    {
+        PriorityFlood(Data, Epsilon);
+        BuildContinuousFlow(Data);
+        TArray<double> Delta;
+        Delta.Init(0.0, Data.Height.Num());
+
+        for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+        {
+            const int32 X = Cell % Data.Columns;
+            const int32 Y = Cell / Data.Columns;
+            if (Data.IsBoundary(X, Y))
+            {
+                continue;
+            }
+
+            const double Mountain = Data.MountainMask.IsValidIndex(Cell)
+                ? Data.MountainMask[Cell] : 0.0;
+            const double Hill = Data.HillMask.IsValidIndex(Cell)
+                ? Data.HillMask[Cell] : 0.0;
+            const double Desert = Data.DesertMask.IsValidIndex(Cell)
+                ? Data.DesertMask[Cell] : 0.0;
+            const double Resistance = bUseResistance
+                ? FMath::Clamp(Data.Resistance[Cell] * EffectiveResistance, 0.0, 0.94)
+                : 0.0;
+            const double ReliefClass = FMath::Clamp(
+                FMath::Max(Mountain, Hill * 0.72), 0.0, 1.0
+            );
+            const double StartArea = FMath::Lerp(
+                LowlandStartArea, MountainStartArea, ReliefClass
+            ) * DrainageSourceMultiplier(Data, Cell);
+            const double AreaRatio = Data.Accumulation[Cell]
+                / FMath::Max(0.01, StartArea);
+            const double ChannelPower = Smooth01(FMath::Clamp(
+                FMath::Loge(1.0 + FMath::Max(0.0, AreaRatio)) / FMath::Loge(9.0),
+                0.0, 1.0
+            ));
+            const double Slope = FMath::Clamp(Data.Slope[Cell], 0.0, 0.8);
+
+            // Differential weathering creates residual mesa/escarpment terrain.
+            const double Upland = FMath::Clamp(Hill + Mountain * 0.35, 0.0, 1.0);
+            Delta[Cell] -= Desert * Upland * (1.0 - Resistance)
+                * Strength * Data.CellSize * 0.006
+                * (0.35 + FMath::Clamp(Slope / 0.10, 0.0, 1.0));
+
+            if (ChannelPower <= 0.0 || Data.ReceiverA[Cell] == INDEX_NONE)
+            {
+                continue;
+            }
+
+            const double CanyonSuitability = Desert
+                * Smooth01(FMath::Clamp((Resistance - 0.22) / 0.55, 0.0, 1.0))
+                * FMath::Clamp(Hill + Mountain * 0.55, 0.0, 1.0);
+            const double Incision = Strength * Data.CellSize
+                * FMath::Lerp(0.035, 0.085, CanyonSuitability)
+                * ChannelPower
+                * (0.45 + FMath::Clamp(Slope / 0.09, 0.0, 1.0) * 0.55)
+                * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability);
+            Delta[Cell] -= Incision;
+
+            // Large streams in weak/wet terrain broaden valleys. Resistant arid
+            // terrain suppresses that widening, producing narrower canyon forms.
+            const double BroadValley = ChannelPower * (1.0 - CanyonSuitability)
+                * (1.0 - Resistance * 0.78);
+            if (BroadValley > 0.02)
+            {
+                const int32 Radius = ChannelPower > 0.72
+                    ? 3 : (ChannelPower > 0.42 ? 2 : 1);
+                for (int32 DY = -Radius; DY <= Radius; ++DY)
+                {
+                    for (int32 DX = -Radius; DX <= Radius; ++DX)
+                    {
+                        if (DX == 0 && DY == 0)
+                        {
+                            continue;
+                        }
+                        const int32 NX = X + DX;
+                        const int32 NY = Y + DY;
+                        if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY))
+                        {
+                            continue;
+                        }
+                        const double Distance = FMath::Sqrt(
+                            static_cast<double>(DX * DX + DY * DY)
+                        );
+                        if (Distance > static_cast<double>(Radius) + 0.15)
+                        {
+                            continue;
+                        }
+                        const int32 Neighbor = Data.Index(NX, NY);
+                        const double NeighborResistance = bUseResistance
+                            ? FMath::Clamp(
+                                Data.Resistance[Neighbor] * EffectiveResistance,
+                                0.0, 0.94
+                            ) : 0.0;
+                        const double Falloff = 1.0
+                            - Distance / (static_cast<double>(Radius) + 0.75);
+                        Delta[Neighbor] -= FMath::Max(
+                            0.0,
+                            Incision * BroadValley * Falloff
+                                * (1.0 - NeighborResistance * 0.82) * 0.46
+                        );
+                    }
+                }
+            }
+        }
+
+        const double MaximumPassChange = Data.CellSize * 0.12;
+        for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+        {
+            Data.Height[Cell] += FMath::Clamp(
+                Delta[Cell], -MaximumPassChange, MaximumPassChange
+            );
+        }
+    }
+
+    PriorityFlood(Data, Epsilon);
+    BuildContinuousFlow(Data);
+}
+
 static int32 PrimaryReceiver(const FAvenorStripData& Data, int32 Cell)
 {
     if (Cell == INDEX_NONE)
@@ -3864,6 +4003,22 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea, Generator.DrainageEpsilon,
         Generator.ErosionResistanceStrength
     );
+
+    // Recompute drainage while erosion reshapes the terrain, then select final
+    // rivers/lakes from the evolved surface rather than the initial noise field.
+    EvolveTerrainFromDrainage(
+        *Data, FMath::Clamp(Generator.StreamPowerIterations / 2 + 1, 2, 6),
+        Generator.StreamPowerStrength,
+        Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea,
+        Generator.DrainageEpsilon, Generator.ErosionResistanceStrength
+    );
+    ApplyThermalErosion(
+        *Data, FMath::Clamp(Generator.ThermalErosionIterations / 3, 1, 4),
+        Generator.ThermalErosionStrength * 0.32,
+        Generator.TalusAngleDegrees, Generator.ErosionResistanceStrength
+    );
+    PriorityFlood(*Data, Generator.DrainageEpsilon);
+    BuildContinuousFlow(*Data);
 
     TArray<bool> AuthoritativeRiverNetwork;
     if (Generator.bGenerateRivers)
