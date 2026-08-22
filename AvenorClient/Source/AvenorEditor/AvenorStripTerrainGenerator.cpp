@@ -610,7 +610,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 14;
+static constexpr int32 GeneratorAlgorithmVersion = 15;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2619,9 +2619,10 @@ static void ConstrainMeandersToValley(
     }
 }
 
-// Smoothing is visual only: after it, project each interior point back toward
-// the local thalweg. On steep terrain this is deliberately strong so a river
-// cannot run sideways along a contour and force a canal-like shelf.
+// Kept for source compatibility with earlier generated data. New river extraction
+// no longer calls this per-point lateral snap because independently choosing a
+// local low point on each sample could alternate sides of a valley and produce
+// zig-zagging/crossing water splines.
 static void ProjectRiverToLocalThalweg(
     const FAvenorStripData& Data,
     TArray<FVector>& Points
@@ -3145,7 +3146,11 @@ static void ExtractRivers(
         const int32 EndCell = CandidateReach.Cells.Last();
         const double Area = Data.Accumulation[EndCell];
         const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
-        Points = ChaikinSmooth(Points, false, 1);
+        // Hydrological receiver cells are the authoritative route. On steeper
+        // reaches, smoothing is suppressed so the visual spline cannot cut
+        // sideways across the valley wall.
+        const int32 InitialSmoothIterations = MeanSlope > 0.035 ? 0 : 1;
+        Points = ChaikinSmooth(Points, false, InitialSmoothIterations);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
         const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
         const double ValleyFreedom = FMath::Clamp(
@@ -3171,13 +3176,14 @@ static void ExtractRivers(
         SuppressPathologicalMeanders(
             BaseMeanderPoints, Points, Data.CellSize
         );
-        Points = ChaikinSmooth(Points, false, 2);
+        const int32 FinalSmoothIterations = MeanSlope > 0.035
+            ? 0 : (MeanSlope > 0.018 ? 1 : 2);
+        Points = ChaikinSmooth(Points, false, FinalSmoothIterations);
         Points = ResamplePolyline(
             Points,
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
             false
         );
-        ProjectRiverToLocalThalweg(Data, Points);
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
@@ -3217,11 +3223,15 @@ static void ExtractRivers(
         River.Width = FMath::Lerp(HeadwaterWidth, MainRiverWidth, RiverAlpha);
         River.Depth = FMath::Lerp(FMath::Max(120.0, MaximumDepth * 0.12), MaximumDepth, RiverAlpha);
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
-        River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
+        // Erosion has already created the broad valley. Ordinary active rivers
+        // only add modest channel/bank relief; canyon classification below is
+        // the only path to large cliff-sided incision.
+        River.ValleyDepth = FMath::Lerp(
+            River.Depth * 0.45,
+            FMath::Min(MaximumValleyDepth * 0.24, River.Depth * 0.90),
+            RiverAlpha
+        );
         River.ChannelSteepness = ChannelSteepness;
-        // Erosion formed the valley already. On steep ground the final Water
-        // Body modifier must stay close to the active channel, otherwise it
-        // manufactures a broad road-like bench on the hillside.
         const double SteepValley = Smooth01(FMath::Clamp(
             (MeanSlope - 0.025) / 0.10, 0.0, 1.0
         ));
@@ -3426,8 +3436,6 @@ static double EvaluateLandform(
         );
     };
 
-    // A broad warp gives coherent geological direction without making
-    // every valley or ridge parallel.
     const FVector2D MacroWarp(
         Fbm(Position, Scale * 1.8,
             SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
@@ -3436,10 +3444,6 @@ static double EvaluateLandform(
     );
     const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
 
-    // Province fields deliberately reserve substantial quiet country.
-    // This is the high-level distribution of plains, hill country,
-    // uplands and active mountain belts; it prevents ruggedness from
-    // saturating the whole strip.
     const double Province = 0.5 + 0.5 * Fbm(
         Warped, Scale * 1.55,
         SeedOffset + FVector2D(1901.0, 331.0),
@@ -3463,17 +3467,11 @@ static double EvaluateLandform(
         0.0, 1.0
     );
 
-    // Regional uplift gives high and low country, but intentionally
-    // contributes little direct relief. Mountains are not giant noise domes.
     const double PlateField = Fbm(
         Warped, Scale * 2.6,
         SeedOffset + FVector2D(1201.0, 331.0),
         5, 0.57, 2.0
     );
-    // Geology has no preferred relationship to the rectangular strip. The
-    // strip only crops a larger conceptual geological field; climate remains
-    // long-axis aware separately. Broad coordinate warps make structures bend,
-    // terminate and intersect instead of holding one mathematical bearing.
     const FVector2D StructureWarp(
         Fbm(Warped, Scale * 2.1,
             SeedOffset + FVector2D(229.0, 1871.0), 3, 0.57, 2.0),
@@ -3507,9 +3505,6 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    // Broad orogenic envelopes define where a range exists. Narrow ridge
-    // noise is only allowed to sculpt the range by a modest amount, so it
-    // cannot turn one sample into a kilometre-high needle.
     const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
         Warped, Scale * 1.55,
         SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
@@ -3539,9 +3534,6 @@ static double EvaluateLandform(
     )) * FMath::Lerp(0.42, 1.0, MountainProvince)
        * FMath::Lerp(0.70, 1.0, PositiveUplift);
 
-    // Discourage only the biggest summit cores immediately on the eventual
-    // central development corridor. This is a soft bias, not a flat trench:
-    // hills, passes, valleys and rivers remain free to cross the centre.
     const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
         ? Position.Y - Bounds.GetCenter().Y
         : Position.X - Bounds.GetCenter().X;
@@ -3572,8 +3564,6 @@ static double EvaluateLandform(
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
-    // Welsh/Scottish-style uplands and ordinary rolling hill country are
-    // separate scales, not weak mountain noise.
     const double UplandRidges = RidgedFbm(
         Warped, Scale * 0.48,
         SeedOffset + FVector2D(347.0, 1039.0),
@@ -3604,8 +3594,6 @@ static double EvaluateLandform(
         0.0, 1.0
     );
 
-    // Long extension zones become rift valleys and broad structural
-    // corridors. They are intentionally wide enough to contain floodplains.
     const FVector2D RiftWarp = Warped + FVector2D(
         Fbm(Warped, Scale * 1.2,
             SeedOffset + FVector2D(509.0, 193.0), 3) * Scale * 0.16,
@@ -3647,9 +3635,6 @@ static double EvaluateLandform(
         0.0, 1.0
     );
 
-    // Zero is a world datum, not a mountain-top datum. Broad ordinary country
-    // occupies a modest positive elevation range; mountains rise above it,
-    // while basins, rifts and drainage can cut below it.
     const double RegionalElevation = Fbm(
         RegionalWarped, Scale * 2.35,
         SeedOffset + FVector2D(2273.0, 1291.0),
@@ -3660,14 +3645,11 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    // Mountains occupy broad bases and are capped by the envelope. The
-    // crest texture changes their profile by only +/- ~20 percent.
     const double MountainHeight = Smooth01(OutMountainMask);
     Height += MountainHeight * Relief
         * FMath::Lerp(0.54, 0.82, Activity)
         * CrestShape;
 
-    // Foothills and hill country are deliberately much lower than mountains.
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
     Height += IndependentHills * Relief * (
@@ -3677,15 +3659,11 @@ static double EvaluateLandform(
         + HillDetail * 0.016
     );
 
-    // Rift floors and basins provide the large negative landforms needed
-    // for wide valleys and long drainage corridors.
     Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
         * FMath::Lerp(0.86, 1.08, RiftLine);
     Height += RiftShoulder * Relief * 0.045;
     Height -= BasinMask * Relief * 0.085;
 
-    // True plains are allowed to stay broad and quiet. Their relief is on
-    // the scale of rolling countryside, not repeated mini-mountains.
     const double PlainRoll = Fbm(
         Warped, Scale * 0.95,
         SeedOffset + FVector2D(101.0, 43.0),
@@ -3714,9 +3692,6 @@ static double EvaluateLandform(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
     );
 
-    // Lithology is independent from shape. Drainage and differential erosion
-    // strip weak arid uplands while resistant caps survive, so mesas,
-    // escarpments and canyon rims emerge instead of being height stamps.
     const double Lithology = 0.5 + 0.5 * Fbm(
         Warped, FMath::Max(90000.0, Scale * 0.22),
         SeedOffset + FVector2D(811.0, 397.0),
@@ -3726,7 +3701,6 @@ static double EvaluateLandform(
         * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
-    // Dunes remain low-amplitude regional terrain on quiet arid plains.
     const double DuneSuitability = OutDesertMask * OutPlainsMask
         * (1.0 - ResistantCap * 0.85)
         * (1.0 - RiftMask * 0.55);
@@ -4121,7 +4095,6 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     BuildMacroClimate(*Data, Generator);
 
-    // Major relief now emerges from one continuous structural field.
     Data->RequestedMountainRanges = 0;
     Data->PlacedMountainRanges = 0;
 
@@ -4160,8 +4133,6 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Generator.ErosionResistanceStrength
     );
 
-    // Recompute drainage while erosion reshapes the terrain, then select final
-    // rivers/lakes from the evolved surface rather than the initial noise field.
     EvolveTerrainFromDrainage(
         *Data, FMath::Clamp(Generator.StreamPowerIterations / 2 + 1, 2, 6),
         Generator.StreamPowerStrength,
@@ -4319,7 +4290,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("b96f4c24-6fb4-49c2-9e1e-7b43ef405e14")); }
+    static FGuid Version() { return FGuid(TEXT("5e0174a3-4ad9-4bb1-9f8e-71e5079ce9c2")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -4691,8 +4662,15 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     HeadwaterWidth = 800.0 * WaterTerrain.RiverWidthScale;
     MainRiverWidth = 12000.0 * WaterTerrain.RiverWidthScale;
     MaximumRiverDepth = 1800.0 * WaterTerrain.RiverDepthScale;
-    HeadwaterValleyHalfWidth = FMath::Max(10000.0, WaterTerrain.RiverBankWidth);
-    MainValleyHalfWidth = FMath::Max(80000.0, WaterTerrain.RiverBankWidth * 3.0);
+    // Broad valley form belongs to erosion. These widths are now only the
+    // active river's immediate valley/bank envelope, with canyon reaches able
+    // to expand/deepen independently when the geomorphology calls for it.
+    HeadwaterValleyHalfWidth = FMath::Max(
+        2500.0, WaterTerrain.RiverBankWidth * 0.35
+    );
+    MainValleyHalfWidth = FMath::Max(
+        12000.0, WaterTerrain.RiverBankWidth * 1.25
+    );
 
     RefinementEdgeLengthHeadwater = FMath::Max(
         100.0, Refinement.HeadwaterEdgeLength
@@ -5340,10 +5318,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, WaterTerrain.LakeBedDepth,
                 WaterTerrain.LakeShoreWidth, WaterTerrain
             );
-            // Avenor's broad terrain op already carves the lake bed and
-            // exterior shoreline with a min-only operation. Attaching Epic's
-            // LakeModifier here would sculpt the terrain a second time and can
-            // raise low ground toward the water datum, creating an uphill bank.
             Lake->PostEditChange();
         }
     }
