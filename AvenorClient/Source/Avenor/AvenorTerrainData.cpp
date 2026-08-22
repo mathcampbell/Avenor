@@ -213,9 +213,9 @@ bool UAvenorTerrainData::SampleFinalHeight(
         return false;
     }
 
-    // Water Body modifiers carve after the broad terrain modifier. Mirror
-    // their authoritative spline datum here so non-mesh consumers (notably
-    // the Spine parcel checker) do not continue to see the pre-carve ground.
+    // Erosion owns the valley shape. The final river pass only guarantees
+    // enough clearance for the wetted channel and a very small bank shoulder.
+    // It must never excavate a second artificial valley around the spline.
     for (const FAvenorBakedRiverReach& River : Rivers)
     {
         for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
@@ -231,9 +231,13 @@ bool UAvenorTerrainData::SampleFinalHeight(
                     / LengthSquared, 0.0, 1.0)
                 : 0.0;
             const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
+            const double BankMargin = FMath::Min(
+                FMath::Max(75.0, River.Width * 0.12),
+                FMath::Max(0.0, River.BankWidth)
+            );
             const double CarveHalfWidth = FMath::Max(
-                River.Width * 0.5 + 100.0,
-                River.Width * 0.5 + River.BankWidth
+                River.Width * 0.52,
+                River.Width * 0.5 + BankMargin
             );
             if (Distance >= CarveHalfWidth)
             {
@@ -247,11 +251,18 @@ bool UAvenorTerrainData::SampleFinalHeight(
             const double CrossAlpha = FMath::Clamp(
                 Distance / CarveHalfWidth, 0.0, 1.0
             );
-            const double BedZ = WaterZ - River.Depth;
+            const double ClearanceDepth = FMath::Min(
+                FMath::Max(60.0, River.Width * 0.10),
+                FMath::Max(60.0, River.Depth)
+            );
+            const double BedZ = WaterZ - ClearanceDepth;
+            const double BankBlend = FMath::SmoothStep(
+                0.0, 1.0, FMath::Pow(CrossAlpha, 0.72)
+            );
             const float CarvedZ = static_cast<float>(FMath::Lerp(
                 BedZ,
                 static_cast<double>(OutHeight),
-                FMath::SmoothStep(0.0, 1.0, CrossAlpha)
+                BankBlend
             ));
             OutHeight = FMath::Min(OutHeight, CarvedZ);
         }
