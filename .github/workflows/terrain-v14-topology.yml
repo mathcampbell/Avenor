@@ -1,0 +1,289 @@
+name: Apply terrain v14 topology
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply terrain v14 geology orientation and river continuity
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s = p.read_text(encoding='utf-8')
+          original = s
+
+          def one(old, new, label):
+              global s
+              if old not in s:
+                  if new in s:
+                      print(f'{label}: already applied')
+                      return
+                  raise RuntimeError(f'missing {label}')
+              s = s.replace(old, new, 1)
+
+          one('static constexpr int32 GeneratorAlgorithmVersion = 13;',
+              'static constexpr int32 GeneratorAlgorithmVersion = 14;', 'algorithm version')
+
+          one('''    const double SeedAngleB = FMath::Fmod(
+        SeedAngleA + 1.047
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000217,
+        PI
+    );
+    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);''', '''    const double SeedAngleB = FMath::Fmod(
+        SeedAngleA + 1.047
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000217,
+        PI
+    );
+    const double SeedAngleC = FMath::Fmod(
+        SeedAngleB + 0.731
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000163,
+        PI
+    );
+    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AxisC(FMath::Cos(SeedAngleC), FMath::Sin(SeedAngleC));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);
+    const FVector2D AcrossC = Rotate90(AxisC);''', 'third geology axis')
+
+          one('''    const double RegionalTilt = Fbm(
+        Oriented(Warped, StripAxis, StripAcross, 2.8, 0.9),
+        Scale * 3.0,
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4, 0.55, 2.0
+    );
+    const double Uplift = FMath::Clamp(
+        PlateField * 0.72 + RegionalTilt * 0.28,
+        -1.0, 1.0
+    );''', '''    // Geology is independent of the gameplay strip orientation. The strip
+    // direction is intentionally retained for macro climate only.
+    const FVector2D StructureWarp = Warped + FVector2D(
+        Fbm(Warped, Scale * 2.2,
+            SeedOffset + FVector2D(229.0, 1549.0), 3, 0.56, 2.0),
+        Fbm(Warped, Scale * 2.0,
+            SeedOffset + FVector2D(1663.0, 593.0), 3, 0.56, 2.03)
+    ) * Scale * 0.22;
+    const double RegionalStructureA = Fbm(
+        Oriented(StructureWarp, AxisC, AcrossC, 2.6, 0.88),
+        Scale * 3.0,
+        SeedOffset + FVector2D(149.0, 1267.0),
+        4, 0.55, 2.0
+    );
+    const double RegionalStructureB = Fbm(
+        Oriented(StructureWarp, AxisA, AcrossA, 1.9, 1.05),
+        Scale * 2.5,
+        SeedOffset + FVector2D(1283.0, 181.0),
+        4, 0.55, 2.07
+    );
+    const double RegionalStructure = FMath::Clamp(
+        RegionalStructureA * 0.58 + RegionalStructureB * 0.42,
+        -1.0, 1.0
+    );
+    const double Uplift = FMath::Clamp(
+        PlateField * 0.72 + RegionalStructure * 0.28,
+        -1.0, 1.0
+    );''', 'strip-independent regional structure')
+
+          one('''    const double BeltA = RidgedFbm(
+        Oriented(Warped, AxisA, AcrossA, 4.2, 0.82),
+        Scale * 0.95,
+        SeedOffset + FVector2D(421.0, 719.0),
+        5
+    );
+    const double BeltB = RidgedFbm(
+        Oriented(Warped, AxisB, AcrossB, 3.4, 0.90),
+        Scale * 1.05,
+        SeedOffset + FVector2D(877.0, 149.0),
+        5
+    );''', '''    // Slowly warped coordinates keep long ranges coherent without making them
+    // ruler-straight or forcing every range to share a compass bearing.
+    const FVector2D BeltWarpA = Warped + FVector2D(
+        Fbm(Warped, Scale * 1.15,
+            SeedOffset + FVector2D(311.0, 1321.0), 3) * Scale * 0.18,
+        Fbm(Warped, Scale * 1.30,
+            SeedOffset + FVector2D(1427.0, 407.0), 3) * Scale * 0.18
+    );
+    const FVector2D BeltWarpB = Warped + FVector2D(
+        Fbm(Warped, Scale * 1.35,
+            SeedOffset + FVector2D(719.0, 1613.0), 3) * Scale * 0.20,
+        Fbm(Warped, Scale * 1.10,
+            SeedOffset + FVector2D(1777.0, 241.0), 3) * Scale * 0.20
+    );
+    const double BeltA = RidgedFbm(
+        Oriented(BeltWarpA, AxisA, AcrossA, 4.2, 0.82),
+        Scale * 0.95,
+        SeedOffset + FVector2D(421.0, 719.0),
+        5
+    );
+    const double BeltB = RidgedFbm(
+        Oriented(BeltWarpB, AxisB, AcrossB, 3.4, 0.90),
+        Scale * 1.05,
+        SeedOffset + FVector2D(877.0, 149.0),
+        5
+    );''', 'warped mountain belts')
+
+          one('''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift);''', '''    // The future spine occupies the centre of the strip. This is only a soft
+    // probability bias against the largest mountain cores: foothills, passes,
+    // valleys and rivers remain completely free to cross the centreline.
+    const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
+        ? Position.Y - Bounds.GetCenter().Y
+        : Position.X - Bounds.GetCenter().X;
+    const double SpineCoreHalfWidth = ShortExtent * 0.06;
+    const double SpineMountainRecoveryWidth = ShortExtent * 0.20;
+    const double SpineMountainRecovery = Smooth01(FMath::Clamp(
+        (FMath::Abs(AcrossCoordinate) - SpineCoreHalfWidth)
+            / FMath::Max(1.0, SpineMountainRecoveryWidth),
+        0.0, 1.0
+    ));
+    const double SpineMountainBias = FMath::Lerp(
+        0.68, 1.0, SpineMountainRecovery
+    );
+    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift)
+       * SpineMountainBias;''', 'soft spine mountain bias')
+
+          one('''    double Height = Uplift * Relief * 0.075
+        + RegionalTilt * Relief * 0.025;''', '''    double Height = Uplift * Relief * 0.075
+        + RegionalStructure * Relief * 0.025;''', 'regional structure height')
+
+          # Keep candidates in score order, but make the reach cap topology-aware.
+          # Any displayed tributary must bring its entire downstream chain with it.
+          one('''    Candidates.Sort([](const FRiverCandidate& A, const FRiverCandidate& B) { return A.Score > B.Score; });
+    const int32 ReachCount = FMath::Min(MaximumReaches, Candidates.Num());
+    for (int32 ReachIndex = 0; ReachIndex < ReachCount; ++ReachIndex)
+    {
+        const FRiverCandidate& CandidateReach = Candidates[ReachIndex];''', '''    Candidates.Sort([](const FRiverCandidate& A, const FRiverCandidate& B) { return A.Score > B.Score; });
+
+    // MaximumRiverReaches used to truncate independently scored reach segments.
+    // That could retain two tributaries while dropping their lower trunk, leaving
+    // a visible Y-shaped river that simply stopped inland. Select complete
+    // downstream closures instead: every retained reach either ends in a lake,
+    // at the world boundary, or continues into another retained reach.
+    TMap<int32, int32> CandidateByStartCell;
+    for (int32 CandidateIndex = 0; CandidateIndex < Candidates.Num(); ++CandidateIndex)
+    {
+        if (!Candidates[CandidateIndex].Cells.IsEmpty())
+        {
+            CandidateByStartCell.Add(
+                Candidates[CandidateIndex].Cells[0], CandidateIndex
+            );
+        }
+    }
+    TArray<bool> SelectedCandidates;
+    SelectedCandidates.Init(false, Candidates.Num());
+    int32 SelectedCount = 0;
+    for (int32 RankedIndex = 0;
+         RankedIndex < Candidates.Num() && SelectedCount < MaximumReaches;
+         ++RankedIndex)
+    {
+        if (SelectedCandidates[RankedIndex])
+        {
+            continue;
+        }
+        TArray<int32> Closure;
+        TSet<int32> ClosureSet;
+        int32 CandidateIndex = RankedIndex;
+        for (int32 Guard = 0;
+             Guard < Candidates.Num() && CandidateIndex != INDEX_NONE;
+             ++Guard)
+        {
+            if (SelectedCandidates[CandidateIndex]
+                || ClosureSet.Contains(CandidateIndex))
+            {
+                break;
+            }
+            Closure.Add(CandidateIndex);
+            ClosureSet.Add(CandidateIndex);
+            const FRiverCandidate& Candidate = Candidates[CandidateIndex];
+            if (Candidate.EndLakeIndex != INDEX_NONE || Candidate.Cells.IsEmpty())
+            {
+                break;
+            }
+            const int32 EndCell = Candidate.Cells.Last();
+            const int32 X = EndCell % Data.Columns;
+            const int32 Y = EndCell / Data.Columns;
+            if (Data.IsBoundary(X, Y))
+            {
+                break;
+            }
+            const int32* DownstreamCandidate = CandidateByStartCell.Find(EndCell);
+            CandidateIndex = DownstreamCandidate ? *DownstreamCandidate : INDEX_NONE;
+        }
+
+        int32 NewReachCount = 0;
+        for (int32 ClosureIndex : Closure)
+        {
+            NewReachCount += SelectedCandidates[ClosureIndex] ? 0 : 1;
+        }
+        if (NewReachCount == 0
+            || SelectedCount + NewReachCount > MaximumReaches)
+        {
+            continue;
+        }
+        for (int32 ClosureIndex : Closure)
+        {
+            if (!SelectedCandidates[ClosureIndex])
+            {
+                SelectedCandidates[ClosureIndex] = true;
+                ++SelectedCount;
+            }
+        }
+    }
+
+    TArray<int32> SelectedCandidateIndices;
+    SelectedCandidateIndices.Reserve(SelectedCount);
+    for (int32 CandidateIndex = 0; CandidateIndex < Candidates.Num(); ++CandidateIndex)
+    {
+        if (SelectedCandidates[CandidateIndex])
+        {
+            SelectedCandidateIndices.Add(CandidateIndex);
+        }
+    }
+    SelectedCandidateIndices.Sort([&](int32 A, int32 B)
+    {
+        return Candidates[A].Score > Candidates[B].Score;
+    });
+
+    for (int32 SelectedIndex = 0;
+         SelectedIndex < SelectedCandidateIndices.Num(); ++SelectedIndex)
+    {
+        const int32 ReachIndex = SelectedCandidateIndices[SelectedIndex];
+        const FRiverCandidate& CandidateReach = Candidates[ReachIndex];''', 'topology-aware river reach selection')
+
+          # Seed meander variation should follow the actual candidate index after
+          # topology selection, not its compact selected-list position.
+          one('''            Seed ^ (ReachIndex * 0x45D9F3B),''', '''            Seed ^ (ReachIndex * 0x45D9F3B),''', 'meander seed unchanged')
+
+          one('static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }',
+              'static FGuid Version() { return FGuid(TEXT("7dc8a0b9-2d86-4c16-a1f5-4fe5de4184b8")); }', 'DDC version')
+
+          if s != original:
+              p.write_text(s, encoding='utf-8')
+          PY
+          if git diff --quiet; then
+            echo "terrain v14 already applied"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Decouple geology and preserve river continuity"
+          git push
