@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply v13 geomorphic terrain evolution
+      - name: Apply v13 terrain evolution
         shell: bash
         run: |
           python3 - <<'PY'
@@ -24,84 +24,38 @@ jobs:
           p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
           s = p.read_text(encoding='utf-8')
 
-          def rep(old, new, label):
+          def one(old, new, label, required=True):
               global s
-              n = s.count(old)
-              if n != 1:
-                  raise RuntimeError(f'{label}: expected one match, got {n}')
-              s = s.replace(old, new, 1)
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  print('applied:', label)
+                  return True
+              print('missing:', label)
+              if required:
+                  raise RuntimeError(label)
+              return False
 
-          rep('static constexpr int32 GeneratorAlgorithmVersion = 12;',
+          one('static constexpr int32 GeneratorAlgorithmVersion = 12;',
               'static constexpr int32 GeneratorAlgorithmVersion = 13;', 'algorithm version')
 
-          rep('''    const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40,
-        0.0, 1.0
-    )) * FMath::Lerp(0.30, 1.0, MountainProvince)
-       * FMath::Lerp(0.62, 1.0, PositiveUplift);''', '''    const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
-        0.0, 1.0
-    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
-       * FMath::Lerp(0.70, 1.0, PositiveUplift);''', 'mountain envelope')
+          one('(BeltSignal - FMath::Lerp(0.50, 0.42, Activity)) / 0.40',
+              '(BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38', 'range threshold')
+          one(')) * FMath::Lerp(0.30, 1.0, MountainProvince)\n       * FMath::Lerp(0.62, 1.0, PositiveUplift);',
+              ')) * FMath::Lerp(0.48, 1.0, MountainProvince)\n       * FMath::Lerp(0.70, 1.0, PositiveUplift);', 'range support')
+          one('0.82\n            + (CrestRidges - 0.50) * 0.22\n            + (CrestVariation - 0.50) * 0.16,\n        0.68, 1.04',
+              '0.88\n            + (CrestRidges - 0.50) * 0.16\n            + (CrestVariation - 0.50) * 0.12,\n        0.76, 1.03', 'crest clamp')
+          one('* FMath::Lerp(0.36, 0.60, Activity)',
+              '* FMath::Lerp(0.54, 0.82, Activity)', 'mountain height')
+          one('Height += FoothillEnvelope * Relief * 0.14\n        * (0.74 + UplandRidges * 0.26);',
+              'Height += FoothillEnvelope * Relief * 0.18\n        * (0.72 + UplandRidges * 0.28);', 'foothill height')
 
-          rep('''    const double CrestShape = FMath::Clamp(
-        0.82
-            + (CrestRidges - 0.50) * 0.22
-            + (CrestVariation - 0.50) * 0.16,
-        0.68, 1.04
-    );''', '''    const double CrestShape = FMath::Clamp(
-        0.88
-            + (CrestRidges - 0.50) * 0.16
-            + (CrestVariation - 0.50) * 0.12,
-        0.76, 1.03
-    );''', 'crest profile')
-
-          rep('''    Height += MountainHeight * Relief
-        * FMath::Lerp(0.36, 0.60, Activity)
-        * CrestShape;''', '''    Height += MountainHeight * Relief
-        * FMath::Lerp(0.54, 0.82, Activity)
-        * CrestShape;''', 'mountain height')
-
-          rep('''    Height += FoothillEnvelope * Relief * 0.14
-        * (0.74 + UplandRidges * 0.26);''', '''    Height += FoothillEnvelope * Relief * 0.18
-        * (0.72 + UplandRidges * 0.28);''', 'foothill height')
-
-          old_desert = '''    // Arid climate exposes and flattens resistant uplands into mesas and
-    // escarpments, but only where structural hill/upland terrain already exists.
-    const double PlateauSignal = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 0.52,
-        SeedOffset + FVector2D(811.0, 397.0),
-        4, 0.55, 2.0
-    );
-    const double PlateauMask = Smooth01(FMath::Clamp(
-        (PlateauSignal - 0.57) / 0.25, 0.0, 1.0
-    )) * OutDesertMask
-       * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.55, 0.0, 1.0)
-       * (1.0 - OutMountainMask * 0.72);
-
-    // Terrace the *upper* part of an existing upland rather than building
-    // free-standing desert spikes.
-    const double MesaStep = FMath::Floor(
-        FMath::Clamp(PlateauSignal, 0.0, 0.999) * 5.0
-    ) / 5.0;
-    Height += PlateauMask * Relief
-        * (0.055 + MesaStep * 0.035);
-
-    const double BadlandRidges = RidgedFbm(
-        Warped, FMath::Max(70000.0, Scale * 0.10),
-        SeedOffset + FVector2D(1733.0, 1449.0),
-        4
-    );
-    Height += (BadlandRidges - 0.48) * Relief * 0.018 * PlateauMask;
-
-    // Dunes remain low-amplitude regional terrain on quiet arid plains.
-    const double DuneSuitability = OutDesertMask * OutPlainsMask
-        * (1.0 - PlateauMask * 0.90)
-        * (1.0 - RiftMask * 0.55);'''
-          new_desert = '''    // Lithology is generated independently from shape. In arid uplands the
-    // later drainage/erosion loop removes weak rock while resistant caps survive,
-    // allowing mesas, escarpments and canyon rims to emerge instead of being
-    // stamped into the initial height field.
+          start = s.find('    // Arid climate exposes and flattens resistant uplands into mesas and')
+          end = s.find('    // Dunes remain low-amplitude regional terrain on quiet arid plains.', start)
+          if start < 0 or end < 0:
+              raise RuntimeError('stamped mesa block markers not found')
+          replacement = '''    // Lithology is independent from shape. The later drainage/erosion loop
+    // strips weak arid uplands while resistant caps survive, so mesas,
+    // escarpments and canyon rims emerge instead of being height stamps.
     const double Lithology = 0.5 + 0.5 * Fbm(
         Warped, FMath::Max(90000.0, Scale * 0.22),
         SeedOffset + FVector2D(811.0, 397.0),
@@ -111,13 +65,11 @@ jobs:
         * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
-    // Dunes remain low-amplitude regional terrain on quiet arid plains.
-    const double DuneSuitability = OutDesertMask * OutPlainsMask
-        * (1.0 - ResistantCap * 0.85)
-        * (1.0 - RiftMask * 0.55);'''
-          rep(old_desert, new_desert, 'replace stamped mesas')
-
-          rep('''    OutResistance = FMath::Clamp(
+'''
+          s = s[:start] + replacement + s[end:]
+          one('const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - PlateauMask * 0.90)',
+              'const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - ResistantCap * 0.85)', 'dune mesa dependency')
+          one('''    OutResistance = FMath::Clamp(
         OutMountainMask * 0.28
             + OutHillMask * 0.11
             + OutDesertMask * (0.18 + PlateauMask * 0.38)
@@ -130,17 +82,15 @@ jobs:
             + ResistantCap * 0.62
             + RiftShoulder * 0.10,
         0.0, 1.0
-    );''', 'lithology resistance')
+    );''', 'resistance model')
 
-          marker = '''static int32 PrimaryReceiver(const FAvenorStripData& Data, int32 Cell)
-{'''
-          if marker not in s:
-              raise RuntimeError('PrimaryReceiver insertion marker missing')
-          evolution = r'''// Evolve the structural terrain through its own drainage network. Broad valleys
-// develop where runoff can erode weak terrain, while resistant arid uplands keep
-// narrow incision and survive as canyon rims / residual mesas. This is deliberately
-// applied after initial relief and before river/lake extraction so water features are
-// selected from the evolved terrain rather than painted onto it.
+          marker = 'static int32 PrimaryReceiver(const FAvenorStripData& Data, int32 Cell)\n{'
+          if 'static void EvolveTerrainFromDrainage(' not in s:
+              if marker not in s:
+                  raise RuntimeError('evolution insertion marker missing')
+              evolution = r'''// Evolve structural terrain through the drainage network before final water
+// features are selected. Weak terrain develops broad valleys; resistant arid
+// uplands concentrate incision and survive as canyon rims and residual mesas.
 static void EvolveTerrainFromDrainage(
     FAvenorStripData& Data,
     int32 Passes,
@@ -155,16 +105,15 @@ static void EvolveTerrainFromDrainage(
     {
         return;
     }
-
     const bool bUseResistance = Data.Resistance.Num() == Data.Height.Num();
     const double EffectiveResistance = FMath::Clamp(ResistanceStrength, 0.0, 1.5);
     for (int32 Pass = 0; Pass < Passes; ++Pass)
     {
         PriorityFlood(Data, Epsilon);
         BuildContinuousFlow(Data);
-
         TArray<double> Delta;
         Delta.Init(0.0, Data.Height.Num());
+
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
             const int32 X = Cell % Data.Columns;
@@ -173,37 +122,24 @@ static void EvolveTerrainFromDrainage(
             {
                 continue;
             }
-
-            const double Mountain = Data.MountainMask.IsValidIndex(Cell)
-                ? Data.MountainMask[Cell] : 0.0;
-            const double Hill = Data.HillMask.IsValidIndex(Cell)
-                ? Data.HillMask[Cell] : 0.0;
-            const double Desert = Data.DesertMask.IsValidIndex(Cell)
-                ? Data.DesertMask[Cell] : 0.0;
+            const double Mountain = Data.MountainMask.IsValidIndex(Cell) ? Data.MountainMask[Cell] : 0.0;
+            const double Hill = Data.HillMask.IsValidIndex(Cell) ? Data.HillMask[Cell] : 0.0;
+            const double Desert = Data.DesertMask.IsValidIndex(Cell) ? Data.DesertMask[Cell] : 0.0;
             const double Resistance = bUseResistance
-                ? FMath::Clamp(Data.Resistance[Cell] * EffectiveResistance, 0.0, 0.94)
-                : 0.0;
-            const double ReliefClass = FMath::Clamp(
-                FMath::Max(Mountain, Hill * 0.72), 0.0, 1.0
-            );
-            const double StartArea = FMath::Lerp(
-                LowlandStartArea, MountainStartArea, ReliefClass
-            ) * DrainageSourceMultiplier(Data, Cell);
-            const double AreaRatio = Data.Accumulation[Cell]
-                / FMath::Max(0.01, StartArea);
+                ? FMath::Clamp(Data.Resistance[Cell] * EffectiveResistance, 0.0, 0.94) : 0.0;
+            const double ReliefClass = FMath::Clamp(FMath::Max(Mountain, Hill * 0.72), 0.0, 1.0);
+            const double StartArea = FMath::Lerp(LowlandStartArea, MountainStartArea, ReliefClass)
+                * DrainageSourceMultiplier(Data, Cell);
+            const double AreaRatio = Data.Accumulation[Cell] / FMath::Max(0.01, StartArea);
             const double ChannelPower = Smooth01(FMath::Clamp(
-                FMath::Loge(1.0 + FMath::Max(0.0, AreaRatio)) / FMath::Loge(9.0),
-                0.0, 1.0
-            ));
+                FMath::Loge(1.0 + FMath::Max(0.0, AreaRatio)) / FMath::Loge(9.0), 0.0, 1.0));
             const double Slope = FMath::Clamp(Data.Slope[Cell], 0.0, 0.8);
 
-            // Diffuse weathering strips weak arid uplands but leaves resistant caps.
-            // The differential, not a height stamp, creates residual mesa country.
+            // Differential weathering is what creates mesa remnants.
             const double Upland = FMath::Clamp(Hill + Mountain * 0.35, 0.0, 1.0);
-            const double SheetErosion = Desert * Upland * (1.0 - Resistance)
+            Delta[Cell] -= Desert * Upland * (1.0 - Resistance)
                 * Strength * Data.CellSize * 0.006
                 * (0.35 + FMath::Clamp(Slope / 0.10, 0.0, 1.0));
-            Delta[Cell] -= SheetErosion;
 
             if (ChannelPower <= 0.0 || Data.ReceiverA[Cell] == INDEX_NONE)
             {
@@ -220,8 +156,7 @@ static void EvolveTerrainFromDrainage(
                 * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability);
             Delta[Cell] -= Incision;
 
-            // Weak/wet terrain develops wide valleys and floodplain corridors.
-            // Resistant arid terrain instead concentrates erosion in the channel.
+            // Larger rivers in weak terrain widen their valleys; canyon rivers do not.
             const double BroadValley = ChannelPower * (1.0 - CanyonSuitability)
                 * (1.0 - Resistance * 0.78);
             if (BroadValley > 0.02)
@@ -231,32 +166,18 @@ static void EvolveTerrainFromDrainage(
                 {
                     for (int32 DX = -Radius; DX <= Radius; ++DX)
                     {
-                        if (DX == 0 && DY == 0)
-                        {
-                            continue;
-                        }
+                        if (DX == 0 && DY == 0) continue;
                         const int32 NX = X + DX;
                         const int32 NY = Y + DY;
-                        if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY))
-                        {
-                            continue;
-                        }
-                        const double Distance = FMath::Sqrt(
-                            static_cast<double>(DX * DX + DY * DY)
-                        );
-                        if (Distance > static_cast<double>(Radius) + 0.15)
-                        {
-                            continue;
-                        }
+                        if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY)) continue;
+                        const double Distance = FMath::Sqrt(static_cast<double>(DX * DX + DY * DY));
+                        if (Distance > static_cast<double>(Radius) + 0.15) continue;
                         const int32 Neighbor = Data.Index(NX, NY);
                         const double NeighborResistance = bUseResistance
-                            ? FMath::Clamp(Data.Resistance[Neighbor] * EffectiveResistance, 0.0, 0.94)
-                            : 0.0;
+                            ? FMath::Clamp(Data.Resistance[Neighbor] * EffectiveResistance, 0.0, 0.94) : 0.0;
                         const double Falloff = 1.0 - Distance / (static_cast<double>(Radius) + 0.75);
-                        const double Widening = Incision * BroadValley * Falloff
-                            * (1.0 - NeighborResistance * 0.82)
-                            * 0.46;
-                        Delta[Neighbor] -= FMath::Max(0.0, Widening);
+                        Delta[Neighbor] -= FMath::Max(0.0,
+                            Incision * BroadValley * Falloff * (1.0 - NeighborResistance * 0.82) * 0.46);
                     }
                 }
             }
@@ -265,35 +186,30 @@ static void EvolveTerrainFromDrainage(
         const double MaximumPassChange = Data.CellSize * 0.12;
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
-            Data.Height[Cell] += FMath::Clamp(
-                Delta[Cell], -MaximumPassChange, MaximumPassChange
-            );
+            Data.Height[Cell] += FMath::Clamp(Delta[Cell], -MaximumPassChange, MaximumPassChange);
         }
     }
-
     PriorityFlood(Data, Epsilon);
     BuildContinuousFlow(Data);
 }
 
 '''
-          s = s.replace(marker, evolution + marker, 1)
+              s = s.replace(marker, evolution + marker, 1)
+              print('inserted drainage evolution')
 
-          old_order = '''    ApplyStreamPowerErosion(
+          old_call = '''    ApplyStreamPowerErosion(
         *Data, Generator.StreamPowerIterations, Generator.StreamPowerStrength,
         Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea, Generator.DrainageEpsilon,
         Generator.ErosionResistanceStrength
     );
 
     TArray<bool> AuthoritativeRiverNetwork;'''
-          new_order = '''    ApplyStreamPowerErosion(
+          new_call = '''    ApplyStreamPowerErosion(
         *Data, Generator.StreamPowerIterations, Generator.StreamPowerStrength,
         Generator.MountainStreamStartArea, Generator.LowlandStreamStartArea, Generator.DrainageEpsilon,
         Generator.ErosionResistanceStrength
     );
 
-    // Let drainage reshape the structural landforms before selecting final
-    // rivers and lakes. A short thermal pass then removes numerical knife-edges
-    // without erasing the resulting valleys, canyon walls or residual uplands.
     EvolveTerrainFromDrainage(
         *Data,
         FMath::Clamp(Generator.StreamPowerIterations / 2 + 1, 2, 6),
@@ -311,10 +227,10 @@ static void EvolveTerrainFromDrainage(
     BuildContinuousFlow(*Data);
 
     TArray<bool> AuthoritativeRiverNetwork;'''
-          rep(old_order, new_order, 'generation order')
+          one(old_call, new_call, 'generation evolution call')
 
-          rep('static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }',
-              'static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }', 'terrain DDC GUID')
+          one('static FGuid Version() { return FGuid(TEXT("5c84f5e8-8f3b-4ca6-a966-cb4ed9f1cb3b")); }',
+              'static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }', 'DDC GUID')
 
           p.write_text(s, encoding='utf-8')
           PY
