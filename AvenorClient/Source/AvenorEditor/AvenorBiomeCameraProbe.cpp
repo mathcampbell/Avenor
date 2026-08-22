@@ -5,6 +5,7 @@
 #include "DrawDebugHelpers.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
+#include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "HAL/IConsoleManager.h"
@@ -275,6 +276,9 @@ private:
             Camera.Y / 100000.0
         );
 
+        // DrawDebugString is world-space and proved unreliable in the editor
+        // viewport. Keep it as a spatial fallback, but also render a fixed
+        // on-screen message so the probe is visible regardless of camera pose.
         const FVector TextLocation = Camera
             + ViewClient->GetViewRotation().Vector() * 1200.0
             + FVector(0.0, 0.0, 220.0);
@@ -288,6 +292,16 @@ private:
             true,
             1.05f
         );
+        if (GEngine)
+        {
+            GEngine->AddOnScreenDebugMessage(
+                0x0A7E0B10,
+                FMath::Max(0.30f, CVarUpdateSeconds.GetValueOnGameThread() * 2.0f),
+                FColor::White,
+                Status,
+                false
+            );
+        }
 
         return true;
     }
