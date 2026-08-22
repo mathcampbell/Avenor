@@ -1,0 +1,279 @@
+name: Apply terrain v17 source patch
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.issue.title == 'APPLY TERRAIN V17 NOW'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Patch source only
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          gen = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s = gen.read_text(encoding='utf-8')
+
+          def one(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, found {n}')
+              s = s.replace(old, new, 1)
+
+          one('static constexpr int32 GeneratorAlgorithmVersion = 16;',
+              'static constexpr int32 GeneratorAlgorithmVersion = 17;',
+              'algorithm version')
+
+          start = s.index('static void ReclassifyFinalLandforms(FAvenorStripData& Data)')
+          end = s.index('\nstatic void RefineClimateFromHydrology(', start)
+          replacement = r'''static void ReclassifyFinalLandforms(FAvenorStripData& Data)
+{
+    const int32 CellCount = Data.Columns * Data.Rows;
+    if (CellCount <= 0)
+    {
+        return;
+    }
+
+    TArray<double> NewMountain;
+    TArray<double> NewHill;
+    TArray<double> NewPlains;
+    NewMountain.SetNumUninitialized(CellCount);
+    NewHill.SetNumUninitialized(CellCount);
+    NewPlains.SetNumUninitialized(CellCount);
+
+    // Read the final, eroded surface at several scales. Landform identity is
+    // geometric and post-erosion: structural masks are supporting evidence,
+    // not an immutable label inherited from the pre-erosion terrain.
+    const double NearRadius = FMath::Max(60000.0, Data.CellSize * 12.0);
+    const double FarRadius = FMath::Max(180000.0, Data.CellSize * 36.0);
+    static const FVector2D Directions[] = {
+        FVector2D(1,0), FVector2D(-1,0), FVector2D(0,1), FVector2D(0,-1),
+        FVector2D(0.70710678,0.70710678), FVector2D(-0.70710678,0.70710678),
+        FVector2D(0.70710678,-0.70710678), FVector2D(-0.70710678,-0.70710678)
+    };
+
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const FVector2D Position = Data.CellPosition(Cell);
+        const double Height = Data.Height[Cell];
+        double NearMin = Height;
+        double NearMax = Height;
+        double FarMin = Height;
+        double FarMax = Height;
+
+        for (const FVector2D& Direction : Directions)
+        {
+            const double NearHeight = Data.SampleGrid(
+                Data.Height, Position + Direction * NearRadius
+            );
+            const double FarHeight = Data.SampleGrid(
+                Data.Height, Position + Direction * FarRadius
+            );
+            NearMin = FMath::Min(NearMin, NearHeight);
+            NearMax = FMath::Max(NearMax, NearHeight);
+            FarMin = FMath::Min(FarMin, FarHeight);
+            FarMax = FMath::Max(FarMax, FarHeight);
+        }
+
+        const double NearRelief = FMath::Max(0.0, NearMax - NearMin);
+        const double FarRelief = FMath::Max(0.0, FarMax - FarMin);
+        const double NearProminence = FMath::Max(0.0, Height - NearMin);
+        const double FarProminence = FMath::Max(0.0, Height - FarMin);
+        const double ElevationMetres = FMath::Max(0.0, Height) / 100.0;
+        const double Slope = FMath::Max(0.0, Data.Slope[Cell]);
+
+        // A mountain is not just 'high': it must stand above its surroundings.
+        // Conversely a genuinely prominent 700-1000 m massif should not remain
+        // labelled lowland merely because the original structural mask was weak.
+        const double NearReliefFactor = Smooth01(FMath::Clamp(
+            (NearRelief - 12000.0) / 52000.0, 0.0, 1.0
+        ));
+        const double FarReliefFactor = Smooth01(FMath::Clamp(
+            (FarRelief - 28000.0) / 90000.0, 0.0, 1.0
+        ));
+        const double ProminenceFactor = Smooth01(FMath::Clamp(
+            (FMath::Max(NearProminence, FarProminence * 0.72) - 12000.0)
+                / 65000.0,
+            0.0, 1.0
+        ));
+        const double ElevationFactor = Smooth01(FMath::Clamp(
+            (ElevationMetres - 450.0) / 900.0, 0.0, 1.0
+        ));
+        const double SlopeFactor = Smooth01(FMath::Clamp(
+            (Slope - 0.012) / 0.075, 0.0, 1.0
+        ));
+
+        const double StructuralMountain = FMath::Clamp(
+            Data.MountainMask[Cell], 0.0, 1.0
+        );
+        const double StructuralHill = FMath::Clamp(
+            Data.HillMask[Cell], 0.0, 1.0
+        );
+
+        const double GeometricMountain = FMath::Clamp(
+            ProminenceFactor
+                * FMath::Lerp(NearReliefFactor, FarReliefFactor, 0.62)
+                * FMath::Lerp(0.72, 1.0,
+                    FMath::Max(ElevationFactor, SlopeFactor)),
+            0.0, 1.0
+        );
+        const double HighMassifSupport = ElevationFactor
+            * FMath::Max(FarReliefFactor, SlopeFactor * 0.72);
+        const double Mountain = FMath::Clamp(FMath::Max3(
+            StructuralMountain * FMath::Lerp(0.48, 1.0, FarReliefFactor),
+            GeometricMountain,
+            HighMassifSupport * 0.88
+        ), 0.0, 1.0);
+
+        const double HillRelief = Smooth01(FMath::Clamp(
+            (NearRelief - 5000.0) / 36000.0, 0.0, 1.0
+        ));
+        const double HillProminence = Smooth01(FMath::Clamp(
+            (NearProminence - 3500.0) / 30000.0, 0.0, 1.0
+        ));
+        const double UplandElevation = Smooth01(FMath::Clamp(
+            (ElevationMetres - 250.0) / 600.0, 0.0, 1.0
+        ));
+        const double GeometricHill = FMath::Clamp(
+            FMath::Max(
+                HillRelief * FMath::Max(HillProminence, SlopeFactor * 0.75),
+                UplandElevation * FMath::Max(HillRelief, SlopeFactor) * 0.78
+            ),
+            0.0, 1.0
+        );
+        const double Hill = FMath::Clamp(FMath::Max(
+            StructuralHill * FMath::Lerp(0.45, 0.86, HillRelief),
+            GeometricHill
+        ) * (1.0 - Mountain * 0.72), 0.0, 1.0);
+
+        NewMountain[Cell] = Mountain;
+        NewHill[Cell] = Hill;
+        NewPlains[Cell] = FMath::Clamp(
+            1.0 - Mountain * 1.05 - Hill * 0.88, 0.0, 1.0
+        );
+    }
+
+    Data.MountainMask = MoveTemp(NewMountain);
+    Data.HillMask = MoveTemp(NewHill);
+    Data.PlainsMask = MoveTemp(NewPlains);
+}
+'''
+          s = s[:start] + replacement + s[end:]
+
+          one('''        const double ElevationFraction = FMath::Clamp(
+            ElevationMetres / 3000.0, 0.0, 1.5
+        );''', '''        const double ElevationFraction = FMath::Clamp(
+            ElevationMetres / 2400.0, 0.0, 1.65
+        );''', 'elevation climate scale')
+
+          one('''            RegionalTemperature - ElevationFraction * 0.46
+                - MountainExposure * ElevationFraction * 0.05,''', '''            RegionalTemperature - ElevationFraction * 0.52
+                - MountainExposure * ElevationFraction * 0.07,''', 'temperature lapse')
+
+          one('''            RegionalMoisture
+                - ElevationFraction * 0.11
+                - MountainExposure * 0.035,''', '''            RegionalMoisture
+                - ElevationFraction * 0.16
+                - MountainExposure * 0.055,''', 'exposure drying')
+
+          one('''        const bool bHighTerrain = FinalMountain > 0.28 || ElevationMetres > 1400.0;
+        if (Temperature < 0.105 && bHighTerrain)
+        {
+            Biome = EAvenorBiomeClass::SnowIce;
+        }
+        else if (Temperature < 0.32 && bHighTerrain)
+        {
+            Biome = EAvenorBiomeClass::AlpineTundra;
+        }''', '''        const double FinalHill = FMath::Clamp(
+            Data.HillMask[Cell], 0.0, 1.0
+        );
+        // Alpine is a climatic outcome, not a synonym for mountain. Very high
+        // terrain can become alpine regardless of structural label; lower
+        // mountains/hills remain in the regional biome unless cooling warrants
+        // an alpine transition.
+        const bool bMountainTerrain = FinalMountain > 0.34;
+        const bool bHighUpland = FinalHill > 0.32 && ElevationMetres > 850.0;
+        const bool bVeryHighTerrain = ElevationMetres > 1450.0;
+        const bool bAlpineCandidate = bVeryHighTerrain
+            || (bMountainTerrain && ElevationMetres > 850.0)
+            || (bHighUpland && ElevationMetres > 1050.0);
+        if (Temperature < 0.10
+            && (bVeryHighTerrain || (bMountainTerrain && ElevationMetres > 1200.0)))
+        {
+            Biome = EAvenorBiomeClass::SnowIce;
+        }
+        else if (Temperature < 0.29 && bAlpineCandidate)
+        {
+            Biome = EAvenorBiomeClass::AlpineTundra;
+        }''', 'alpine rules')
+
+          one('static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8ae")); }',
+              'static FGuid Version() { return FGuid(TEXT("db3d6d52-772c-4d64-9e37-1838c3738771")); }',
+              'modifier guid')
+
+          gen.write_text(s, encoding='utf-8')
+
+          terrain = Path('AvenorClient/Source/Avenor/AvenorTerrainData.cpp')
+          t = terrain.read_text(encoding='utf-8')
+          old = '''            const double CarveHalfWidth = FMath::Max(
+                River.Width * 0.5 + 100.0,
+                River.Width * 0.5 + River.BankWidth
+            );'''
+          new = '''            // The broad valley already exists in the eroded terrain. This
+            // final pass only guarantees clearance for the wetted channel and
+            // a narrow natural bank transition; it must not excavate a second
+            // artificial U-shaped gorge around every river spline.
+            const double BankMargin = FMath::Min(
+                FMath::Max(75.0, River.Width * 0.12),
+                FMath::Max(0.0, River.BankWidth)
+            );
+            const double CarveHalfWidth = FMath::Max(
+                River.Width * 0.52,
+                River.Width * 0.5 + BankMargin
+            );'''
+          if t.count(old) != 1:
+              raise RuntimeError(f'river carve width: expected 1 match, found {t.count(old)}')
+          t = t.replace(old, new, 1)
+          old = '''            const double BedZ = WaterZ - River.Depth;
+            const float CarvedZ = static_cast<float>(FMath::Lerp(
+                BedZ,
+                static_cast<double>(OutHeight),
+                FMath::SmoothStep(0.0, 1.0, CrossAlpha)
+            ));'''
+          new = '''            const double ClearanceDepth = FMath::Min(
+                FMath::Max(60.0, River.Width * 0.10),
+                FMath::Max(60.0, River.Depth)
+            );
+            const double BedZ = WaterZ - ClearanceDepth;
+            const double BankBlend = FMath::SmoothStep(
+                0.0, 1.0,
+                FMath::Pow(CrossAlpha, 0.72)
+            );
+            const float CarvedZ = static_cast<float>(FMath::Lerp(
+                BedZ,
+                static_cast<double>(OutHeight),
+                BankBlend
+            ));'''
+          if t.count(old) != 1:
+              raise RuntimeError(f'river carve depth: expected 1 match, found {t.count(old)}')
+          t = t.replace(old, new, 1)
+          terrain.write_text(t, encoding='utf-8')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp AvenorClient/Source/Avenor/AvenorTerrainData.cpp
+          git commit -m "Fix final landform classification and river gouging"
+          git push origin main
