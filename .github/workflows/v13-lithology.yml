@@ -1,0 +1,60 @@
+name: v13 lithology
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s=p.read_text()
+          start=s.find('    // Arid climate exposes and flattens resistant uplands into mesas and')
+          end=s.find('    // Dunes remain low-amplitude regional terrain on quiet arid plains.',start)
+          if start<0 or end<0: raise RuntimeError('mesa block not found')
+          s=s[:start]+'''    // Lithology is independent from shape. Drainage and differential erosion
+    // strip weak arid uplands while resistant caps survive, so mesas,
+    // escarpments and canyon rims emerge instead of being height stamps.
+    const double Lithology = 0.5 + 0.5 * Fbm(
+        Warped, FMath::Max(90000.0, Scale * 0.22),
+        SeedOffset + FVector2D(811.0, 397.0),
+        4, 0.58, 2.0
+    );
+    const double ResistantCap = OutDesertMask
+        * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
+        * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
+
+'''+s[end:]
+          old='const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - PlateauMask * 0.90)'
+          if old not in s: raise RuntimeError('dune dependency')
+          s=s.replace(old,'const double DuneSuitability = OutDesertMask * OutPlainsMask\n        * (1.0 - ResistantCap * 0.85)',1)
+          old='''    OutResistance = FMath::Clamp(
+        OutMountainMask * 0.28
+            + OutHillMask * 0.11
+            + OutDesertMask * (0.18 + PlateauMask * 0.38)
+            + RiftShoulder * 0.10,
+        0.0, 1.0
+    );'''
+          new='''    OutResistance = FMath::Clamp(
+        OutMountainMask * 0.24
+            + OutHillMask * 0.09
+            + OutDesertMask * 0.10
+            + ResistantCap * 0.62
+            + RiftShoulder * 0.10,
+        0.0, 1.0
+    );'''
+          if old not in s: raise RuntimeError('resistance block')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git commit -m "Replace stamped mesas with resistant lithology"
+          git push
