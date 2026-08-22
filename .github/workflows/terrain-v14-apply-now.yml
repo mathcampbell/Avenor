@@ -1,0 +1,296 @@
+name: Apply terrain v14 now
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.issue.title == 'RUN TERRAIN V14 APPLY'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply terrain v14 source changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
+          s = path.read_text(encoding='utf-8')
+
+          def one(old, new, label):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise RuntimeError(f'{label}: expected 1 match, found {n}')
+              s = s.replace(old, new, 1)
+
+          one('static constexpr int32 GeneratorAlgorithmVersion = 13;',
+              'static constexpr int32 GeneratorAlgorithmVersion = 14;',
+              'algorithm version')
+
+          helper = '''static double DrainageSourceMultiplier(
+    const FAvenorStripData& Data,
+    int32 Cell
+)
+{
+    const double MountainSupport = Data.MountainMask.IsValidIndex(Cell)
+        ? Data.MountainMask[Cell] : 0.0;
+    const double HillSupport = Data.HillMask.IsValidIndex(Cell)
+        ? Data.HillMask[Cell] : 0.0;
+    const double ReliefSupport = FMath::Max(
+        FMath::Max(MountainSupport, HillSupport * 0.75),
+        Smooth01(FMath::Clamp(Data.Slope[Cell] / 0.055, 0.0, 1.0))
+    );
+    const double SourceMoisture = Data.MacroMoisture.IsValidIndex(Cell)
+        ? Data.MacroMoisture[Cell]
+        : (Data.Moisture.IsValidIndex(Cell) ? Data.Moisture[Cell] : 0.5);
+    const double WetLowlandSupport = Smooth01(FMath::Clamp(
+        (SourceMoisture - 0.62) / 0.26, 0.0, 1.0
+    ));
+    const double DesertInfluence = Data.DesertMask.IsValidIndex(Cell)
+        ? Data.DesertMask[Cell] : 0.0;
+    const double AridSourcePenalty = DesertInfluence * Smooth01(
+        FMath::Clamp((0.52 - SourceMoisture) / 0.42, 0.0, 1.0)
+    );
+    const double SourceSupport = FMath::Max(
+        ReliefSupport, WetLowlandSupport
+    );
+    return 1.0
+        + (1.0 - SourceSupport) * 1.45
+        + AridSourcePenalty * 1.65;
+}
+'''
+          helper_new = helper + '''
+// Geomorphic erosion can preserve wetter palaeodrainage after the current
+// climate becomes dry. Active rivers still use the stricter modern threshold.
+static double ErosionDrainageSourceMultiplier(
+    const FAvenorStripData& Data,
+    int32 Cell
+)
+{
+    const double ActiveMultiplier = DrainageSourceMultiplier(Data, Cell);
+    const double Desert = Data.DesertMask.IsValidIndex(Cell)
+        ? FMath::Clamp(Data.DesertMask[Cell], 0.0, 1.0) : 0.0;
+    return FMath::Lerp(
+        FMath::Min(ActiveMultiplier, 1.85),
+        FMath::Min(ActiveMultiplier, 1.25),
+        Desert
+    );
+}
+'''
+          one(helper, helper_new, 'palaeodrainage helper')
+
+          old_use = ') * DrainageSourceMultiplier(Data, Cell);'
+          positions = []
+          start = s.index('static double ErosionDrainageSourceMultiplier')
+          while True:
+              i = s.find(old_use, start)
+              if i < 0:
+                  break
+              positions.append(i)
+              start = i + len(old_use)
+          if len(positions) < 3:
+              raise RuntimeError(f'drainage uses: expected >=3 after helper, found {len(positions)}')
+          for i in reversed(positions[:2]):
+              s = s[:i] + ') * ErosionDrainageSourceMultiplier(Data, Cell);' + s[i+len(old_use):]
+
+          one('''    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.62 + Province2 * 0.38 - 0.56) / 0.30,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.42 + Province2 * 0.58 - 0.30) / 0.46,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.42);''',
+'''    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.62 + Province2 * 0.38 - 0.59) / 0.29,
+        0.0, 1.0
+    ));
+    const double HillProvince = Smooth01(FMath::Clamp(
+        (Province * 0.42 + Province2 * 0.58 - 0.35) / 0.44,
+        0.0, 1.0
+    )) * (1.0 - MountainProvince * 0.46);''',
+              'province balance')
+
+          one('''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.44, 0.34, Activity)) / 0.38,
+        0.0, 1.0
+    )) * FMath::Lerp(0.48, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift);''',
+'''    const double BroadRange = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.48, 0.38, Activity)) / 0.40,
+        0.0, 1.0
+    )) * FMath::Lerp(0.42, 1.0, MountainProvince)
+       * FMath::Lerp(0.70, 1.0, PositiveUplift);''',
+              'mountain coverage')
+
+          one('''    const double FoothillEnvelope = Smooth01(FMath::Clamp(
+        (BeltSignal - 0.34) / 0.38, 0.0, 1.0
+    )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
+    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.40 * UplandRidges
+            + 0.40 * (0.5 + 0.5 * Rolling)
+            + 0.20 * Province2 - 0.33) / 0.46,
+        0.0, 1.0
+    ));''',
+'''    const double FoothillEnvelope = Smooth01(FMath::Clamp(
+        (BeltSignal - 0.38) / 0.38, 0.0, 1.0
+    )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
+    const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
+        (0.40 * UplandRidges
+            + 0.40 * (0.5 + 0.5 * Rolling)
+            + 0.20 * Province2 - 0.38) / 0.44,
+        0.0, 1.0
+    ));''',
+              'hill coverage')
+
+          one('''    double Height = Uplift * Relief * 0.075
+        + RegionalTilt * Relief * 0.025;''',
+'''    // Zero is a world datum, not the top of the relief. Ordinary country
+    // gets a modest positive regional elevation while basins and rifts can
+    // still fall below it and mountains rise clearly above it.
+    const double RegionalElevation = Fbm(
+        Warped, Scale * 2.35,
+        SeedOffset + FVector2D(2273.0, 1291.0),
+        4, 0.56, 2.0
+    );
+    double Height = Relief * 0.060
+        + RegionalElevation * Relief * 0.080
+        + Uplift * Relief * 0.075
+        + RegionalTilt * Relief * 0.025;''',
+              'terrain datum')
+
+          anchor = '''static void SuppressPathologicalMeanders(
+    const TArray<FVector>& BasePoints,'''
+          thalweg = '''// After visual smoothing, put the river back onto the local thalweg so
+// spline beautification cannot move a hydrologically valid channel sideways
+// onto a contour and make the water modifier cut a road-like shelf.
+static void ProjectRiverToLocalThalweg(
+    const FAvenorStripData& Data,
+    TArray<FVector>& Points
+)
+{
+    if (Points.Num() < 3)
+    {
+        return;
+    }
+    for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
+    {
+        const FVector2D Previous(Points[Index - 1]);
+        const FVector2D Current(Points[Index]);
+        const FVector2D Next(Points[Index + 1]);
+        const FVector2D Tangent = (Next - Previous).GetSafeNormal();
+        if (Tangent.IsNearlyZero())
+        {
+            continue;
+        }
+        const FVector2D Normal = Rotate90(Tangent);
+        const double LocalSlope = Data.SampleGrid(Data.Slope, Current);
+        const double Steepness = Smooth01(FMath::Clamp(
+            (LocalSlope - 0.025) / 0.10, 0.0, 1.0
+        ));
+        const double SearchRadius = Data.CellSize
+            * FMath::Lerp(1.45, 0.75, Steepness);
+        FVector2D Best = Current;
+        double BestHeight = Data.SampleGrid(Data.Height, Current);
+        double BestScore = BestHeight;
+        for (int32 Step = -6; Step <= 6; ++Step)
+        {
+            if (Step == 0)
+            {
+                continue;
+            }
+            const double Offset = SearchRadius
+                * static_cast<double>(Step) / 6.0;
+            const FVector2D Candidate = Current + Normal * Offset;
+            if (!Data.Bounds.IsInside(FVector(Candidate.X, Candidate.Y, 0.0)))
+            {
+                continue;
+            }
+            const double CandidateHeight = Data.SampleGrid(Data.Height, Candidate);
+            const double Score = CandidateHeight + FMath::Abs(Offset) * 0.030;
+            if (Score < BestScore - 40.0)
+            {
+                BestScore = Score;
+                BestHeight = CandidateHeight;
+                Best = Candidate;
+            }
+        }
+        const double Snap = FMath::Lerp(0.62, 0.94, Steepness);
+        Points[Index].X = FMath::Lerp(Current.X, Best.X, Snap);
+        Points[Index].Y = FMath::Lerp(Current.Y, Best.Y, Snap);
+        Points[Index].Z = BestHeight;
+    }
+}
+
+'''
+          if s.count(anchor) != 1:
+              raise RuntimeError('thalweg insertion anchor missing/ambiguous')
+          s = s.replace(anchor, thalweg + anchor, 1)
+
+          one('''        Points = ResamplePolyline(
+            Points,
+            FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
+            false
+        );
+        for (FVector& Point : Points)
+        {
+            const FVector2D Position(Point);
+            Point.Z = Data.SampleGrid(Data.Height, Position);
+        }
+        EnforceDownhill(Points);''',
+'''        Points = ResamplePolyline(
+            Points,
+            FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
+            false
+        );
+        ProjectRiverToLocalThalweg(Data, Points);
+        for (FVector& Point : Points)
+        {
+            const FVector2D Position(Point);
+            Point.Z = Data.SampleGrid(Data.Height, Position);
+        }
+        EnforceDownhill(Points);''',
+              'thalweg projection call')
+
+          one('''        River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
+        River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
+        River.ChannelSteepness = ChannelSteepness;
+        const double HumidValley = Smooth01(FMath::Clamp(''',
+'''        River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
+        River.ValleyDepth = FMath::Lerp(River.Depth * 1.4, MaximumValleyDepth, RiverAlpha);
+        River.ChannelSteepness = ChannelSteepness;
+        // Erosion already formed the steep valley. Keep the final Water Body
+        // carve close to the active channel instead of stamping a broad shelf.
+        const double SteepValley = Smooth01(FMath::Clamp(
+            (MeanSlope - 0.025) / 0.10, 0.0, 1.0
+        ));
+        River.ValleyHalfWidth *= FMath::Lerp(1.0, 0.38, SteepValley);
+        River.ValleyDepth *= FMath::Lerp(1.0, 0.78, SteepValley);
+        const double HumidValley = Smooth01(FMath::Clamp(''',
+              'steep valley carve')
+
+          one('static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }',
+              'static FGuid Version() { return FGuid(TEXT("b96f4c24-6fb4-49c2-9e1e-7b43ef405e14")); }',
+              'mesh modifier version')
+
+          path.write_text(s, encoding='utf-8')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
+          git rm -f .github/workflows/terrain-v14-apply-now.yml \
+                    .github/workflows/terrain-v14-issue-runner.yml \
+                    .github/workflows/terrain-v14-rivers-probe.yml \
+                    .github/workflows/terrain-v14-scheduled-runner.yml
+          git commit -m "Fix terrain relief, palaeodrainage and river routing"
+          git push origin main
