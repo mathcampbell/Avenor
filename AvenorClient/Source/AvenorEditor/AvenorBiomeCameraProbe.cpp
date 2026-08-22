@@ -1,6 +1,7 @@
 #include "AvenorStripTerrainGenerator.h"
 #include "AvenorTerrainData.h"
 
+#include "Containers/Ticker.h"
 #include "DrawDebugHelpers.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
@@ -159,28 +160,30 @@ class FCameraProbe
 public:
     FCameraProbe()
     {
-        TickHandle = FEditorDelegates::PostEditorTick.AddRaw(this, &FCameraProbe::Tick);
+        TickHandle = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateRaw(this, &FCameraProbe::Tick)
+        );
     }
 
     ~FCameraProbe()
     {
         if (TickHandle.IsValid())
         {
-            FEditorDelegates::PostEditorTick.Remove(TickHandle);
+            FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
         }
     }
 
 private:
-    void Tick(float DeltaSeconds)
+    bool Tick(float DeltaSeconds)
     {
         if (CVarEnabled.GetValueOnGameThread() == 0 || !GEditor)
         {
-            return;
+            return true;
         }
         Accumulator += DeltaSeconds;
         if (Accumulator < FMath::Max(0.05f, CVarUpdateSeconds.GetValueOnGameThread()))
         {
-            return;
+            return true;
         }
         Accumulator = 0.0f;
 
@@ -188,7 +191,7 @@ private:
         FLevelEditorViewportClient* ViewClient = GCurrentLevelEditingViewportClient;
         if (!World || !ViewClient)
         {
-            return;
+            return true;
         }
 
         AAvenorStripTerrainGenerator* Generator = nullptr;
@@ -199,13 +202,13 @@ private:
         }
         if (!Generator)
         {
-            return;
+            return true;
         }
 
         UAvenorTerrainData* Data = Generator->BakedTerrainData.LoadSynchronous();
         if (!Data || !Data->HasValidData())
         {
-            return;
+            return true;
         }
 
         const FVector Camera = ViewClient->GetViewLocation();
@@ -213,7 +216,7 @@ private:
         const FBox2D ClimateBounds = Data->WorldClimateMaps.WorldBounds;
         if (!ClimateBounds.bIsValid || !ClimateBounds.IsInside(XY))
         {
-            return;
+            return true;
         }
 
         UTexture2D* ClimateTexture = Data->WorldClimateMaps.ClimateFilterTexture.LoadSynchronous();
@@ -223,7 +226,7 @@ private:
             || !BaseBiomePixels.Refresh(BaseBiomeTexture)
             || !LocalBiomePixels.Refresh(LocalBiomeTexture))
         {
-            return;
+            return true;
         }
 
         const FColor* Climate = ClimatePixels.Sample(ClimateBounds, XY);
@@ -231,7 +234,7 @@ private:
         const FColor* LocalBiomePixel = LocalBiomePixels.Sample(ClimateBounds, XY);
         if (!Climate || !BaseBiomePixel)
         {
-            return;
+            return true;
         }
 
         const EAvenorBiomeClass BaseBiome = ClosestBiomeColour(*BaseBiomePixel);
@@ -285,6 +288,8 @@ private:
             true,
             1.05f
         );
+
+        return true;
     }
 
     FDelegateHandle TickHandle;
