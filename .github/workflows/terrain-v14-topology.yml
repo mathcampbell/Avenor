@@ -11,11 +11,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply terrain v14 geology orientation and river continuity
+      - name: Apply terrain v14 geology orientation river continuity and lake clearance
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path('AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp')
           s = p.read_text(encoding='utf-8')
           original = s
@@ -164,19 +165,15 @@ jobs:
         + RegionalTilt * Relief * 0.025;''', '''    double Height = Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;''', 'regional structure height')
 
-          # Keep candidates in score order, but make the reach cap topology-aware.
-          # Any displayed tributary must bring its entire downstream chain with it.
           one('''    Candidates.Sort([](const FRiverCandidate& A, const FRiverCandidate& B) { return A.Score > B.Score; });
     const int32 ReachCount = FMath::Min(MaximumReaches, Candidates.Num());
     for (int32 ReachIndex = 0; ReachIndex < ReachCount; ++ReachIndex)
     {
         const FRiverCandidate& CandidateReach = Candidates[ReachIndex];''', '''    Candidates.Sort([](const FRiverCandidate& A, const FRiverCandidate& B) { return A.Score > B.Score; });
 
-    // MaximumRiverReaches used to truncate independently scored reach segments.
-    // That could retain two tributaries while dropping their lower trunk, leaving
-    // a visible Y-shaped river that simply stopped inland. Select complete
-    // downstream closures instead: every retained reach either ends in a lake,
-    // at the world boundary, or continues into another retained reach.
+    // Never truncate a river system in the middle just because the reach budget
+    // was exhausted. Selecting a tributary also selects every downstream reach
+    // needed to get it to a lake or the world boundary.
     TMap<int32, int32> CandidateByStartCell;
     for (int32 CandidateIndex = 0; CandidateIndex < Candidates.Num(); ++CandidateIndex)
     {
@@ -201,12 +198,17 @@ jobs:
         TArray<int32> Closure;
         TSet<int32> ClosureSet;
         int32 CandidateIndex = RankedIndex;
+        bool bHasValidTerminus = false;
         for (int32 Guard = 0;
              Guard < Candidates.Num() && CandidateIndex != INDEX_NONE;
              ++Guard)
         {
-            if (SelectedCandidates[CandidateIndex]
-                || ClosureSet.Contains(CandidateIndex))
+            if (SelectedCandidates[CandidateIndex])
+            {
+                bHasValidTerminus = true;
+                break;
+            }
+            if (ClosureSet.Contains(CandidateIndex))
             {
                 break;
             }
@@ -215,19 +217,26 @@ jobs:
             const FRiverCandidate& Candidate = Candidates[CandidateIndex];
             if (Candidate.EndLakeIndex != INDEX_NONE || Candidate.Cells.IsEmpty())
             {
+                bHasValidTerminus = true;
                 break;
             }
             const int32 EndCell = Candidate.Cells.Last();
             const int32 X = EndCell % Data.Columns;
             const int32 Y = EndCell / Data.Columns;
-            if (Data.IsBoundary(X, Y))
+            if (Data.IsBoundary(X, Y)
+                || PrimaryReceiver(Data, EndCell) == INDEX_NONE)
             {
+                bHasValidTerminus = true;
                 break;
             }
             const int32* DownstreamCandidate = CandidateByStartCell.Find(EndCell);
             CandidateIndex = DownstreamCandidate ? *DownstreamCandidate : INDEX_NONE;
         }
 
+        if (!bHasValidTerminus)
+        {
+            continue;
+        }
         int32 NewReachCount = 0;
         for (int32 ClosureIndex : Closure)
         {
@@ -268,15 +277,32 @@ jobs:
         const int32 ReachIndex = SelectedCandidateIndices[SelectedIndex];
         const FRiverCandidate& CandidateReach = Candidates[ReachIndex];''', 'topology-aware river reach selection')
 
-          # Seed meander variation should follow the actual candidate index after
-          # topology selection, not its compact selected-list position.
-          one('''            Seed ^ (ReachIndex * 0x45D9F3B),''', '''            Seed ^ (ReachIndex * 0x45D9F3B),''', 'meander seed unchanged')
-
           one('static FGuid Version() { return FGuid(TEXT("a4176c44-ff53-49b0-b453-f5e869d2c7c0")); }',
               'static FGuid Version() { return FGuid(TEXT("7dc8a0b9-2d86-4c16-a1f5-4fe5de4184b8")); }', 'DDC version')
 
           if s != original:
               p.write_text(s, encoding='utf-8')
+
+          # Keep the generated water surface clear of the broad terrain mesh.
+          # Previously lake ground was exactly coplanar with the water datum at
+          # the shoreline, which could leave a valid lake actor visually buried.
+          td = Path('AvenorClient/Source/Avenor/AvenorTerrainData.cpp')
+          t = td.read_text(encoding='utf-8')
+          old = '''            const float LakeGroundZ = static_cast<float>(
+                Lake.SurfaceHeight - BedDepth * DepthAlpha
+            );'''
+          new = '''            const double MinimumWaterClearance = FMath::Clamp(
+                BedDepth * 0.04, 50.0, 125.0
+            );
+            const float LakeGroundZ = static_cast<float>(
+                Lake.SurfaceHeight - MinimumWaterClearance
+                    - BedDepth * DepthAlpha
+            );'''
+          if old in t:
+              t = t.replace(old, new, 1)
+              td.write_text(t, encoding='utf-8')
+          elif new not in t:
+              raise RuntimeError('missing lake water-clearance target')
           PY
           if git diff --quiet; then
             echo "terrain v14 already applied"
@@ -284,6 +310,6 @@ jobs:
           fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp
-          git commit -m "Decouple geology and preserve river continuity"
+          git add AvenorClient/Source/AvenorEditor/AvenorStripTerrainGenerator.cpp AvenorClient/Source/Avenor/AvenorTerrainData.cpp
+          git commit -m "Decouple geology preserve river continuity and expose lakes"
           git push
