@@ -49,17 +49,17 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate")
     bool bEnabled = true;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "0 is cold and 1 is hot. Elevation cools this regional baseline automatically."))
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Middle point of the world's temperature range. 0 is cold and 1 is hot. Broad climate regions vary around this value and elevation cools the local result automatically."))
     double Temperature = 0.5;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Regional precipitation before terrain drainage and proximity to generated water are applied."))
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Middle point of the world's precipitation range. Broad climate regions vary around this value before terrain drainage and proximity to generated water are applied."))
     double Moisture = 0.5;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls slow regional variation. Adjacent control points remain constrained so climate cannot jump directly from cold to hot."))
-    double RegionalVariation = 0.55;
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls how strongly successive broad climate regions differ. The default is deliberately high enough for a long Avenor strip to contain clearly different wet, dry, cold and warm regions without abrupt biome bands."))
+    double RegionalVariation = 0.72;
 
-    UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (Units = "cm", ClampMin = "100000.0", ToolTip = "Spacing of the smooth climate control points and length of each exported PCG source tile. Five kilometres is the recommended default."))
-    double RegionSpacing = 500000.0;
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "500000.0", ClampMax = "3000000.0", ToolTip = "Characteristic length of a broad climate region along the world's long axis. Default 1,500,000 cm = 15 km. Values are smoothly interpolated, so this is not a hard biome boundary or grid size."))
+    double RegionSpacing = 1500000.0;
 
     UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (Units = "cm", ClampMin = "10000.0", ToolTip = "Distance over which rivers and lakes increase local habitat moisture."))
     double WaterInfluenceDistance = 100000.0;
@@ -67,7 +67,7 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     double WaterMoistureBoost = 0.35;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ToolTip = "Compresses a wider climate range into a short proof-of-concept map. Leave disabled for geographically gentler transitions."))
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ToolTip = "Compresses unusually large climate changes into a short proof-of-concept map. Useful for short test worlds; normally leave disabled for a full-length world."))
     bool bShowcaseClimateCompression = false;
 };
 
@@ -312,8 +312,8 @@ public:
     bool bGenerateClimate = true;
     double ClimateTemperature = 0.5;
     double ClimateMoisture = 0.5;
-    double ClimateRegionalVariation = 0.55;
-    double ClimateRegionSpacing = 500000.0;
+    double ClimateRegionalVariation = 0.72;
+    double ClimateRegionSpacing = 1500000.0;
     double ClimateWaterInfluenceDistance = 100000.0;
     double ClimateWaterMoistureBoost = 0.35;
     bool bShowcaseClimateCompression = false;
