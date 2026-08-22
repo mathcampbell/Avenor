@@ -296,8 +296,16 @@ bool UAvenorTerrainData::SampleFinalHeight(
                     ? Lake.ModifierBedDepth
                     : Lake.MaximumDepth
             );
+            // Keep the lake interior unambiguously below the water datum even
+            // at the first samples inside the shoreline. Without this clearance
+            // the min-only carve could leave terrain exactly coplanar with the
+            // Water Body Lake surface and visually bury a perfectly valid lake.
+            const double MinimumWaterClearance = FMath::Clamp(
+                BedDepth * 0.04, 50.0, 125.0
+            );
             const float LakeGroundZ = static_cast<float>(
-                Lake.SurfaceHeight - BedDepth * DepthAlpha
+                Lake.SurfaceHeight - MinimumWaterClearance
+                    - BedDepth * DepthAlpha
             );
             OutHeight = FMath::Min(OutHeight, LakeGroundZ);
         }
