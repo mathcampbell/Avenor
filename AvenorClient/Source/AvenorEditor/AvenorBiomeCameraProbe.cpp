@@ -156,6 +156,77 @@ static const TCHAR* MoistureLabel(double Value)
     return TEXT("Wet");
 }
 
+static const TCHAR* ClassifyFinalLandform(
+    const UAvenorTerrainData& Data,
+    const FVector2D& Position,
+    const FAvenorTerrainSample& Centre,
+    FAvenorTerrainHeightChunkCache& Cache
+)
+{
+    // Diagnose the terrain that actually survived erosion rather than simply
+    // echoing the original structural mask.  Mountain is a geometric landform;
+    // alpine is a separate climate/biome decision.
+    const double NearRadius = FMath::Max(60000.0, Data.CellSize * 12.0);
+    const double FarRadius = FMath::Max(180000.0, Data.CellSize * 36.0);
+    static const FVector2D Directions[] = {
+        FVector2D(1,0), FVector2D(-1,0), FVector2D(0,1), FVector2D(0,-1),
+        FVector2D(0.70710678,0.70710678), FVector2D(-0.70710678,0.70710678),
+        FVector2D(0.70710678,-0.70710678), FVector2D(-0.70710678,-0.70710678)
+    };
+
+    double NearMin = Centre.Height;
+    double NearMax = Centre.Height;
+    double FarMin = Centre.Height;
+    double FarMax = Centre.Height;
+    for (const FVector2D& Direction : Directions)
+    {
+        FAvenorTerrainSample Sample;
+        if (Data.SampleTerrain(Position + Direction * NearRadius, Sample, Cache))
+        {
+            NearMin = FMath::Min(NearMin, static_cast<double>(Sample.Height));
+            NearMax = FMath::Max(NearMax, static_cast<double>(Sample.Height));
+        }
+        if (Data.SampleTerrain(Position + Direction * FarRadius, Sample, Cache))
+        {
+            FarMin = FMath::Min(FarMin, static_cast<double>(Sample.Height));
+            FarMax = FMath::Max(FarMax, static_cast<double>(Sample.Height));
+        }
+    }
+
+    const double NearRelief = FMath::Max(0.0, NearMax - NearMin);
+    const double FarRelief = FMath::Max(0.0, FarMax - FarMin);
+    const double NearProminence = FMath::Max(0.0, static_cast<double>(Centre.Height) - NearMin);
+    const double FarProminence = FMath::Max(0.0, static_cast<double>(Centre.Height) - FarMin);
+    const double ElevationMetres = FMath::Max(0.0, static_cast<double>(Centre.Height)) / 100.0;
+    const double Prominence = FMath::Max(NearProminence, FarProminence * 0.72);
+
+    const bool bMountain = Centre.Mountain >= 0.34f
+        || ((ElevationMetres > 450.0 || Centre.Slope > 0.025f)
+            && FarRelief > 28000.0
+            && Prominence > 12000.0)
+        || (ElevationMetres > 850.0
+            && FarRelief > 18000.0
+            && Centre.Slope > 0.018f);
+    if (bMountain)
+    {
+        return TEXT("Mountain");
+    }
+
+    const bool bUpland = Centre.Hill >= 0.32f
+        || (NearRelief > 5000.0 && NearProminence > 3500.0)
+        || (ElevationMetres > 250.0
+            && (NearRelief > 3500.0 || Centre.Slope > 0.012f));
+    if (bUpland)
+    {
+        return TEXT("Hills / upland");
+    }
+    if (Centre.Desert >= 0.45f)
+    {
+        return TEXT("Arid lowland / plateau");
+    }
+    return TEXT("Lowland / plains");
+}
+
 class FCameraProbe
 {
 public:
@@ -251,14 +322,9 @@ private:
 
         FAvenorTerrainSample Terrain;
         const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
-        const TCHAR* Landform = TEXT("Unknown");
-        if (bTerrain)
-        {
-            if (Terrain.Mountain >= 0.45f) Landform = TEXT("Mountain");
-            else if (Terrain.Hill >= 0.40f) Landform = TEXT("Hills / upland");
-            else if (Terrain.Desert >= 0.45f) Landform = TEXT("Arid lowland / plateau");
-            else Landform = TEXT("Lowland / plains");
-        }
+        const TCHAR* Landform = bTerrain
+            ? ClassifyFinalLandform(*Data, XY, Terrain, TerrainCache)
+            : TEXT("Unknown");
 
         const FString Status = FString::Printf(
             TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
@@ -276,9 +342,6 @@ private:
             Camera.Y / 100000.0
         );
 
-        // DrawDebugString is world-space and proved unreliable in the editor
-        // viewport. Keep it as a spatial fallback, but also render a fixed
-        // on-screen message so the probe is visible regardless of camera pose.
         const FVector TextLocation = Camera
             + ViewClient->GetViewRotation().Vector() * 1200.0
             + FVector(0.0, 0.0, 220.0);
