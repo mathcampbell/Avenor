@@ -34,13 +34,19 @@ struct FTexturePixels
     int32 Height = 0;
     TArray<FColor> Pixels;
 
+    void Reset()
+    {
+        Texture = nullptr;
+        Width = 0;
+        Height = 0;
+        Pixels.Reset();
+    }
+
     bool Refresh(UTexture2D* InTexture)
     {
         if (!InTexture || InTexture->Source.GetFormat(0) != TSF_BGRA8)
         {
-            Texture = nullptr;
-            Pixels.Reset();
-            Width = Height = 0;
+            Reset();
             return false;
         }
         const int32 NewWidth = InTexture->Source.GetSizeX();
@@ -54,9 +60,7 @@ struct FTexturePixels
         if (!InTexture->Source.GetMipData(RawMip, 0, nullptr)
             || RawMip.Num() != static_cast<int64>(NewWidth) * NewHeight * sizeof(FColor))
         {
-            Texture = nullptr;
-            Pixels.Reset();
-            Width = Height = 0;
+            Reset();
             return false;
         }
         Texture = InTexture;
@@ -179,6 +183,21 @@ public:
     }
 
 private:
+    void ResetBakedCaches(const UAvenorTerrainData* Data)
+    {
+        // Do not retain or reset decompressed terrain chunks on this static
+        // live-coding object. FAvenorTerrainSampleChunk lives in the runtime
+        // module; destroying a TMap of those chunks from a replaced editor
+        // patch can cross module generations and crash during Live Coding.
+        // Terrain sampling instead uses a short-lived cache inside each tick.
+        ClimatePixels.Reset();
+        BaseBiomePixels.Reset();
+        LocalBiomePixels.Reset();
+        CachedData = Data;
+        CachedGeneratedAtUtc = Data ? Data->GeneratedAtUtc : FDateTime();
+        CachedSettingsHash = Data ? Data->SettingsHash : FString();
+    }
+
     bool Tick(float DeltaSeconds)
     {
         if (CVarEnabled.GetValueOnGameThread() == 0 || !GEditor || !GEngine)
@@ -213,22 +232,31 @@ private:
         UAvenorTerrainData* Data = Generator->BakedTerrainData.LoadSynchronous();
         if (!Data || !Data->HasValidData())
         {
+            ResetBakedCaches(nullptr);
             GEngine->AddOnScreenDebugMessage(
                 0x0A7E0B10, 0.5f, FColor::White,
                 TEXT("AVENOR LOCATION PROBE\nBaked terrain data unavailable"), false);
             return true;
         }
 
+        if (CachedData.Get() != Data
+            || CachedGeneratedAtUtc != Data->GeneratedAtUtc
+            || CachedSettingsHash != Data->SettingsHash)
+        {
+            ResetBakedCaches(Data);
+        }
+
+        // Intentional semantics: report the world-space XY directly beneath
+        // the editor camera, not the centre of the view or a cursor raycast.
         const FVector Camera = ViewClient->GetViewLocation();
         const FVector2D XY(Camera.X, Camera.Y);
+
+        // Keep decompressed terrain data local to this tick. Apart from being
+        // live-coding safe, this guarantees a rebake can never leave the probe
+        // serving stale chunks from the previous geography.
+        FAvenorTerrainHeightChunkCache TerrainCache;
         FAvenorTerrainSample Terrain;
         const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
-        // SampleTerrain (above) reads the raw pre-carve analysis grid, used
-        // for landform classification (mountain/hill/desert character is a
-        // structural property, not something a river carving through it
-        // should change). The displayed elevation should instead be what is
-        // actually visible at this point, including river/lake carving, or
-        // it reads as wrong every time the camera is over a water feature.
         float FinalHeight = Terrain.Height;
         bool bWaterAffected = false;
         if (bTerrain)
@@ -305,10 +333,12 @@ private:
 
     FTSTicker::FDelegateHandle TickHandle;
     float Accumulator = 0.0f;
+    TWeakObjectPtr<const UAvenorTerrainData> CachedData;
+    FDateTime CachedGeneratedAtUtc;
+    FString CachedSettingsHash;
     FTexturePixels ClimatePixels;
     FTexturePixels BaseBiomePixels;
     FTexturePixels LocalBiomePixels;
-    FAvenorTerrainHeightChunkCache TerrainCache;
 };
 
 static FCameraProbe GCameraProbe;
