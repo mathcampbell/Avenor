@@ -1855,8 +1855,24 @@ static void ApplyStreamPowerErosion(
             const double LocalResistance = bUseResistance
                 ? FMath::Clamp(Data.Resistance[Cell] * ResistanceStrength, 0.0, 0.92)
                 : 0.0;
+            // Suppress incision on cells that are not the dominant D8 flow
+            // path. The MFD accumulation above disperses across two
+            // receivers at every cell, so two adjacent cells can each
+            // independently accumulate enough area to qualify for incision
+            // even though only one is really "the" channel - carving two
+            // parallel troughs a cell apart that get permanently entrenched,
+            // instead of one channel. D8 accumulation concentrates all of a
+            // path's flow onto a single thread, so a genuine secondary
+            // candidate shows much less D8 accumulation than MFD
+            // accumulation even where the two look similar under MFD alone.
+            // Damping only (clamped to 1.0), not boosting the winner, to
+            // keep this a minimal change to already-tuned incision strength.
+            const double D8Dominance = Data.AccumulationD8.IsValidIndex(Cell)
+                ? FMath::Clamp(
+                    Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
+                ) : 1.0;
             Delta[Cell] = FMath::Min(Data.CellSize * 6.0, Strength * 760.0 * AreaFactor * SlopeFactor) *
-                (1.0 - LocalResistance);
+                (1.0 - LocalResistance) * D8Dominance;
         }
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
@@ -1939,11 +1955,21 @@ static void EvolveTerrainFromDrainage(
             const double CanyonSuitability = Desert
                 * Smooth01(FMath::Clamp((Resistance - 0.22) / 0.55, 0.0, 1.0))
                 * FMath::Clamp(Hill + Mountain * 0.55, 0.0, 1.0);
+            // Same D8-dominance damping as ApplyStreamPowerErosion, and for
+            // the same reason: this channel-centred incision term (not the
+            // deliberate BroadValley widening below it) can otherwise
+            // entrench a second parallel candidate a cell away from the real
+            // channel, since MFD lets both accumulate enough area.
+            const double D8Dominance = Data.AccumulationD8.IsValidIndex(Cell)
+                ? FMath::Clamp(
+                    Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
+                ) : 1.0;
             const double Incision = Strength * Data.CellSize
                 * FMath::Lerp(0.035, 0.085, CanyonSuitability)
                 * ChannelPower
                 * (0.45 + FMath::Clamp(Slope / 0.09, 0.0, 1.0) * 0.55)
-                * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability);
+                * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability)
+                * D8Dominance;
             Delta[Cell] -= Incision;
 
             // Large streams in weak/wet terrain broaden valleys. Resistant arid
