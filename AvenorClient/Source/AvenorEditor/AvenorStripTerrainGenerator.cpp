@@ -492,6 +492,8 @@ static void AddBroadMeanders(
 struct FRiverReach
 {
     TArray<FVector> Points;
+    TArray<float> PointWidths;
+    TArray<float> PointDepths;
     double Width = 500.0;
     double Depth = 250.0;
     double ValleyHalfWidth = 15000.0;
@@ -627,7 +629,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 16;
+static constexpr int32 GeneratorAlgorithmVersion = 17;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2902,6 +2904,51 @@ struct FRiverCandidate
     int32 EndLakeIndex = INDEX_NONE;
 };
 
+static void PopulateRiverHydraulics(
+    const FAvenorStripData& Data,
+    FRiverReach& River,
+    double MainRiverArea,
+    double HeadwaterWidth,
+    double MainRiverWidth,
+    double MaximumDepth
+)
+{
+    River.PointWidths.Reset(River.Points.Num());
+    River.PointDepths.Reset(River.Points.Num());
+    double DownstreamArea = 0.0;
+    for (const FVector& Point : River.Points)
+    {
+        // Smoothing and meandering move render points away from drainage-cell
+        // centres, so sample the authoritative D8 accumulation field at the
+        // final spline position. Accumulation must never decrease downstream;
+        // enforcing that invariant also removes tiny width pulses caused by
+        // interpolation either side of a cell boundary.
+        const double SampledArea = Data.SampleGrid(
+            Data.AccumulationD8, FVector2D(Point)
+        );
+        DownstreamArea = FMath::Max(DownstreamArea, SampledArea);
+        const double LocalAlpha = DrainageScaleAlpha(
+            DownstreamArea, MainRiverArea
+        );
+        River.PointWidths.Add(static_cast<float>(FMath::Lerp(
+            HeadwaterWidth, MainRiverWidth, LocalAlpha
+        )));
+        River.PointDepths.Add(static_cast<float>(FMath::Lerp(
+            FMath::Max(120.0, MaximumDepth * 0.12),
+            MaximumDepth,
+            LocalAlpha
+        )));
+    }
+    if (!River.PointWidths.IsEmpty())
+    {
+        River.Width = River.PointWidths.Last();
+    }
+    if (!River.PointDepths.IsEmpty())
+    {
+        River.Depth = River.PointDepths.Last();
+    }
+}
+
 static bool FindClosestLakeShorePoint(
     const FAvenorStripData& Data,
     const FVector2D& Position,
@@ -3210,7 +3257,6 @@ static void ExtractRivers(
     }
     Starts.Sort([&](int32 A, int32 B) { return Data.FilledHeight[A] > Data.FilledHeight[B]; });
 
-    TSet<int64> UsedEdges;
     TArray<FRiverCandidate> Candidates;
     for (int32 Start : Starts)
     {
@@ -3237,18 +3283,18 @@ static void ExtractRivers(
             {
                 break;
             }
-            const int64 EdgeKey = (static_cast<int64>(Cell) << 32) | static_cast<uint32>(Receiver);
-            if (UsedEdges.Contains(EdgeKey))
-            {
-                break;
-            }
-            UsedEdges.Add(EdgeKey);
             Cell = Receiver;
             if (Data.LakeIndex.IsValidIndex(Cell) && Data.LakeIndex[Cell] != INDEX_NONE)
             {
                 break;
             }
-            if (UpstreamCount[Cell] != 1)
+            // Reaches are renderable sections of the directed drainage graph:
+            // stop at every confluence/headwater breakpoint and at every lake
+            // outflow breakpoint, then let the reach beginning at that same
+            // cell carry the combined flow onward. A global UsedEdges set used
+            // to make extraction order decide whether that downstream trunk
+            // existed at all.
+            if (UpstreamCount[Cell] != 1 || ForcedSeedSet.Contains(Cell))
             {
                 CandidateReach.Cells.Add(Cell);
                 break;
@@ -3264,7 +3310,11 @@ static void ExtractRivers(
         }
     }
     Candidates.Sort([](const FRiverCandidate& A, const FRiverCandidate& B) { return A.Score > B.Score; });
-    const int32 ReachCount = FMath::Min(MaximumReaches, Candidates.Num());
+    // Never truncate a directed river graph after extraction. Doing so can
+    // retain two high-scoring tributaries but discard their shorter downstream
+    // trunk, leaving an impossible inland confluence terminus. Density and
+    // minimum-system-length settings control the amount of river upstream.
+    const int32 ReachCount = Candidates.Num();
     for (int32 ReachIndex = 0; ReachIndex < ReachCount; ++ReachIndex)
     {
         const FRiverCandidate& CandidateReach = Candidates[ReachIndex];
@@ -3450,6 +3500,10 @@ static void ExtractRivers(
         AddLevelLakeJunctionPads(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
+        PopulateRiverHydraulics(
+            Data, River, MainRiverArea, HeadwaterWidth, MainRiverWidth,
+            MaximumDepth
+        );
         River.Bounds = FBox2D(ForceInit);
         for (const FVector& Point : River.Points)
         {
@@ -3535,9 +3589,7 @@ namespace UE::Avenor::Strip
 {
 static double EvaluateLandform(
     const FVector2D& Position,
-    const FBox& Bounds,
     int32 Seed,
-    EAvenorStripLongAxis LongAxis,
     double ReliefHeight,
     double StructuralScale,
     double TectonicActivity,
@@ -3553,10 +3605,6 @@ static double EvaluateLandform(
 )
 {
     const double Relief = FMath::Max(25000.0, ReliefHeight);
-    const FVector WorldSize = Bounds.GetSize();
-    const double ShortExtent = FMath::Max(
-        100000.0, FMath::Min(WorldSize.X, WorldSize.Y)
-    );
     // StructuralScale arrives already resolved (explicit or auto-derived from
     // world size) in ResolveSettings(). Only guard against degenerate values
     // here - do not re-derive from ShortExtent, or an explicit user choice
@@ -3570,9 +3618,6 @@ static double EvaluateLandform(
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
 
-    const FVector2D StripAxis = LongAxis == EAvenorStripLongAxis::X
-        ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
-    const FVector2D StripAcross = Rotate90(StripAxis);
     const double SeedAngleA = FMath::Fmod(
         FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
     );
@@ -3703,18 +3748,6 @@ static double EvaluateLandform(
     )) * FMath::Lerp(0.50, 1.0, MountainProvince)
        * FMath::Lerp(0.68, 1.0, PositiveUplift);
 
-    const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
-        ? Position.Y - Bounds.GetCenter().Y
-        : Position.X - Bounds.GetCenter().X;
-    const double SpineCoreHalfWidth = ShortExtent * 0.07;
-    const double SpineRecoveryWidth = ShortExtent * 0.18;
-    const double SpineRecovery = Smooth01(FMath::Clamp(
-        (FMath::Abs(AcrossCoordinate) - SpineCoreHalfWidth)
-            / FMath::Max(1.0, SpineRecoveryWidth),
-        0.0, 1.0
-    ));
-    BroadRange *= FMath::Lerp(0.45, 1.0, SpineRecovery);
-
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
         SeedOffset + FVector2D(947.0, 271.0),
@@ -3726,10 +3759,10 @@ static double EvaluateLandform(
         4, 0.54, 2.07
     );
     const double CrestShape = FMath::Clamp(
-        0.88
-            + (CrestRidges - 0.50) * 0.16
-            + (CrestVariation - 0.50) * 0.12,
-        0.76, 1.03
+        0.68
+            + CrestRidges * 0.48
+            + CrestVariation * 0.34,
+        0.68, 1.50
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3814,7 +3847,12 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    const double MountainHeight = Smooth01(OutMountainMask);
+    // Do not smoothstep an already-smooth, clamped structural mask a second
+    // time. That drove every strong belt toward exactly 1.0 and made unrelated
+    // summits converge on the same apparent ceiling. CrestShape now carries a
+    // materially wider, coherent regional/crest variation so adjacent peaks
+    // retain different heights even where the belt envelope is fully active.
+    const double MountainHeight = OutMountainMask;
     // Strong coherent uplift accelerates non-linearly so true mountain belts
     // can reach kilometre-scale relief without lifting quiet plains with them.
     const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
@@ -4441,7 +4479,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellDesertMask = 0.0;
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
-            Data->CellPosition(Cell), Bounds, Generator.Seed, Generator.LongAxis,
+            Data->CellPosition(Cell), Generator.Seed,
             Generator.StructuralRelief, Generator.StructuralScale,
             Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
@@ -4692,7 +4730,14 @@ static void ConfigureWaterSpline(
     Spline.UpdateSpline();
 }
 
-static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
+static void ConfigureRiverSpline(
+    UWaterSplineComponent& Spline,
+    const TArray<FVector>& Points,
+    const TArray<float>& PointWidths,
+    const TArray<float>& PointDepths,
+    double FullWidth,
+    double Depth
+)
 {
     ConfigureWaterSpline(Spline, Points, false);
     for (int32 Index = 0; Index < Points.Num(); ++Index)
@@ -4722,10 +4767,18 @@ static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVe
     if (Metadata)
     {
         Metadata->Fixup(Spline.GetNumberOfSplinePoints(), &Spline);
-        const float MetadataWidth = static_cast<float>(FMath::Max(100.0, FullWidth));
-        const float WaterDepth = static_cast<float>(FMath::Max(1.0, Depth));
         for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
         {
+            const float MetadataWidth = static_cast<float>(FMath::Max(
+                100.0,
+                PointWidths.IsValidIndex(Index)
+                    ? static_cast<double>(PointWidths[Index]) : FullWidth
+            ));
+            const float WaterDepth = static_cast<float>(FMath::Max(
+                1.0,
+                PointDepths.IsValidIndex(Index)
+                    ? static_cast<double>(PointDepths[Index]) : Depth
+            ));
             if (Metadata->RiverWidth.Points.IsValidIndex(Index))
             {
                 Metadata->RiverWidth.Points[Index].OutVal = MetadataWidth;
@@ -5294,9 +5347,11 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
     {
         FAvenorBakedRiverReach& Target = Asset->Rivers.AddDefaulted_GetRef();
         Target.Points = Source.Points;
+        Target.PointWidths = Source.PointWidths;
+        Target.PointDepths = Source.PointDepths;
         Target.Width = Source.Width;
         Target.Depth = Source.Depth;
-        Target.BankWidth = WaterTerrain.RiverBankWidth;
+        Target.BankWidth = FMath::Clamp(Source.Width * 0.08, 75.0, 400.0);
         Target.ValleyHalfWidth = Source.ValleyHalfWidth;
         Target.ValleyDepth = Source.ValleyDepth;
         Target.CrossSectionExponent = Source.CrossSectionExponent;
@@ -5421,6 +5476,8 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData()
     {
         FRiverReach& Target = Data->Rivers.AddDefaulted_GetRef();
         Target.Points = Source.Points;
+        Target.PointWidths = Source.PointWidths;
+        Target.PointDepths = Source.PointDepths;
         Target.Width = Source.Width;
         Target.Depth = Source.Depth;
         Target.ValleyHalfWidth = Source.ValleyHalfWidth;
@@ -5701,7 +5758,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         {
             ConfigureRiverSpline(
                 *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
-                Reach.Width, Reach.Depth
+                Reach.PointWidths, Reach.PointDepths, Reach.Width, Reach.Depth
             );
             // The broad valley shape belongs to erosion - already baked into
             // the base terrain height field. This carve is only meant to
@@ -5712,29 +5769,15 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             // the reach was a headwater trickle or a main river - and
             // CrossSectionExponent dips low on any steep mountain slope, not
             // just true canyons, so gating steep walls on it made ordinary
-            // mountain streams carve like cliffs too. Canyon reaches get a
-            // real, but still bounded, deeper and steeper-walled cut instead
-            // of the full ValleyDepth/ValleyHalfWidth; everything else gets
-            // a gentle bank blend scaled to its own actual water width.
+            // mountain streams carve like cliffs too. Canyon morphology also
+            // remains erosion-owned; the native modifier only cuts the local
+            // wetted channel and a small shoulder in every terrain type.
             const double BankMargin = FMath::Clamp(
-                Reach.Width * 1.2, 400.0, Reach.ValleyHalfWidth
+                Reach.Width * 0.08, 75.0, 400.0
             );
-            double CarveHalfWidth = Reach.Width * 0.5 + BankMargin;
-            double CarveDepth = Reach.Depth;
-            double EdgeOffsetScale = 1.3;
-            if (Reach.bIsCanyon)
-            {
-                CarveHalfWidth = FMath::Min(
-                    Reach.ValleyHalfWidth, Reach.Width * 0.5 + BankMargin * 2.0
-                );
-                CarveDepth = FMath::Max(
-                    Reach.Depth,
-                    FMath::Min(Reach.ValleyDepth, Reach.Depth * 4.0)
-                );
-                EdgeOffsetScale = 0.3;
-            }
             ConfigureWaterTerrainSettings(
-                *River, false, CarveDepth, CarveHalfWidth, WaterTerrain, EdgeOffsetScale
+                *River, false, Reach.Depth, BankMargin, WaterTerrain,
+                Reach.bIsCanyon ? 0.3 : 1.0
             );
             AddNativeWaterModifier(
                 *River, *TargetMeshPartition, WaterPriorityLayer,
