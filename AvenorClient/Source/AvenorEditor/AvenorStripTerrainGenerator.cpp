@@ -3785,11 +3785,19 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(211.0, 883.0),
         4, 0.54, 2.07
     );
+    // Cold, high terrain earns a sharper, more jagged alpine crest (freeze-
+    // thaw and glacial carving keep ridgelines knife-edged); warm/moist
+    // mountains weather down to rounder, gentler summits instead. Otherwise
+    // every mountain range looked the same regardless of climate - only the
+    // biome colour changed, never the actual peak shape.
+    const double Coldness = bClimateEnabled
+        ? Smooth01(FMath::Clamp((0.45 - ClimateTemperature) / 0.42, 0.0, 1.0))
+        : 0.0;
     const double CrestShape = FMath::Clamp(
         0.88
-            + (CrestRidges - 0.50) * 0.16
-            + (CrestVariation - 0.50) * 0.12,
-        0.76, 1.03
+            + (CrestRidges - 0.50) * FMath::Lerp(0.11, 0.24, Coldness)
+            + (CrestVariation - 0.50) * FMath::Lerp(0.08, 0.18, Coldness),
+        0.70, 1.10
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3877,7 +3885,10 @@ static double EvaluateLandform(
     const double MountainHeight = Smooth01(OutMountainMask);
     // Strong coherent uplift accelerates non-linearly so true mountain belts
     // can reach kilometre-scale relief without lifting quiet plains with them.
-    const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
+    // A higher exponent concentrates that relief onto fewer, more isolated
+    // summits (sharp alpine peaks); a lower one spreads it into broader,
+    // more rounded massifs, matching the CrestShape climate split above.
+    const double MountainRelief = FMath::Pow(MountainHeight, FMath::Lerp(1.08, 1.34, Coldness));
     Height += MountainRelief * Relief
         * FMath::Lerp(0.72, 1.12, Activity)
         * FMath::Lerp(0.82, 1.72, MountainRelief)
@@ -3984,6 +3995,39 @@ using namespace UE::Avenor::Strip;
 
 namespace UE::Avenor::Strip
 {
+// Shared by BuildMacroClimate (stretches the base regional climate before it
+// drives desert/dune terrain shaping) and RefineClimateFromHydrology
+// (stretches the final post-lapse-rate, post-hydrology climate before biome
+// classification). A percentile remap is monotonic - it cannot reorder
+// cells, so a spatial gradient's shape survives - but it expands whatever
+// real spread exists in this particular generated world to actually fill
+// the target range, instead of leaving it clustered wherever the raw
+// formula's one-directional biases or boundary-straddling defaults happen
+// to push it.
+static double PercentileValue(TArray<double> Values, double Percentile)
+{
+    if (Values.Num() == 0)
+    {
+        return 0.5;
+    }
+    Values.Sort();
+    const int32 Index = FMath::Clamp(
+        FMath::RoundToInt(Percentile * static_cast<double>(Values.Num() - 1)),
+        0, Values.Num() - 1
+    );
+    return Values[Index];
+}
+
+static double StretchToRange(double Value, double Lo, double Hi, double TargetLo, double TargetHi)
+{
+    if (Hi - Lo < 1e-4)
+    {
+        return FMath::Clamp((TargetLo + TargetHi) * 0.5, 0.0, 1.0);
+    }
+    const double Alpha = (Value - Lo) / (Hi - Lo);
+    return FMath::Clamp(FMath::Lerp(TargetLo, TargetHi, Alpha), 0.0, 1.0);
+}
+
 static void BuildMacroClimate(
     FAvenorStripData& Data,
     const AAvenorStripTerrainGenerator& Generator
@@ -4110,6 +4154,37 @@ static void BuildMacroClimate(
                 + MoistureNoise
                     * Generator.ClimateRegionalVariation * 0.14,
             0.0, 1.0
+        );
+        Data.MacroTemperature[Cell] = Temperature;
+        Data.MacroMoisture[Cell] = Precipitation;
+    }
+
+    // This regional climate is what EvaluateLandform reads to decide where
+    // terrain actually earns desert/dune character (via HotFraction/Dryness
+    // thresholds around 0.58) - not just what colours the biome map later.
+    // With anchors centred on the ClimateTemperature/ClimateMoisture
+    // sliders (0.5/0.5 by default) and only modest per-anchor drift, the
+    // raw values rarely reach those thresholds anywhere on a given world,
+    // so terrain shape stayed geologically uniform regardless of the
+    // labelled biome. Stretch to this world's own 10th/90th percentile
+    // spread so real dune deserts, and later real cold/hot classification,
+    // actually appear somewhere instead of the range never reaching the
+    // shaping thresholds at all.
+    const double TemperatureLowPercentile = PercentileValue(Data.MacroTemperature, 0.10);
+    const double TemperatureHighPercentile = PercentileValue(Data.MacroTemperature, 0.90);
+    const double MoistureLowPercentile = PercentileValue(Data.MacroMoisture, 0.10);
+    const double MoistureHighPercentile = PercentileValue(Data.MacroMoisture, 0.90);
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const double Temperature = StretchToRange(
+            Data.MacroTemperature[Cell],
+            TemperatureLowPercentile, TemperatureHighPercentile,
+            0.05, 0.95
+        );
+        const double Precipitation = StretchToRange(
+            Data.MacroMoisture[Cell],
+            MoistureLowPercentile, MoistureHighPercentile,
+            0.05, 0.95
         );
         Data.MacroTemperature[Cell] = Temperature;
         Data.MacroMoisture[Cell] = Precipitation;
@@ -4434,33 +4509,10 @@ static void RefineClimateFromHydrology(
         );
     }
 
-    auto PercentileValue = [](TArray<double> Values, double Percentile) -> double
-    {
-        if (Values.Num() == 0)
-        {
-            return 0.5;
-        }
-        Values.Sort();
-        const int32 Index = FMath::Clamp(
-            FMath::RoundToInt(Percentile * static_cast<double>(Values.Num() - 1)),
-            0, Values.Num() - 1
-        );
-        return Values[Index];
-    };
     const double MoistureLowPercentile = PercentileValue(RawAvailableMoisture, 0.10);
     const double MoistureHighPercentile = PercentileValue(RawAvailableMoisture, 0.90);
     const double TemperatureLowPercentile = PercentileValue(Data.Temperature, 0.10);
     const double TemperatureHighPercentile = PercentileValue(Data.Temperature, 0.90);
-
-    auto StretchToRange = [](double Value, double Lo, double Hi, double TargetLo, double TargetHi) -> double
-    {
-        if (Hi - Lo < 1e-4)
-        {
-            return FMath::Clamp((TargetLo + TargetHi) * 0.5, 0.0, 1.0);
-        }
-        const double Alpha = (Value - Lo) / (Hi - Lo);
-        return FMath::Clamp(FMath::Lerp(TargetLo, TargetHi, Alpha), 0.0, 1.0);
-    };
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
