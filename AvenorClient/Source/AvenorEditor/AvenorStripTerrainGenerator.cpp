@@ -2469,6 +2469,42 @@ static void ExtractLakes(
             Candidate[Cell] = (Data.DepressionFillHeight[Cell] - Data.Height[Cell]) >= ShorelineFillThreshold;
         }
     }
+    // Two basins separated only by a narrow strip of ground - a cell or two -
+    // would, in reality, share a short strait or have that strip submerged
+    // once bank blending is applied. Treating them as unrelated components
+    // produces two separate, often visibly overlapping water bodies right
+    // next to each other instead of one merged lake. Bridge small gaps: a
+    // non-candidate cell within a short radius of a real candidate cell can
+    // still be traversed (and is absorbed into the merged lake's shape), but
+    // never seeds a basin on its own.
+    constexpr int32 BridgeRadius = 2;
+    TArray<bool> BridgeCandidate = Candidate;
+    for (int32 Y = 0; Y < Data.Rows; ++Y)
+    {
+        for (int32 X = 0; X < Data.Columns; ++X)
+        {
+            const int32 Cell = Data.Index(X, Y);
+            if (Candidate[Cell])
+            {
+                continue;
+            }
+            bool bNearCandidate = false;
+            for (int32 DY = -BridgeRadius; DY <= BridgeRadius && !bNearCandidate; ++DY)
+            {
+                for (int32 DX = -BridgeRadius; DX <= BridgeRadius; ++DX)
+                {
+                    const int32 NX = X + DX;
+                    const int32 NY = Y + DY;
+                    if (Data.IsValid(NX, NY) && Candidate[Data.Index(NX, NY)])
+                    {
+                        bNearCandidate = true;
+                        break;
+                    }
+                }
+            }
+            BridgeCandidate[Cell] = bNearCandidate;
+        }
+    }
     TArray<bool> Visited;
     Visited.Init(false, Data.Height.Num());
     TArray<FLakeCandidate> Basins;
@@ -2514,7 +2550,7 @@ static void ExtractLakes(
                     continue;
                 }
                 const int32 Neighbor = Data.Index(NX, NY);
-                if (Candidate[Neighbor])
+                if (BridgeCandidate[Neighbor])
                 {
                     if (!Visited[Neighbor])
                     {
@@ -3555,9 +3591,7 @@ namespace UE::Avenor::Strip
 {
 static double EvaluateLandform(
     const FVector2D& Position,
-    const FBox& Bounds,
     int32 Seed,
-    EAvenorStripLongAxis LongAxis,
     double ReliefHeight,
     double StructuralScale,
     double TectonicActivity,
@@ -3573,13 +3607,9 @@ static double EvaluateLandform(
 )
 {
     const double Relief = FMath::Max(25000.0, ReliefHeight);
-    const FVector WorldSize = Bounds.GetSize();
-    const double ShortExtent = FMath::Max(
-        100000.0, FMath::Min(WorldSize.X, WorldSize.Y)
-    );
     // StructuralScale arrives already resolved (explicit or auto-derived from
     // world size) in ResolveSettings(). Only guard against degenerate values
-    // here - do not re-derive from ShortExtent, or an explicit user choice
+    // here - do not re-derive from world bounds, or an explicit user choice
     // would get silently overridden a second time.
     const double Scale = FMath::Clamp(StructuralScale, 100000.0, 5000000.0);
     const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
@@ -3589,10 +3619,6 @@ static double EvaluateLandform(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
-
-    const FVector2D StripAxis = LongAxis == EAvenorStripLongAxis::X
-        ? FVector2D(1.0, 0.0) : FVector2D(0.0, 1.0);
-    const FVector2D StripAcross = Rotate90(StripAxis);
     const double SeedAngleA = FMath::Fmod(
         FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
     );
@@ -3723,18 +3749,10 @@ static double EvaluateLandform(
     )) * FMath::Lerp(0.50, 1.0, MountainProvince)
        * FMath::Lerp(0.68, 1.0, PositiveUplift);
 
-    const double AcrossCoordinate = LongAxis == EAvenorStripLongAxis::X
-        ? Position.Y - Bounds.GetCenter().Y
-        : Position.X - Bounds.GetCenter().X;
-    const double SpineCoreHalfWidth = ShortExtent * 0.07;
-    const double SpineRecoveryWidth = ShortExtent * 0.18;
-    const double SpineRecovery = Smooth01(FMath::Clamp(
-        (FMath::Abs(AcrossCoordinate) - SpineCoreHalfWidth)
-            / FMath::Max(1.0, SpineRecoveryWidth),
-        0.0, 1.0
-    ));
-    BroadRange *= FMath::Lerp(0.45, 1.0, SpineRecovery);
-
+    // Deliberately no strip-centre or spine term here. Geology is generated
+    // independent of the monorail corridor; keeping the corridor buildable
+    // is handled later by directly altering the terrain along its path,
+    // not by biasing the height field the corridor might run through.
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
         SeedOffset + FVector2D(947.0, 271.0),
@@ -4461,7 +4479,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellDesertMask = 0.0;
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
-            Data->CellPosition(Cell), Bounds, Generator.Seed, Generator.LongAxis,
+            Data->CellPosition(Cell), Generator.Seed,
             Generator.StructuralRelief, Generator.StructuralScale,
             Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
