@@ -7,6 +7,29 @@ namespace
 constexpr uint32 TerrainChunkMagic = 0x41564431; // AVD1
 constexpr int32 TerrainChunkPayloadVersion = 5;
 
+static double RiverPointValue(
+    const TArray<float>& Values,
+    int32 PointIndex,
+    double Fallback
+)
+{
+    return Values.IsValidIndex(PointIndex)
+        ? FMath::Max(0.0, static_cast<double>(Values[PointIndex]))
+        : FMath::Max(0.0, Fallback);
+}
+
+static double RiverSegmentValue(
+    const TArray<float>& Values,
+    int32 SegmentIndex,
+    double Alpha,
+    double Fallback
+)
+{
+    const double A = RiverPointValue(Values, SegmentIndex, Fallback);
+    const double B = RiverPointValue(Values, SegmentIndex + 1, Fallback);
+    return FMath::Lerp(A, B, Alpha);
+}
+
 // Lake actors use explicit closed Catmull-Rom/Hermite tangents. Sample the
 // same curve here so terrain carving, water tests and Spine bridge detection
 // all use the visible shoreline rather than its straight control polygon.
@@ -213,9 +236,9 @@ bool UAvenorTerrainData::SampleFinalHeight(
         return false;
     }
 
-    // Erosion owns the valley shape. The final river pass only guarantees
-    // enough clearance for the wetted channel and a very small bank shoulder.
-    // It must never excavate a second artificial valley around the spline.
+    // Erosion owns valleys, gullies, floodplains and canyons. This last pass
+    // only opens the wetted channel and a tiny shoulder so the water surface
+    // never intersects the terrain. Width/depth are local to each spline point.
     for (const FAvenorBakedRiverReach& River : Rivers)
     {
         for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
@@ -231,13 +254,19 @@ bool UAvenorTerrainData::SampleFinalHeight(
                     / LengthSquared, 0.0, 1.0)
                 : 0.0;
             const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
+            const double LocalWidth = RiverSegmentValue(
+                River.PointWidths, Index, Alpha, River.Width
+            );
+            const double LocalDepth = RiverSegmentValue(
+                River.PointDepths, Index, Alpha, River.Depth
+            );
             const double BankMargin = FMath::Min(
-                FMath::Max(75.0, River.Width * 0.12),
+                FMath::Clamp(LocalWidth * 0.08, 75.0, 400.0),
                 FMath::Max(0.0, River.BankWidth)
             );
             const double CarveHalfWidth = FMath::Max(
-                River.Width * 0.52,
-                River.Width * 0.5 + BankMargin
+                50.0,
+                LocalWidth * 0.5 + BankMargin
             );
             if (Distance >= CarveHalfWidth)
             {
@@ -252,8 +281,8 @@ bool UAvenorTerrainData::SampleFinalHeight(
                 Distance / CarveHalfWidth, 0.0, 1.0
             );
             const double ClearanceDepth = FMath::Min(
-                FMath::Max(60.0, River.Width * 0.10),
-                FMath::Max(60.0, River.Depth)
+                FMath::Max(50.0, LocalWidth * 0.045),
+                FMath::Max(50.0, LocalDepth)
             );
             const double BedZ = WaterZ - ClearanceDepth;
             const double BankBlend = FMath::SmoothStep(
@@ -307,10 +336,6 @@ bool UAvenorTerrainData::SampleFinalHeight(
                     ? Lake.ModifierBedDepth
                     : Lake.MaximumDepth
             );
-            // Keep the lake interior unambiguously below the water datum even
-            // at the first samples inside the shoreline. Without this clearance
-            // the min-only carve could leave terrain exactly coplanar with the
-            // Water Body Lake surface and visually bury a perfectly valid lake.
             const double MinimumWaterClearance = FMath::Clamp(
                 BedDepth * 0.04, 50.0, 125.0
             );
@@ -347,7 +372,6 @@ bool UAvenorTerrainData::SampleWaterSurface(
 
     for (const FAvenorBakedRiverReach& River : Rivers)
     {
-        const double WaterHalfWidth = FMath::Max(0.0, River.Width * 0.5);
         for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
         {
             const FVector& A3 = River.Points[Index];
@@ -360,6 +384,10 @@ bool UAvenorTerrainData::SampleWaterSurface(
                 ? FMath::Clamp(FVector2D::DotProduct(
                     WorldPosition - A, Segment) / LengthSquared, 0.0, 1.0)
                 : 0.0;
+            const double WaterHalfWidth = FMath::Max(
+                0.0,
+                RiverSegmentValue(River.PointWidths, Index, Alpha, River.Width) * 0.5
+            );
             if ((WorldPosition - (A + Segment * Alpha)).Size()
                 <= WaterHalfWidth)
             {
@@ -512,11 +540,17 @@ float UAvenorTerrainData::SampleRiverWeight(
         for (const FAvenorBakedRiverReach& River : Rivers)
         {
             FBox2D Bounds(ForceInit);
-            for (const FVector& Point : River.Points)
+            double MaximumWidth = FMath::Max(0.0, River.Width);
+            for (int32 Index = 0; Index < River.Points.Num(); ++Index)
             {
-                Bounds += FVector2D(Point);
+                Bounds += FVector2D(River.Points[Index]);
+                MaximumWidth = FMath::Max(
+                    MaximumWidth,
+                    RiverPointValue(River.PointWidths, Index, River.Width)
+                );
             }
-            Cache.RiverBounds.Add(Bounds.ExpandBy(River.ValleyHalfWidth));
+            const double Shoulder = FMath::Clamp(MaximumWidth * 0.08, 75.0, 400.0);
+            Cache.RiverBounds.Add(Bounds.ExpandBy(MaximumWidth * 0.5 + Shoulder));
         }
     }
     float Weight = 0.0f;
@@ -538,11 +572,18 @@ float UAvenorTerrainData::SampleRiverWeight(
                     / LengthSquared, 0.0, 1.0)
                 : 0.0;
             const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
-            if (Distance <= River.ValleyHalfWidth)
+            const double LocalWidth = RiverSegmentValue(
+                River.PointWidths, Index, Alpha, River.Width
+            );
+            const double Shoulder = FMath::Clamp(LocalWidth * 0.08, 75.0, 400.0);
+            const double InfluenceHalfWidth = FMath::Max(
+                50.0, LocalWidth * 0.5 + Shoulder
+            );
+            if (Distance <= InfluenceHalfWidth)
             {
                 Weight = FMath::Max(
                     Weight,
-                    static_cast<float>(1.0 - Distance / River.ValleyHalfWidth)
+                    static_cast<float>(1.0 - Distance / InfluenceHalfWidth)
                 );
             }
         }
