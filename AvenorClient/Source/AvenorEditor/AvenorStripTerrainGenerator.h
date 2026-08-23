@@ -26,8 +26,8 @@ struct FAvenorLandformSettings
     UPROPERTY(EditAnywhere, Category = "Landforms", meta = (Units = "cm", ClampMin = "25000.0", ClampMax = "600000.0", ToolTip = "Overall vertical relief available to the structural terrain system. Mountains, uplands, basins and rifts all emerge from this same field."))
     double ReliefHeight = 300000.0;
 
-    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (Units = "cm", ClampMin = "250000.0", ClampMax = "5000000.0", ToolTip = "Typical scale of major ridges, uplands, basins and rift structures. This is not a mountain size control."))
-    double StructuralScale = 1600000.0;
+    UPROPERTY(EditAnywhere, Category = "Landforms", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "5000000.0", ToolTip = "Typical scale of major ridges, uplands, basins and rift structures. This is not a mountain size control. Set to 0 to auto-derive this from the world's short-axis extent (roughly half the short axis, so multiple provinces fit across the width) - this keeps feature scale sensible as you resize a test world. Enter an explicit value to pin a specific scale regardless of world size."))
+    double StructuralScale = 0.0;
 
     UPROPERTY(EditAnywhere, Category = "Landforms", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls how strongly broad uplift and compression become rugged high-relief terrain. Lower values favour older rolling terrain; higher values favour active rugged relief."))
     double TectonicActivity = 0.65;
@@ -410,7 +410,7 @@ static FORCEINLINE FVector2D RotateAxis(
     double StructuralScale
 )
 {
-    const double SafeScale = FMath::Max(250000.0, StructuralScale);
+    const double SafeScale = FMath::Max(100000.0, StructuralScale);
     const double SeedAngle = FMath::Fmod(
         FMath::Abs(static_cast<double>(Seed)) * 0.000827 + 0.617,
         PI

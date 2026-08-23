@@ -3406,11 +3406,11 @@ static double EvaluateLandform(
     const double ShortExtent = FMath::Max(
         100000.0, FMath::Min(WorldSize.X, WorldSize.Y)
     );
-    const double Scale = FMath::Clamp(
-        StructuralScale,
-        250000.0,
-        FMath::Max(450000.0, ShortExtent * 0.62)
-    );
+    // StructuralScale arrives already resolved (explicit or auto-derived from
+    // world size) in ResolveSettings(). Only guard against degenerate values
+    // here - do not re-derive from ShortExtent, or an explicit user choice
+    // would get silently overridden a second time.
+    const double Scale = FMath::Clamp(StructuralScale, 100000.0, 5000000.0);
     const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
     const double RiftAmount = FMath::Clamp(RiftStrength, 0.0, 1.0);
 
@@ -4739,7 +4739,17 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
 {
     AnalysisCellSize = Erosion.AnalysisSpacing;
     StructuralRelief = FMath::Max(25000.0, Landforms.ReliefHeight);
-    StructuralScale = FMath::Max(250000.0, Landforms.StructuralScale);
+    // 0 means "auto": derive a base feature scale from the world's short-axis
+    // extent so terrain provinces stay proportionate as a test world is
+    // resized, rather than inheriting a fixed absolute default tuned for one
+    // particular world size. A non-zero value pins an explicit scale that
+    // stays fixed regardless of world size.
+    const double ShortAxisExtent = FMath::Max(
+        100000.0, FMath::Min(WorldSize.X, WorldSize.Y)
+    );
+    StructuralScale = Landforms.StructuralScale > 0.0
+        ? FMath::Clamp(Landforms.StructuralScale, 100000.0, 5000000.0)
+        : FMath::Clamp(ShortAxisExtent * 0.5, 200000.0, 5000000.0);
     TectonicActivity = FMath::Clamp(Landforms.TectonicActivity, 0.0, 1.0);
     RiftStrength = FMath::Clamp(Landforms.RiftStrength, 0.0, 1.0);
     bGenerateMesasAndCanyons = true;
