@@ -629,7 +629,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 22;
+static constexpr int32 GeneratorAlgorithmVersion = 23;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3587,8 +3587,162 @@ float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) 
 
 namespace UE::Avenor::Strip
 {
+struct FMountainFieldCalibration
+{
+    double UplandThreshold = 0.35;
+    double MountainThreshold = 0.55;
+    double PeakReference = 0.80;
+};
+
+static double EvaluateMountainPlacementPotential(
+    const FVector2D& Warped,
+    const FVector2D& SeedOffset,
+    const FVector2D& AxisA,
+    const FVector2D& AcrossA,
+    const FVector2D& AxisB,
+    const FVector2D& AcrossB,
+    double Scale,
+    double Province,
+    double Province2
+)
+{
+    auto Oriented = [](const FVector2D& P,
+                       const FVector2D& Along,
+                       const FVector2D& Across,
+                       double AlongStretch,
+                       double AcrossStretch)
+    {
+        return FVector2D(
+            FVector2D::DotProduct(P, Along) / FMath::Max(0.05, AlongStretch),
+            FVector2D::DotProduct(P, Across) / FMath::Max(0.05, AcrossStretch)
+        );
+    };
+
+    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
+        Warped, Scale * 1.55,
+        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
+    ) * Scale * 0.24;
+    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
+        Warped, Scale * 1.35,
+        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
+    ) * Scale * 0.22;
+    const double BeltA = RidgedFbm(
+        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
+        Scale * 0.95,
+        SeedOffset + FVector2D(421.0, 719.0),
+        5
+    );
+    const double BeltB = RidgedFbm(
+        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
+        Scale * 1.05,
+        SeedOffset + FVector2D(877.0, 149.0),
+        5
+    );
+    const double BeltSignal = FMath::Clamp(
+        BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
+    );
+    const double ProvinceSignal = Smooth01(FMath::Clamp(
+        (Province * 0.62 + Province2 * 0.38 - 0.40) / 0.34,
+        0.0, 1.0
+    ));
+    return FMath::Clamp(
+        BeltSignal * FMath::Lerp(0.28, 1.0, ProvinceSignal),
+        0.0, 1.0
+    );
+}
+
+static FMountainFieldCalibration CalibrateMountainField(
+    const FBox& Bounds,
+    int32 Seed,
+    double StructuralScale
+)
+{
+    const double Scale = FMath::Clamp(
+        StructuralScale, 100000.0, 5000000.0
+    );
+    const FVector2D SeedOffset(
+        static_cast<double>((Seed * 92821) & 0x7ffff),
+        static_cast<double>((Seed * 68917) & 0x7ffff)
+    );
+    const double SeedAngleA = FMath::Fmod(
+        FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
+    );
+    const double SeedAngleB = FMath::Fmod(
+        SeedAngleA + 1.047
+            + FMath::Abs(static_cast<double>(Seed)) * 0.000217,
+        PI
+    );
+    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D AcrossB = Rotate90(AxisB);
+
+    // A modest fixed sampling lattice is enough to calibrate broad fields and
+    // is independent of the hydrology analysis resolution.
+    const bool bXIsLongAxis = Bounds.GetSize().X >= Bounds.GetSize().Y;
+    const int32 SamplesX = bXIsLongAxis ? 96 : 32;
+    const int32 SamplesY = bXIsLongAxis ? 32 : 96;
+    TArray<double> Samples;
+    Samples.Reserve(SamplesX * SamplesY);
+    for (int32 Y = 0; Y < SamplesY; ++Y)
+    {
+        for (int32 X = 0; X < SamplesX; ++X)
+        {
+            const FVector2D Position(
+                FMath::Lerp(
+                    Bounds.Min.X, Bounds.Max.X,
+                    (static_cast<double>(X) + 0.5) / SamplesX
+                ),
+                FMath::Lerp(
+                    Bounds.Min.Y, Bounds.Max.Y,
+                    (static_cast<double>(Y) + 0.5) / SamplesY
+                )
+            );
+            const FVector2D MacroWarp(
+                Fbm(Position, Scale * 1.8,
+                    SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
+                Fbm(Position, Scale * 1.7,
+                    SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.03)
+            );
+            const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
+            const double Province = 0.5 + 0.5 * Fbm(
+                Warped, Scale * 1.55,
+                SeedOffset + FVector2D(1901.0, 331.0),
+                4, 0.57, 2.0
+            );
+            const double Province2 = 0.5 + 0.5 * Fbm(
+                Warped, Scale * 1.15,
+                SeedOffset + FVector2D(433.0, 1777.0),
+                4, 0.55, 2.07
+            );
+            Samples.Add(EvaluateMountainPlacementPotential(
+                Warped, SeedOffset, AxisA, AcrossA, AxisB, AcrossB,
+                Scale, Province, Province2
+            ));
+        }
+    }
+    Samples.Sort();
+    auto Quantile = [&Samples](double Fraction)
+    {
+        const double Position = FMath::Clamp(Fraction, 0.0, 1.0)
+            * static_cast<double>(Samples.Num() - 1);
+        const int32 Lower = FMath::FloorToInt(Position);
+        const int32 Upper = FMath::Min(Lower + 1, Samples.Num() - 1);
+        return FMath::Lerp(Samples[Lower], Samples[Upper], Position - Lower);
+    };
+
+    FMountainFieldCalibration Result;
+    Result.UplandThreshold = Quantile(0.45);
+    Result.MountainThreshold = Quantile(0.72);
+    Result.PeakReference = FMath::Max(
+        Result.MountainThreshold + 0.025, Quantile(0.97)
+    );
+    return Result;
+}
+
 static double EvaluateLandform(
     const FVector2D& Position,
+    const FMountainFieldCalibration& MountainCalibration,
     int32 Seed,
     double ReliefHeight,
     double StructuralScale,
@@ -3669,7 +3823,7 @@ static double EvaluateLandform(
         4, 0.55, 2.07
     );
     const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.54) / 0.32,
+        (Province * 0.62 + Province2 * 0.38 - 0.43) / 0.38,
         0.0, 1.0
     ));
     const double HillProvince = Smooth01(FMath::Clamp(
@@ -3719,43 +3873,32 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    // Broad warped geological belts provide a continuous uplift field. Unlike
-    // explicit ridge polylines, these have no line ends that can turn into
-    // cones or triangular walls, and they give erosion a connected massif to
-    // dissect into peaks, spurs, valleys and foothills.
-    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
-        Warped, Scale * 1.55,
-        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
-    ) * Scale * 0.24;
-    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
-        Warped, Scale * 1.35,
-        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
-    ) * Scale * 0.22;
-    const double BeltA = RidgedFbm(
-        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
-        Scale * 0.95,
-        SeedOffset + FVector2D(421.0, 719.0),
-        5
+    // Broad warped geological belts provide a continuous uplift field. The
+    // thresholds are calibrated from this world's own distribution, so every
+    // seed retains mountain country without fixed-value all-or-none failures.
+    const double MountainPotential = EvaluateMountainPlacementPotential(
+        Warped, SeedOffset, AxisA, AcrossA, AxisB, AcrossB,
+        Scale, Province, Province2
     );
-    const double BeltB = RidgedFbm(
-        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
-        Scale * 1.05,
-        SeedOffset + FVector2D(877.0, 149.0),
-        5
-    );
-    const double BeltSignal = FMath::Clamp(
-        BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
-    );
-    const double ProvinceGate = Smooth01(MountainProvince);
     const double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.48, 0.38, Activity)) / 0.38,
+        (MountainPotential - MountainCalibration.MountainThreshold)
+            / FMath::Max(
+                0.025,
+                MountainCalibration.PeakReference
+                    - MountainCalibration.MountainThreshold
+            ),
         0.0, 1.0
-    )) * FMath::Lerp(0.04, 1.0, ProvinceGate)
-       * FMath::Lerp(0.68, 1.0, PositiveUplift);
+    )) * FMath::Lerp(0.82, 1.0, PositiveUplift)
+       * FMath::Lerp(0.88, 1.08, Activity);
     const double BroadUpland = Smooth01(FMath::Clamp(
-        (BeltSignal - 0.29) / 0.48, 0.0, 1.0
-    )) * FMath::Lerp(0.18, 1.0, MountainProvince)
-       * FMath::Lerp(0.78, 1.0, PositiveUplift);
+        (MountainPotential - MountainCalibration.UplandThreshold)
+            / FMath::Max(
+                0.035,
+                MountainCalibration.PeakReference
+                    - MountainCalibration.UplandThreshold
+            ),
+        0.0, 1.0
+    )) * FMath::Lerp(0.88, 1.0, PositiveUplift);
 
     // There is deliberately no strip-centre or spine term here. Geological
     // landforms are generated independently of later infrastructure.
@@ -4474,6 +4617,18 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     Data->RequestedMountainRanges = 0;
     Data->PlacedMountainRanges = 0;
+    const FMountainFieldCalibration MountainCalibration =
+        CalibrateMountainField(
+            Bounds, Generator.Seed, Generator.StructuralScale
+        );
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor mountain field: upland %.4f, mountain %.4f, peak %.4f"),
+        MountainCalibration.UplandThreshold,
+        MountainCalibration.MountainThreshold,
+        MountainCalibration.PeakReference
+    );
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -4483,7 +4638,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellDesertMask = 0.0;
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
-            Data->CellPosition(Cell), Generator.Seed,
+            Data->CellPosition(Cell), MountainCalibration, Generator.Seed,
             Generator.StructuralRelief, Generator.StructuralScale,
             Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
@@ -4528,6 +4683,26 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     // mountain/hill/plains masks from the surviving surface, then reapply the
     // regional climate so altitude and final relief drive alpine transitions.
     ReclassifyFinalLandforms(*Data);
+    double MinimumFinalHeight = TNumericLimits<double>::Max();
+    double MaximumFinalHeight = -TNumericLimits<double>::Max();
+    int32 StrongMountainCells = 0;
+    int32 StrongHillCells = 0;
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        MinimumFinalHeight = FMath::Min(MinimumFinalHeight, Data->Height[Cell]);
+        MaximumFinalHeight = FMath::Max(MaximumFinalHeight, Data->Height[Cell]);
+        StrongMountainCells += Data->MountainMask[Cell] >= 0.50 ? 1 : 0;
+        StrongHillCells += Data->HillMask[Cell] >= 0.40 ? 1 : 0;
+    }
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor final relief: %.0f..%.0f cm; mountain %.1f%%; hill %.1f%%"),
+        MinimumFinalHeight,
+        MaximumFinalHeight,
+        100.0 * StrongMountainCells / FMath::Max(1, CellCount),
+        100.0 * StrongHillCells / FMath::Max(1, CellCount)
+    );
     ApplyTerrainClimate(*Data, Generator);
     ComputeDepressionFillHeight(*Data);
 
