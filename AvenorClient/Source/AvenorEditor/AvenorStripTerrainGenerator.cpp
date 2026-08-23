@@ -507,6 +507,23 @@ struct FRiverReach
     FBox2D Bounds = FBox2D(ForceInit);
 };
 
+/** One continuous ridge line in a generated mountain system. */
+struct FMountainRidgePrimitive
+{
+    TArray<FVector2D> Points;
+    double CoreHalfWidth = 200000.0;
+    double FoothillHalfWidth = 650000.0;
+    double Strength = 1.0;
+    FBox2D Bounds = FBox2D(ForceInit);
+};
+
+/** A sparse main ridge plus subordinate branch ridges. */
+struct FMountainRangePrimitive
+{
+    FVector2D Centre = FVector2D::ZeroVector;
+    TArray<FMountainRidgePrimitive> Ridges;
+};
+
 struct FLakeBasin
 {
     TArray<FVector> Shoreline;
@@ -525,6 +542,212 @@ struct FPriorityCell
     int32 Cell = INDEX_NONE;
     bool operator>(const FPriorityCell& Other) const { return Height > Other.Height; }
 };
+
+static void FinalizeMountainRidge(FMountainRidgePrimitive& Ridge)
+{
+    Ridge.Bounds = FBox2D(ForceInit);
+    for (const FVector2D& Point : Ridge.Points)
+    {
+        Ridge.Bounds += Point;
+    }
+    Ridge.Bounds = Ridge.Bounds.ExpandBy(Ridge.FoothillHalfWidth);
+}
+
+static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
+    const FBox& Bounds,
+    int32 Seed,
+    double StructuralScale,
+    double TectonicActivity,
+    int32& OutRequestedRanges
+)
+{
+    const FVector Size3D = Bounds.GetSize();
+    const FVector2D Size(Size3D.X, Size3D.Y);
+    const double Scale = FMath::Clamp(
+        StructuralScale, 100000.0, 5000000.0
+    );
+    const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
+    const double LongExtent = FMath::Max(Size.X, Size.Y);
+    OutRequestedRanges = FMath::Clamp(
+        FMath::RoundToInt(
+            LongExtent / FMath::Max(Scale * 4.10, 1.0)
+                * FMath::Lerp(0.82, 1.10, Activity)
+        ),
+        1,
+        8
+    );
+
+    FRandomStream Random(Seed ^ 0x36A9F17D);
+    const FVector2D SeedOffset(
+        static_cast<double>((Seed * 31847) & 0x7ffff),
+        static_cast<double>((Seed * 76493) & 0x7ffff)
+    );
+    TArray<FMountainRangePrimitive> Result;
+    Result.Reserve(OutRequestedRanges);
+
+    for (int32 RangeIndex = 0; RangeIndex < OutRequestedRanges; ++RangeIndex)
+    {
+        FVector2D BestCentre = FVector2D(Bounds.GetCenter());
+        double BestScore = -TNumericLimits<double>::Max();
+        // Choose from several deterministic candidates. Noise only biases the
+        // coarse geological province selected for a range; it never becomes
+        // elevation directly and cannot turn the whole domain mountainous.
+        for (int32 Attempt = 0; Attempt < 24; ++Attempt)
+        {
+            const FVector2D Candidate(
+                FMath::Lerp(Bounds.Min.X, Bounds.Max.X, Random.FRandRange(0.03f, 0.97f)),
+                FMath::Lerp(Bounds.Min.Y, Bounds.Max.Y, Random.FRandRange(0.03f, 0.97f))
+            );
+            const double Province = 0.5 + 0.5 * Fbm(
+                Candidate, Scale * 3.8,
+                SeedOffset + FVector2D(1901.0, 331.0),
+                4, 0.57, 2.0
+            );
+            const double Convergence = RidgedFbm(
+                Candidate, Scale * 2.7,
+                SeedOffset + FVector2D(421.0, 719.0),
+                4
+            );
+            double Separation = 1.0;
+            for (const FMountainRangePrimitive& Existing : Result)
+            {
+                Separation = FMath::Min(
+                    Separation,
+                    FMath::Clamp(
+                        FVector2D::Distance(Candidate, Existing.Centre)
+                            / FMath::Max(Scale * 1.65, 1.0),
+                        0.0,
+                        1.0
+                    )
+                );
+            }
+            const double Score = Province * 0.58
+                + Convergence * 0.42
+                + Separation * 0.55;
+            if (Score > BestScore)
+            {
+                BestScore = Score;
+                BestCentre = Candidate;
+            }
+        }
+
+        FMountainRangePrimitive& Range = Result.AddDefaulted_GetRef();
+        Range.Centre = BestCentre;
+        const double Angle = Random.FRandRange(0.0f, static_cast<float>(PI));
+        const FVector2D Along(FMath::Cos(Angle), FMath::Sin(Angle));
+        const FVector2D Across = Rotate90(Along);
+        const double HalfLength = Scale
+            * Random.FRandRange(0.75f, 1.45f)
+            * FMath::Lerp(0.88, 1.16, Activity);
+        const double CoreHalfWidth = Scale
+            * Random.FRandRange(0.12f, 0.22f);
+        const double FoothillHalfWidth = CoreHalfWidth + Scale
+            * Random.FRandRange(0.28f, 0.52f);
+
+        FMountainRidgePrimitive& MainRidge = Range.Ridges.AddDefaulted_GetRef();
+        MainRidge.CoreHalfWidth = CoreHalfWidth;
+        MainRidge.FoothillHalfWidth = FoothillHalfWidth;
+        MainRidge.Strength = Random.FRandRange(0.78f, 1.0f);
+        constexpr int32 MainPointCount = 9;
+        const double BendAmplitude = Scale * Random.FRandRange(0.12f, 0.26f);
+        const double BendPhase = Random.FRandRange(
+            -static_cast<float>(PI), static_cast<float>(PI)
+        );
+        const double BendCycles = Random.FRandRange(1.15f, 1.65f);
+        for (int32 PointIndex = 0; PointIndex < MainPointCount; ++PointIndex)
+        {
+            const double Alpha = static_cast<double>(PointIndex)
+                / static_cast<double>(MainPointCount - 1);
+            const double AlongDistance = FMath::Lerp(-HalfLength, HalfLength, Alpha);
+            const double EndFade = FMath::Sin(PI * Alpha);
+            const double Bend = FMath::Sin(
+                Alpha * PI * BendCycles + BendPhase
+            ) * BendAmplitude * EndFade;
+            const double Irregularity = PointIndex > 0 && PointIndex + 1 < MainPointCount
+                ? Random.FRandRange(-0.16f, 0.16f) * Scale * EndFade
+                : 0.0;
+            MainRidge.Points.Add(
+                BestCentre + Along * AlongDistance
+                    + Across * (Bend + Irregularity)
+            );
+        }
+        FinalizeMountainRidge(MainRidge);
+
+        const int32 BranchCount = Random.RandRange(1, 2);
+        for (int32 BranchIndex = 0; BranchIndex < BranchCount; ++BranchIndex)
+        {
+            const int32 AttachIndex = Random.RandRange(2, MainPointCount - 3);
+            const FVector2D Attach = MainRidge.Points[AttachIndex];
+            const double Side = Random.RandRange(0, 1) == 0 ? -1.0 : 1.0;
+            const double BranchAngle = Side * Random.FRandRange(0.48f, 0.92f);
+            const FVector2D BranchAlong(
+                Along.X * FMath::Cos(BranchAngle) - Along.Y * FMath::Sin(BranchAngle),
+                Along.X * FMath::Sin(BranchAngle) + Along.Y * FMath::Cos(BranchAngle)
+            );
+            const FVector2D BranchAcross = Rotate90(BranchAlong);
+            const double BranchLength = Scale * Random.FRandRange(0.48f, 0.95f);
+            FMountainRidgePrimitive& Branch = Range.Ridges.AddDefaulted_GetRef();
+            Branch.CoreHalfWidth = CoreHalfWidth * Random.FRandRange(0.48f, 0.68f);
+            Branch.FoothillHalfWidth = FoothillHalfWidth * Random.FRandRange(0.55f, 0.76f);
+            Branch.Strength = MainRidge.Strength * Random.FRandRange(0.62f, 0.82f);
+            Branch.Points = {
+                Attach,
+                Attach + BranchAlong * (BranchLength * 0.52)
+                    + BranchAcross * Random.FRandRange(-0.10f, 0.10f) * Scale,
+                Attach + BranchAlong * BranchLength
+            };
+            FinalizeMountainRidge(Branch);
+        }
+    }
+    return Result;
+}
+
+static void EvaluateMountainRangePlan(
+    const FVector2D& Position,
+    const TArray<FMountainRangePrimitive>& Ranges,
+    double& OutMountainEnvelope,
+    double& OutFoothillEnvelope
+)
+{
+    OutMountainEnvelope = 0.0;
+    OutFoothillEnvelope = 0.0;
+    for (const FMountainRangePrimitive& Range : Ranges)
+    {
+        for (const FMountainRidgePrimitive& Ridge : Range.Ridges)
+        {
+            if (Ridge.Points.Num() < 2 || !Ridge.Bounds.IsInside(Position))
+            {
+                continue;
+            }
+            double Distance = TNumericLimits<double>::Max();
+            for (int32 Index = 0; Index + 1 < Ridge.Points.Num(); ++Index)
+            {
+                Distance = FMath::Min(
+                    Distance,
+                    SegmentDistance(
+                        Position, Ridge.Points[Index], Ridge.Points[Index + 1]
+                    )
+                );
+            }
+            const double Core = Smooth01(1.0 - FMath::Clamp(
+                Distance / FMath::Max(1.0, Ridge.CoreHalfWidth), 0.0, 1.0
+            ));
+            const double Outer = Smooth01(1.0 - FMath::Clamp(
+                Distance / FMath::Max(1.0, Ridge.FoothillHalfWidth), 0.0, 1.0
+            ));
+            const double Mountain = FMath::Pow(Core, 1.12) * Ridge.Strength;
+            const double Foothill = FMath::Max(
+                0.0, Outer - Core * 0.78
+            ) * Ridge.Strength;
+            OutMountainEnvelope = FMath::Max(
+                OutMountainEnvelope, Mountain
+            );
+            OutFoothillEnvelope = FMath::Max(
+                OutFoothillEnvelope, Foothill
+            );
+        }
+    }
+}
 
 } // namespace UE::Avenor::Strip
 
@@ -629,7 +852,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 18;
+static constexpr int32 GeneratorAlgorithmVersion = 19;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3589,6 +3812,7 @@ namespace UE::Avenor::Strip
 {
 static double EvaluateLandform(
     const FVector2D& Position,
+    const TArray<FMountainRangePrimitive>& MountainRanges,
     int32 Seed,
     double ReliefHeight,
     double StructuralScale,
@@ -3668,18 +3892,14 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
-    const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.55) / 0.31,
+    const double HighlandProvince = Smooth01(FMath::Clamp(
+        (Province * 0.62 + Province2 * 0.38 - 0.38) / 0.46,
         0.0, 1.0
     ));
     const double HillProvince = Smooth01(FMath::Clamp(
         (Province * 0.42 + Province2 * 0.58 - 0.35) / 0.44,
         0.0, 1.0
-    )) * (1.0 - MountainProvince * 0.46);
-    const double QuietProvince = FMath::Clamp(
-        1.0 - MountainProvince * 0.70 - HillProvince * 0.46,
-        0.0, 1.0
-    );
+    )) * FMath::Lerp(0.72, 1.0, HighlandProvince);
 
     const double PlateField = Fbm(
         Warped, Scale * 2.6,
@@ -3719,47 +3939,12 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
-        Warped, Scale * 1.55,
-        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
-    ) * Scale * 0.24;
-    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
-        Warped, Scale * 1.35,
-        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
-    ) * Scale * 0.22;
-    const double BeltA = RidgedFbm(
-        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
-        Scale * 0.95,
-        SeedOffset + FVector2D(421.0, 719.0),
-        5
+    double RangeMountainEnvelope = 0.0;
+    double RangeFoothillEnvelope = 0.0;
+    EvaluateMountainRangePlan(
+        Position, MountainRanges,
+        RangeMountainEnvelope, RangeFoothillEnvelope
     );
-    const double BeltB = RidgedFbm(
-        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
-        Scale * 1.05,
-        SeedOffset + FVector2D(877.0, 149.0),
-        5
-    );
-    const double BeltSignal = FMath::Clamp(
-        BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
-    );
-    // Ridged noise is deliberately bright over much of its domain: values
-    // near a Perlin zero crossing become a ridge. It therefore cannot itself
-    // be treated as a mountain-presence mask. The old low threshold plus
-    // non-zero 0.50/0.68 multiplier floors left virtually the entire world
-    // mountain-eligible. Require a genuine high ridge inside a coherent
-    // mountain province instead. Both gates can now reach zero, preserving
-    // large quiet provinces for plains, rolling country and broad valleys.
-    const double BeltCore = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.72, 0.60, Activity)) / 0.24,
-        0.0, 1.0
-    ));
-    const double MountainProvinceGate = Smooth01(FMath::Clamp(
-        (MountainProvince - 0.08) / 0.82,
-        0.0, 1.0
-    ));
-    const double BroadRange = BeltCore
-        * MountainProvinceGate
-        * FMath::Lerp(0.55, 1.0, PositiveUplift);
 
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
@@ -3777,7 +3962,15 @@ static double EvaluateLandform(
             + CrestVariation * 0.22,
         0.74, 1.30
     );
-    OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
+    // Range primitives decide where mountains exist. Noise only varies their
+    // internal crest character, while uplift modulates their strength.
+    OutMountainMask = FMath::Clamp(
+        RangeMountainEnvelope
+            * FMath::Lerp(0.72, 1.0, CrestRidges)
+            * FMath::Lerp(0.78, 1.0, PositiveUplift),
+        0.0,
+        1.0
+    );
 
     const double UplandRidges = RidgedFbm(
         Warped, Scale * 0.48,
@@ -3794,15 +3987,17 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(163.0, 1429.0),
         4, 0.52, 2.1
     );
-    const double FoothillEnvelope = Smooth01(FMath::Clamp(
-        (BeltSignal - 0.38) / 0.38, 0.0, 1.0
-    )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
+    const double FoothillEnvelope = FMath::Clamp(
+        RangeFoothillEnvelope * (1.0 - OutMountainMask * 0.35),
+        0.0,
+        1.0
+    );
     const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
         (0.40 * UplandRidges
             + 0.40 * (0.5 + 0.5 * Rolling)
             + 0.20 * Province2 - 0.38) / 0.44,
         0.0, 1.0
-    ));
+    )) * (1.0 - RangeMountainEnvelope * 0.72);
     OutHillMask = FMath::Clamp(
         FMath::Max(FoothillEnvelope * 0.82, IndependentHills)
             * (1.0 - OutMountainMask * 0.62),
@@ -3844,6 +4039,11 @@ static double EvaluateLandform(
         * Smooth01(FMath::Clamp((BasinNoise - 0.46) / 0.36, 0.0, 1.0))
         * (1.0 - OutMountainMask * 0.72);
 
+    const double QuietProvince = FMath::Clamp(
+        1.0 - OutMountainMask - OutHillMask * 0.74,
+        0.0,
+        1.0
+    );
     OutPlainsMask = FMath::Clamp(
         FMath::Max(QuietProvince, 1.0 - OutMountainMask * 0.96
             - OutHillMask * 0.72 - RiftMask * 0.42),
@@ -3860,11 +4060,10 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    // Do not smoothstep an already-smooth, clamped structural mask a second
-    // time. That drove every strong belt toward exactly 1.0 and made unrelated
-    // summits converge on the same apparent ceiling. CrestShape now carries a
-    // materially wider, coherent regional/crest variation so adjacent peaks
-    // retain different heights even where the belt envelope is fully active.
+    // The distance-field envelope supplies range-scale relief; CrestShape
+    // supplies coherent variation within it. Keeping those responsibilities
+    // separate prevents both a uniform summit ceiling and high-frequency
+    // noise from deciding where mountains exist.
     const double MountainHeight = OutMountainMask;
     // Strong coherent uplift accelerates non-linearly so true mountain belts
     // can reach kilometre-scale relief without lifting quiet plains with them.
@@ -4481,8 +4680,14 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     BuildMacroClimate(*Data, Generator);
 
-    Data->RequestedMountainRanges = 0;
-    Data->PlacedMountainRanges = 0;
+    TArray<FMountainRangePrimitive> MountainRanges = GenerateMountainRangePlan(
+        Bounds,
+        Generator.Seed,
+        Generator.StructuralScale,
+        Generator.TectonicActivity,
+        Data->RequestedMountainRanges
+    );
+    Data->PlacedMountainRanges = MountainRanges.Num();
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -4492,7 +4697,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellDesertMask = 0.0;
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
-            Data->CellPosition(Cell), Generator.Seed,
+            Data->CellPosition(Cell), MountainRanges, Generator.Seed,
             Generator.StructuralRelief, Generator.StructuralScale,
             Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
@@ -5870,11 +6075,12 @@ void AAvenorStripTerrainGenerator::GenerateTerrain()
     }
 
     LastBuildStamp = FString::Printf(
-        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | structural relief %.0fcm @ %.0fcm scale | river seeds %d + %d downstream cells = %d channel cells | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
+        TEXT("Terrain submitted %s | code %s | seed %d | %d cells @ %.0fcm | structural relief %.0fcm @ %.0fcm scale | mountain ranges %d/%d | river seeds %d + %d downstream cells = %d channel cells | short systems rejected %d | %d river reaches | lakes %d (%d terminal + %d optional; %d terminal candidates) | NEXT: GENERATE REFINEMENT SPLINES"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed, Data->Height.Num(), Data->CellSize,
         StructuralRelief, StructuralScale,
+        Data->PlacedMountainRanges, Data->RequestedMountainRanges,
         Data->RiverSeedCells, Data->RiverContinuationCells,
         Data->AuthoritativeRiverCells, Data->RejectedShortRiverSystems,
         Data->Rivers.Num(), Data->Lakes.Num(),
