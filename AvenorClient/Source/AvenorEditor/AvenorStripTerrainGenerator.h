@@ -70,10 +70,10 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ToolTip = "Compresses unusually large climate changes into a short proof-of-concept map. Useful for short test worlds; normally leave disabled for a full-length world."))
     bool bShowcaseClimateCompression = false;
 
-    UPROPERTY(EditAnywhere, Category = "Climate|Rain Shadow", meta = (ClampMin = "0.0", ClampMax = "360.0", Units = "deg", ToolTip = "Compass direction the prevailing wind blows TOWARD (0 = +X world axis, 90 = +Y), independent of the strip's long axis. Moisture is depleted on the far (lee) side of ridges that face into this wind and boosted on the near (windward) side."))
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "360.0", Units = "deg", ToolTip = "Compass direction the prevailing wind blows TOWARD (0 = +X world axis, 90 = +Y), independent of the strip's long axis. Moisture is depleted on the far (lee) side of ridges that face into this wind and boosted on the near (windward) side."))
     double PrevailingWindDirectionDegrees = 0.0;
 
-    UPROPERTY(EditAnywhere, Category = "Climate|Rain Shadow", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "How strongly mountains block moisture on their lee side and enhance it on their windward side. 0 disables rain shadows entirely, leaving moisture purely a function of the broad climate regions and elevation."))
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "How strongly mountains block moisture on their lee side and enhance it on their windward side. 0 disables rain shadows entirely, leaving moisture purely a function of the broad climate regions and elevation."))
     double RainShadowStrength = 0.6;
 };
 
