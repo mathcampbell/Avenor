@@ -553,6 +553,30 @@ static void FinalizeMountainRidge(FMountainRidgePrimitive& Ridge)
     Ridge.Bounds = Ridge.Bounds.ExpandBy(Ridge.FoothillHalfWidth);
 }
 
+static TArray<FVector2D> SmoothMountainRidge(
+    const TArray<FVector2D>& Input,
+    int32 Iterations
+)
+{
+    TArray<FVector2D> Points = Input;
+    for (int32 Iteration = 0;
+         Iteration < Iterations && Points.Num() >= 2;
+         ++Iteration)
+    {
+        TArray<FVector2D> Smoothed;
+        Smoothed.Reserve(Points.Num() * 2);
+        Smoothed.Add(Points[0]);
+        for (int32 Index = 0; Index + 1 < Points.Num(); ++Index)
+        {
+            Smoothed.Add(FMath::Lerp(Points[Index], Points[Index + 1], 0.25));
+            Smoothed.Add(FMath::Lerp(Points[Index], Points[Index + 1], 0.75));
+        }
+        Smoothed.Add(Points.Last());
+        Points = MoveTemp(Smoothed);
+    }
+    return Points;
+}
+
 static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
     const FBox& Bounds,
     int32 Seed,
@@ -640,9 +664,9 @@ static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
             * Random.FRandRange(0.75f, 1.45f)
             * FMath::Lerp(0.88, 1.16, Activity);
         const double CoreHalfWidth = Scale
-            * Random.FRandRange(0.12f, 0.22f);
+            * Random.FRandRange(0.30f, 0.48f);
         const double FoothillHalfWidth = CoreHalfWidth + Scale
-            * Random.FRandRange(0.28f, 0.52f);
+            * Random.FRandRange(0.35f, 0.55f);
 
         FMountainRidgePrimitive& MainRidge = Range.Ridges.AddDefaulted_GetRef();
         MainRidge.CoreHalfWidth = CoreHalfWidth;
@@ -671,24 +695,34 @@ static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
                     + Across * (Bend + Irregularity)
             );
         }
+        MainRidge.Points = SmoothMountainRidge(MainRidge.Points, 2);
         FinalizeMountainRidge(MainRidge);
 
         const int32 BranchCount = Random.RandRange(1, 2);
         for (int32 BranchIndex = 0; BranchIndex < BranchCount; ++BranchIndex)
         {
-            const int32 AttachIndex = Random.RandRange(2, MainPointCount - 3);
+            const int32 AttachIndex = Random.RandRange(
+                MainRidge.Points.Num() / 4,
+                MainRidge.Points.Num() * 3 / 4
+            );
             const FVector2D Attach = MainRidge.Points[AttachIndex];
+            const FVector2D LocalAlong = (
+                MainRidge.Points[AttachIndex + 1]
+                    - MainRidge.Points[AttachIndex - 1]
+            ).GetSafeNormal();
             const double Side = Random.RandRange(0, 1) == 0 ? -1.0 : 1.0;
             const double BranchAngle = Side * Random.FRandRange(0.48f, 0.92f);
             const FVector2D BranchAlong(
-                Along.X * FMath::Cos(BranchAngle) - Along.Y * FMath::Sin(BranchAngle),
-                Along.X * FMath::Sin(BranchAngle) + Along.Y * FMath::Cos(BranchAngle)
+                LocalAlong.X * FMath::Cos(BranchAngle)
+                    - LocalAlong.Y * FMath::Sin(BranchAngle),
+                LocalAlong.X * FMath::Sin(BranchAngle)
+                    + LocalAlong.Y * FMath::Cos(BranchAngle)
             );
             const FVector2D BranchAcross = Rotate90(BranchAlong);
             const double BranchLength = Scale * Random.FRandRange(0.48f, 0.95f);
             FMountainRidgePrimitive& Branch = Range.Ridges.AddDefaulted_GetRef();
-            Branch.CoreHalfWidth = CoreHalfWidth * Random.FRandRange(0.48f, 0.68f);
-            Branch.FoothillHalfWidth = FoothillHalfWidth * Random.FRandRange(0.55f, 0.76f);
+            Branch.CoreHalfWidth = CoreHalfWidth * Random.FRandRange(0.55f, 0.72f);
+            Branch.FoothillHalfWidth = FoothillHalfWidth * Random.FRandRange(0.62f, 0.80f);
             Branch.Strength = MainRidge.Strength * Random.FRandRange(0.62f, 0.82f);
             Branch.Points = {
                 Attach,
@@ -696,6 +730,7 @@ static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
                     + BranchAcross * Random.FRandRange(-0.10f, 0.10f) * Scale,
                 Attach + BranchAlong * BranchLength
             };
+            Branch.Points = SmoothMountainRidge(Branch.Points, 2);
             FinalizeMountainRidge(Branch);
         }
     }
@@ -735,7 +770,7 @@ static void EvaluateMountainRangePlan(
             const double Outer = Smooth01(1.0 - FMath::Clamp(
                 Distance / FMath::Max(1.0, Ridge.FoothillHalfWidth), 0.0, 1.0
             ));
-            const double Mountain = FMath::Pow(Core, 1.12) * Ridge.Strength;
+            const double Mountain = Core * Ridge.Strength;
             const double Foothill = FMath::Max(
                 0.0, Outer - Core * 0.78
             ) * Ridge.Strength;
@@ -852,7 +887,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 19;
+static constexpr int32 GeneratorAlgorithmVersion = 20;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3957,16 +3992,17 @@ static double EvaluateLandform(
         4, 0.54, 2.07
     );
     const double CrestShape = FMath::Clamp(
-        0.74
-            + CrestRidges * 0.34
-            + CrestVariation * 0.22,
-        0.74, 1.30
+        0.82
+            + CrestRidges * 0.20
+            + CrestVariation * 0.18,
+        0.82, 1.20
     );
     // Range primitives decide where mountains exist. Noise only varies their
     // internal crest character, while uplift modulates their strength.
     OutMountainMask = FMath::Clamp(
         RangeMountainEnvelope
-            * FMath::Lerp(0.72, 1.0, CrestRidges)
+            * FMath::Lerp(0.42, 1.0, CrestRidges)
+            * FMath::Lerp(0.78, 1.08, CrestVariation)
             * FMath::Lerp(0.78, 1.0, PositiveUplift),
         0.0,
         1.0
