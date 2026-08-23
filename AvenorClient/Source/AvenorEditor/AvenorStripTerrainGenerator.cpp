@@ -539,6 +539,16 @@ struct FAvenorStripData
     TArray<double> DesertMask;
     TArray<double> PlainsMask;
     TArray<double> FilledHeight;
+    // Near-zero-epsilon depression fill, used only for lake/basin detection.
+    // FilledHeight above is built with DrainageEpsilon for flow routing, and
+    // that epsilon accumulates additively along any long, gently-sloped
+    // stretch (an ordinary lowland valley, a floodplain) even where the
+    // terrain has no real depression - which can make a ordinary valley many
+    // cells long read as a "filled basin" and drag a lake's detected surface
+    // height down to whatever the far end of that false blob happens to be.
+    // This field is not part of the baked chunk format - transient, used
+    // only during generation.
+    TArray<double> DepressionFillHeight;
     TArray<double> Accumulation;
     TArray<double> Slope;
     TArray<double> MacroTemperature;
@@ -1570,6 +1580,65 @@ static void PriorityFlood(FAvenorStripData& Data, double Epsilon)
     }
 }
 
+// Same priority-flood algorithm as above, but always at the smallest
+// representable step (not DrainageEpsilon) and writing to a separate field.
+// FilledHeight above needs a real epsilon to disambiguate flow direction
+// across flats; that same epsilon then accumulates additively along any
+// long, gently-sloped stretch, which can make an ordinary valley many cells
+// long falsely read as a filled depression. This field is for measuring
+// genuine depression depth only - lake/basin detection - not routing.
+static void ComputeDepressionFillHeight(FAvenorStripData& Data)
+{
+    const int32 CellCount = Data.Height.Num();
+    Data.DepressionFillHeight = Data.Height;
+    TArray<bool> Visited;
+    Visited.Init(false, CellCount);
+    std::priority_queue<FPriorityCell, std::vector<FPriorityCell>, std::greater<FPriorityCell>> Queue;
+    auto AddBoundary = [&](int32 X, int32 Y)
+    {
+        const int32 Cell = Data.Index(X, Y);
+        if (!Visited[Cell])
+        {
+            Visited[Cell] = true;
+            Queue.push({Data.DepressionFillHeight[Cell], Cell});
+        }
+    };
+    for (int32 X = 0; X < Data.Columns; ++X)
+    {
+        AddBoundary(X, 0);
+        AddBoundary(X, Data.Rows - 1);
+    }
+    for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
+    {
+        AddBoundary(0, Y);
+        AddBoundary(Data.Columns - 1, Y);
+    }
+    while (!Queue.empty())
+    {
+        const FPriorityCell Current = Queue.top();
+        Queue.pop();
+        const int32 X = Current.Cell % Data.Columns;
+        const int32 Y = Current.Cell / Data.Columns;
+        for (int32 Direction = 0; Direction < 8; ++Direction)
+        {
+            const int32 NX = X + NeighborX[Direction];
+            const int32 NY = Y + NeighborY[Direction];
+            if (!Data.IsValid(NX, NY))
+            {
+                continue;
+            }
+            const int32 Neighbor = Data.Index(NX, NY);
+            if (Visited[Neighbor])
+            {
+                continue;
+            }
+            Visited[Neighbor] = true;
+            Data.DepressionFillHeight[Neighbor] = FMath::Max(Data.Height[Neighbor], Current.Height + 0.0001);
+            Queue.push({Data.DepressionFillHeight[Neighbor], Neighbor});
+        }
+    }
+}
+
 static int32 SteepestReceiver(const FAvenorStripData& Data, int32 X, int32 Y)
 {
     const int32 Cell = Data.Index(X, Y);
@@ -2307,8 +2376,8 @@ static TArray<int32> FindRiverFedBasinSeeds(
             continue;
         }
         const bool bMeaningfulDepression =
-            Data.FilledHeight.IsValidIndex(Cell)
-            && (Data.FilledHeight[Cell] - Data.Height[Cell])
+            Data.DepressionFillHeight.IsValidIndex(Cell)
+            && (Data.DepressionFillHeight[Cell] - Data.Height[Cell])
                 >= DepressionThreshold;
         const int32 Receiver = PrimaryReceiver(Data, Cell);
         // In principle a cell whose receiver has fallen out of the channel
@@ -2371,7 +2440,7 @@ static void ExtractLakes(
         for (int32 X = 1; X + 1 < Data.Columns; ++X)
         {
             const int32 Cell = Data.Index(X, Y);
-            Candidate[Cell] = (Data.FilledHeight[Cell] - Data.Height[Cell]) >= ShorelineFillThreshold;
+            Candidate[Cell] = (Data.DepressionFillHeight[Cell] - Data.Height[Cell]) >= ShorelineFillThreshold;
         }
     }
     TArray<bool> Visited;
@@ -2395,9 +2464,9 @@ static void ExtractLakes(
             Basin.Cells.Add(Cell);
             Basin.SurfaceHeight = FMath::Min(
                 Basin.SurfaceHeight,
-                Data.FilledHeight[Cell]
+                Data.DepressionFillHeight[Cell]
             );
-            Basin.MaximumDepth = FMath::Max(Basin.MaximumDepth, Data.FilledHeight[Cell] - Data.Height[Cell]);
+            Basin.MaximumDepth = FMath::Max(Basin.MaximumDepth, Data.DepressionFillHeight[Cell] - Data.Height[Cell]);
             // D8, not MFD: catchment sizing feeds mandatory/optional lake
             // acceptance, which is decided from the same D8 channel network
             // (see FindRiverFedBasinSeeds/PrimaryReceiver) that determines
@@ -4392,6 +4461,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     // regional climate so altitude and final relief drive alpine transitions.
     ReclassifyFinalLandforms(*Data);
     ApplyTerrainClimate(*Data, Generator);
+    ComputeDepressionFillHeight(*Data);
 
     TArray<bool> AuthoritativeRiverNetwork;
     if (Generator.bGenerateRivers)
