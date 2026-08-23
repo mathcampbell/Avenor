@@ -2186,8 +2186,26 @@ static TArray<FVector> TraceComponentBoundary(
     {
         return {};
     }
-    TArray<FVector> Reduced = ResamplePolyline(Boundary, FMath::Max(Data.CellSize, 3500.0), true);
-    Boundary = ChaikinSmooth(Reduced, true, 2);
+    double Perimeter = 0.0;
+    for (int32 Index = 0; Index < Boundary.Num(); ++Index)
+    {
+        Perimeter += FVector2D::Distance(
+            FVector2D(Boundary[Index]),
+            FVector2D(Boundary[(Index + 1) % Boundary.Num()])
+        );
+    }
+    // A flat CellSize resample floor left a small lake (a handful of grid
+    // cells, a few hundred metres of shoreline) with only a few points to
+    // round through Chaikin, so its raw grid-aligned trace read as an
+    // unmistakably blocky, near-rectangular shape instead of an organic
+    // pond outline. Guarantee a reasonable minimum point count regardless
+    // of size, while still capping density (via the CellSize floor) so a
+    // large lake's shoreline doesn't balloon in point count.
+    const double AdaptiveSpacing = FMath::Clamp(
+        Perimeter / 28.0, 800.0, FMath::Max(Data.CellSize, 3500.0)
+    );
+    TArray<FVector> Reduced = ResamplePolyline(Boundary, AdaptiveSpacing, true);
+    Boundary = ChaikinSmooth(Reduced, true, 3);
     const double SimplificationTolerance = FMath::Max(
         FinalPointSpacing * 4.0,
         Data.CellSize * 0.15
@@ -2608,7 +2626,13 @@ static void ExtractLakes(
     for (const FLakeCandidate& CandidateBasin : OrderedBasins)
     {
         const double BasinArea = CandidateBasin.Cells.Num() * Data.CellAreaSquareKilometres();
-        if (BasinArea <= 0.0)
+        // A basin only a handful of cells across has no boundary detail for
+        // the shoreline smoothing pipeline to work with - it traces as a
+        // blocky, unmistakably grid-aligned near-rectangle no matter how
+        // much smoothing runs afterward. Below this size it can never read
+        // as a natural pond outline, so reject it as a lake outright rather
+        // than spawn something that looks like a rendering bug.
+        if (BasinArea <= 0.0 || CandidateBasin.Cells.Num() < 9)
         {
             continue;
         }
@@ -3742,14 +3766,26 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
-        Warped, Scale * 1.55,
-        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
-    ) * Scale * 0.24;
-    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
-        Warped, Scale * 1.35,
-        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
-    ) * Scale * 0.22;
+    // Two warp scales: a slow, large-amplitude one so the belt's overall
+    // path actually bends over its length (a real orogenic belt sweeps in
+    // broad arcs, it doesn't run ruler-straight for tens of kilometres),
+    // plus the original fast, small one for local jitter on top of that
+    // bend. AxisA/AxisB's own 4-5x along:across stretch already makes each
+    // belt an elongated, mountain-range-like feature - without a large-
+    // scale bend it reads as an unnaturally straight corrugation instead,
+    // and any river valley following it inherits that same straightness.
+    const FVector2D BeltWarpedA = Warped + AcrossA * (
+        Fbm(Warped, Scale * 0.42,
+            SeedOffset + FVector2D(2903.0, 641.0), 3, 0.58, 2.0) * Scale * 0.85
+        + Fbm(Warped, Scale * 1.55,
+            SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0) * Scale * 0.24
+    );
+    const FVector2D BeltWarpedB = Warped + AcrossB * (
+        Fbm(Warped, Scale * 0.37,
+            SeedOffset + FVector2D(367.0, 3121.0), 3, 0.58, 2.0) * Scale * 0.80
+        + Fbm(Warped, Scale * 1.35,
+            SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0) * Scale * 0.22
+    );
     const double BeltA = RidgedFbm(
         Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
         Scale * 0.95,
@@ -4533,20 +4569,18 @@ static void RefineClimateFromHydrology(
             0.08, 0.92
         );
         Data.Temperature[Cell] = Temperature;
-        const double FinalMountain = FMath::Clamp(
-            Data.MountainMask[Cell], 0.0, 1.0
-        );
-        const double ElevationMetres = FMath::Max(0.0, Data.Height[Cell]) / 100.0;
-        const bool bHighTerrain = FinalMountain > 0.28 || ElevationMetres > 1400.0;
-        if (Temperature < 0.105 && bHighTerrain)
-        {
-            Biome = EAvenorBiomeClass::SnowIce;
-        }
-        else if (Temperature < 0.32 && bHighTerrain)
-        {
-            Biome = EAvenorBiomeClass::AlpineTundra;
-        }
-        else if (Temperature >= 0.50
+        // AlpineTundra/SnowIce are deliberately not classified here. This is
+        // the coarse, per-analysis-cell biome (feeds erosion/desert-mask
+        // consistency, not material painting), and AvenorBiomeBlendMap's
+        // local-override bake already derives those two from fine-grained
+        // per-pixel elevation against its own thresholds for exactly that
+        // purpose - having both meant the same "cold, high terrain" ground
+        // could read as plain ColdDry/ColdMoist here but Alpine/Snow there,
+        // with no way to tell which one the game actually uses. One place
+        // decides Alpine/Snow (the local override, since it's genuinely a
+        // fine-resolution material distinction); this one only ever
+        // produces the plain climate quadrant.
+        if (Temperature >= 0.50
             && Data.DesertMask.IsValidIndex(Cell) && Data.DesertMask[Cell] > 0.40
             && RegionalMoisture < 0.42
             && AvailableMoisture >= 0.48
