@@ -223,6 +223,18 @@ private:
         const FVector2D XY(Camera.X, Camera.Y);
         FAvenorTerrainSample Terrain;
         const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
+        // SampleTerrain (above) reads the raw pre-carve analysis grid, used
+        // for landform classification (mountain/hill/desert character is a
+        // structural property, not something a river carving through it
+        // should change). The displayed elevation should instead be what is
+        // actually visible at this point, including river/lake carving, or
+        // it reads as wrong every time the camera is over a water feature.
+        float FinalHeight = Terrain.Height;
+        bool bWaterAffected = false;
+        if (bTerrain)
+        {
+            Data->SampleFinalHeight(XY, FinalHeight, TerrainCache, &bWaterAffected);
+        }
 
         const FBox2D ClimateBounds = Data->WorldClimateMaps.WorldBounds;
         UTexture2D* ClimateTexture = Data->WorldClimateMaps.ClimateFilterTexture.LoadSynchronous();
@@ -252,7 +264,7 @@ private:
                 const double LocalTemperature = Climate->B / 255.0;
                 const double LocalMoisture = Climate->A / 255.0;
                 Status = FString::Printf(
-                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
+                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s%s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
                     *BiomeName(FinalBiome),
                     bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
                     *BiomeName(BaseBiome),
@@ -261,7 +273,8 @@ private:
                     TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),
                     LocalTemperature, LocalMoisture,
                     bTerrain ? ClassifyFinalLandform(Terrain) : TEXT("Unknown"),
-                    bTerrain ? *FString::Printf(TEXT("%.0f m"), Terrain.Height / 100.0f) : TEXT("n/a"),
+                    bTerrain ? *FString::Printf(TEXT("%.0f m"), FinalHeight / 100.0f) : TEXT("n/a"),
+                    bWaterAffected ? TEXT(" (water)") : TEXT(""),
                     bTerrain ? *FString::Printf(TEXT("%.1f km2"), Terrain.Accumulation) : TEXT("n/a"),
                     Camera.X / 100000.0, Camera.Y / 100000.0);
             }
@@ -271,8 +284,9 @@ private:
         {
             Status = bTerrain
                 ? FString::Printf(
-                    TEXT("AVENOR LOCATION PROBE\nClimate maps temporarily unavailable\nLandform: %s   Elevation: %.0f m   Drainage: %.1f km2\nSlope: %.3f   Mountain %.2f   Hill %.2f\nWorld: X %.2f km   Y %.2f km"),
-                    ClassifyFinalLandform(Terrain), Terrain.Height / 100.0f,
+                    TEXT("AVENOR LOCATION PROBE\nClimate maps temporarily unavailable\nLandform: %s   Elevation: %.0f m%s   Drainage: %.1f km2\nSlope: %.3f   Mountain %.2f   Hill %.2f\nWorld: X %.2f km   Y %.2f km"),
+                    ClassifyFinalLandform(Terrain), FinalHeight / 100.0f,
+                    bWaterAffected ? TEXT(" (water)") : TEXT(""),
                     Terrain.Accumulation, Terrain.Slope, Terrain.Mountain, Terrain.Hill,
                     Camera.X / 100000.0, Camera.Y / 100000.0)
                 : FString::Printf(

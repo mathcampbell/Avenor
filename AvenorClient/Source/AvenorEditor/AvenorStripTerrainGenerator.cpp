@@ -2282,7 +2282,8 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
 
 static TArray<int32> FindRiverFedBasinSeeds(
     const FAvenorStripData& Data,
-    const TArray<bool>& Channel
+    const TArray<bool>& Channel,
+    double SignificantConfluenceArea
 )
 {
     TArray<int32> Seeds;
@@ -2310,11 +2311,25 @@ static TArray<int32> FindRiverFedBasinSeeds(
             && (Data.FilledHeight[Cell] - Data.Height[Cell])
                 >= DepressionThreshold;
         const int32 Receiver = PrimaryReceiver(Data, Cell);
+        // In principle a cell whose receiver has fallen out of the channel
+        // network is an interior terminus. In practice this never fires:
+        // BuildAuthoritativeRiverNetwork's endpoint-continuation guarantees
+        // every channel cell's receiver is also a channel cell all the way
+        // to the map edge, and boundary cells are excluded above. Kept as a
+        // defensive check (e.g. if that invariant is ever relaxed), but the
+        // real signal for "this basin deserves the mandatory/looser lake
+        // acceptance path" is bMeaningfulDepression or bSignificantConfluence
+        // below - a wide, shallow pool fed by a real river is exactly as
+        // legitimate a lake as a deep one, and depth alone was previously
+        // the only way in.
         const bool bInteriorTerminus =
             Receiver == INDEX_NONE
             || !Channel.IsValidIndex(Receiver)
             || !Channel[Receiver];
-        if (bMeaningfulDepression || bInteriorTerminus)
+        const bool bSignificantConfluence =
+            Data.AccumulationD8.IsValidIndex(Cell)
+            && Data.AccumulationD8[Cell] >= SignificantConfluenceArea;
+        if (bMeaningfulDepression || bInteriorTerminus || bSignificantConfluence)
         {
             Seeds.Add(Cell);
         }
@@ -4390,7 +4405,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     if (Generator.bGenerateLakes)
     {
         const TArray<int32> MandatoryTerminusSeeds = Generator.bGenerateRivers
-            ? FindRiverFedBasinSeeds(*Data, AuthoritativeRiverNetwork)
+            ? FindRiverFedBasinSeeds(
+                *Data, AuthoritativeRiverNetwork, Generator.MainRiverArea * 0.4)
             : TArray<int32>();
         ExtractLakes(
             *Data, MandatoryTerminusSeeds, Generator.MinimumLakeDepth, Generator.MinimumLakeBedDepth,
