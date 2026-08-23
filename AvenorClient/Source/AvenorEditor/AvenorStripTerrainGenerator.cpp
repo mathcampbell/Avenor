@@ -3606,18 +3606,6 @@ static double EvaluateMountainPlacementPotential(
     double Province2
 )
 {
-    auto Oriented = [](const FVector2D& P,
-                       const FVector2D& Along,
-                       const FVector2D& Across,
-                       double AlongStretch,
-                       double AcrossStretch)
-    {
-        return FVector2D(
-            FVector2D::DotProduct(P, Along) / FMath::Max(0.05, AlongStretch),
-            FVector2D::DotProduct(P, Across) / FMath::Max(0.05, AcrossStretch)
-        );
-    };
-
     const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
         Warped, Scale * 1.55,
         SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
@@ -3626,14 +3614,22 @@ static double EvaluateMountainPlacementPotential(
         Warped, Scale * 1.35,
         SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
     ) * Scale * 0.22;
+    const FVector2D BeltCoordinatesA(
+        FVector2D::DotProduct(BeltWarpedA, AxisA) / 4.2,
+        FVector2D::DotProduct(BeltWarpedA, AcrossA) / 0.82
+    );
+    const FVector2D BeltCoordinatesB(
+        FVector2D::DotProduct(BeltWarpedB, AxisB) / 3.4,
+        FVector2D::DotProduct(BeltWarpedB, AcrossB) / 0.90
+    );
     const double BeltA = RidgedFbm(
-        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
+        BeltCoordinatesA,
         Scale * 0.95,
         SeedOffset + FVector2D(421.0, 719.0),
         5
     );
     const double BeltB = RidgedFbm(
-        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
+        BeltCoordinatesB,
         Scale * 1.05,
         SeedOffset + FVector2D(877.0, 149.0),
         5
