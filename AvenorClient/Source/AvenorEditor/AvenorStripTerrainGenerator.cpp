@@ -445,7 +445,12 @@ static void AddBroadMeanders(
         FMath::Clamp(LowlandFraction, 0.0, 1.0), 1.35
     );
     const double Discharge = FMath::Clamp(DischargeFraction, 0.0, 1.0);
-    const double Freedom = FMath::Clamp(ValleyFreedom, 0.15, 1.0);
+    // Floor kept above the gate threshold below: a clamped-to-floor Freedom
+    // used to land at exactly the same value the gate rejected, so any
+    // valley-constrained reach (common wherever resistance/mountain masks
+    // are non-trivial, which is most of this terrain) silently got zero
+    // meander instead of the reduced-but-nonzero wiggle the floor implies.
+    const double Freedom = FMath::Clamp(ValleyFreedom, 0.20, 1.0);
     if (Lowland < 0.04 || Freedom < 0.16)
     {
         return;
@@ -2763,9 +2768,13 @@ static void ConstrainMeandersToValley(
     }
 
     const double Lowland = FMath::Clamp(LowlandFraction, 0.0, 1.0);
+    // Wider than a single cell so an ordinary hillslope undulation doesn't
+    // read as "left the valley" and snap the spline straight back to the
+    // unmeandered base point; the flood-fill valley/lake logic elsewhere is
+    // still what actually keeps the river out of real terrain.
     const double AllowedLateralRise = FMath::Lerp(
-        Data.CellSize * 0.04,
-        Data.CellSize * 0.22,
+        Data.CellSize * 0.10,
+        Data.CellSize * 0.40,
         Lowland
     );
     for (int32 Index = 1; Index + 1 < MeanderedPoints.Num(); ++Index)
@@ -2787,8 +2796,14 @@ static void ConstrainMeandersToValley(
                 0.0,
                 1.0
             );
+        // Only true steep terrain (not every moderate hillslope undulation)
+        // should flatten a meander back to the raw flow-cell path - that
+        // window used to start at 0.045 (a mild 4.5% grade), which combined
+        // with the per-reach Lowland gate to suppress almost all wiggle
+        // outside dead-flat valley floors and left visibly straight,
+        // grid-aligned segments through ordinary hilly ground.
         const double SlopeScale = 1.0 - Smooth01(FMath::Clamp(
-            (CandidateSlope - 0.045) / 0.10,
+            (CandidateSlope - 0.09) / 0.13,
             0.0,
             1.0
         ));
@@ -3467,8 +3482,15 @@ static void ExtractRivers(
         ));
         River.ValleyHalfWidth *= FMath::Lerp(0.96, 1.18, HumidValley);
         River.ValleyDepth *= FMath::Lerp(0.94, 1.08, HumidValley);
+        // bCanyons is currently always enabled (resolved unconditionally
+        // true, with no exposed toggle to turn it off), so the old
+        // "bCanyons || bClimateCanyon" OR made the desert check redundant -
+        // any reach that was steep and resistant enough got canyon-carved
+        // regardless of climate, including ordinary hilly/temperate rivers.
+        // Real mesas and canyons are a hot/dry-climate landform, so require
+        // both the feature toggle AND real desert climate here.
         const bool bClimateCanyon = MeanDesert > 0.42;
-        if ((bCanyons || bClimateCanyon)
+        if (bCanyons && bClimateCanyon
             && Area >= CanyonStartArea
             && MeanSlope > 0.045
             && MeanResistance > 0.22)
