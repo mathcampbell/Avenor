@@ -34,13 +34,19 @@ struct FTexturePixels
     int32 Height = 0;
     TArray<FColor> Pixels;
 
+    void Reset()
+    {
+        Texture = nullptr;
+        Width = 0;
+        Height = 0;
+        Pixels.Reset();
+    }
+
     bool Refresh(UTexture2D* InTexture)
     {
         if (!InTexture || InTexture->Source.GetFormat(0) != TSF_BGRA8)
         {
-            Texture = nullptr;
-            Pixels.Reset();
-            Width = Height = 0;
+            Reset();
             return false;
         }
         const int32 NewWidth = InTexture->Source.GetSizeX();
@@ -54,9 +60,7 @@ struct FTexturePixels
         if (!InTexture->Source.GetMipData(RawMip, 0, nullptr)
             || RawMip.Num() != static_cast<int64>(NewWidth) * NewHeight * sizeof(FColor))
         {
-            Texture = nullptr;
-            Pixels.Reset();
-            Width = Height = 0;
+            Reset();
             return false;
         }
         Texture = InTexture;
@@ -179,6 +183,19 @@ public:
     }
 
 private:
+    void ResetBakedCaches(const UAvenorTerrainData* Data)
+    {
+        TerrainCache.Chunks.Reset();
+        TerrainCache.RiverBounds.Reset();
+        TerrainCache.LakeBounds.Reset();
+        ClimatePixels.Reset();
+        BaseBiomePixels.Reset();
+        LocalBiomePixels.Reset();
+        CachedData = Data;
+        CachedGeneratedAtUtc = Data ? Data->GeneratedAtUtc : FDateTime();
+        CachedSettingsHash = Data ? Data->SettingsHash : FString();
+    }
+
     bool Tick(float DeltaSeconds)
     {
         if (CVarEnabled.GetValueOnGameThread() == 0 || !GEditor || !GEngine)
@@ -213,22 +230,35 @@ private:
         UAvenorTerrainData* Data = Generator->BakedTerrainData.LoadSynchronous();
         if (!Data || !Data->HasValidData())
         {
+            ResetBakedCaches(nullptr);
             GEngine->AddOnScreenDebugMessage(
                 0x0A7E0B10, 0.5f, FColor::White,
                 TEXT("AVENOR LOCATION PROBE\nBaked terrain data unavailable"), false);
             return true;
         }
 
+        // The terrain asset is overwritten in-place by Generate and Bake
+        // Geography, so its UObject pointer normally does not change. The old
+        // probe kept decompressed chunks and source-texture pixels forever and
+        // therefore continued returning parts of the PREVIOUS bake after a
+        // regeneration. Depending on which chunks had already been visited,
+        // neighbouring camera positions could report heights/biomes from two
+        // different worlds. GeneratedAtUtc and SettingsHash are the bake
+        // identity; invalidate every probe cache as soon as either changes.
+        if (CachedData.Get() != Data
+            || CachedGeneratedAtUtc != Data->GeneratedAtUtc
+            || CachedSettingsHash != Data->SettingsHash)
+        {
+            ResetBakedCaches(Data);
+        }
+
+        // Intentional semantics: this probe describes the world-space XY
+        // directly beneath the editor camera, not the centre of the view or a
+        // cursor/crosshair raycast.
         const FVector Camera = ViewClient->GetViewLocation();
         const FVector2D XY(Camera.X, Camera.Y);
         FAvenorTerrainSample Terrain;
         const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
-        // SampleTerrain (above) reads the raw pre-carve analysis grid, used
-        // for landform classification (mountain/hill/desert character is a
-        // structural property, not something a river carving through it
-        // should change). The displayed elevation should instead be what is
-        // actually visible at this point, including river/lake carving, or
-        // it reads as wrong every time the camera is over a water feature.
         float FinalHeight = Terrain.Height;
         bool bWaterAffected = false;
         if (bTerrain)
@@ -305,6 +335,9 @@ private:
 
     FTSTicker::FDelegateHandle TickHandle;
     float Accumulator = 0.0f;
+    TWeakObjectPtr<const UAvenorTerrainData> CachedData;
+    FDateTime CachedGeneratedAtUtc;
+    FString CachedSettingsHash;
     FTexturePixels ClimatePixels;
     FTexturePixels BaseBiomePixels;
     FTexturePixels LocalBiomePixels;
