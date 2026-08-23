@@ -185,9 +185,11 @@ public:
 private:
     void ResetBakedCaches(const UAvenorTerrainData* Data)
     {
-        TerrainCache.Chunks.Reset();
-        TerrainCache.RiverBounds.Reset();
-        TerrainCache.LakeBounds.Reset();
+        // Do not retain or reset decompressed terrain chunks on this static
+        // live-coding object. FAvenorTerrainSampleChunk lives in the runtime
+        // module; destroying a TMap of those chunks from a replaced editor
+        // patch can cross module generations and crash during Live Coding.
+        // Terrain sampling instead uses a short-lived cache inside each tick.
         ClimatePixels.Reset();
         BaseBiomePixels.Reset();
         LocalBiomePixels.Reset();
@@ -237,14 +239,6 @@ private:
             return true;
         }
 
-        // The terrain asset is overwritten in-place by Generate and Bake
-        // Geography, so its UObject pointer normally does not change. The old
-        // probe kept decompressed chunks and source-texture pixels forever and
-        // therefore continued returning parts of the PREVIOUS bake after a
-        // regeneration. Depending on which chunks had already been visited,
-        // neighbouring camera positions could report heights/biomes from two
-        // different worlds. GeneratedAtUtc and SettingsHash are the bake
-        // identity; invalidate every probe cache as soon as either changes.
         if (CachedData.Get() != Data
             || CachedGeneratedAtUtc != Data->GeneratedAtUtc
             || CachedSettingsHash != Data->SettingsHash)
@@ -252,11 +246,15 @@ private:
             ResetBakedCaches(Data);
         }
 
-        // Intentional semantics: this probe describes the world-space XY
-        // directly beneath the editor camera, not the centre of the view or a
-        // cursor/crosshair raycast.
+        // Intentional semantics: report the world-space XY directly beneath
+        // the editor camera, not the centre of the view or a cursor raycast.
         const FVector Camera = ViewClient->GetViewLocation();
         const FVector2D XY(Camera.X, Camera.Y);
+
+        // Keep decompressed terrain data local to this tick. Apart from being
+        // live-coding safe, this guarantees a rebake can never leave the probe
+        // serving stale chunks from the previous geography.
+        FAvenorTerrainHeightChunkCache TerrainCache;
         FAvenorTerrainSample Terrain;
         const bool bTerrain = Data->SampleTerrain(XY, Terrain, TerrainCache);
         float FinalHeight = Terrain.Height;
@@ -341,7 +339,6 @@ private:
     FTexturePixels ClimatePixels;
     FTexturePixels BaseBiomePixels;
     FTexturePixels LocalBiomePixels;
-    FAvenorTerrainHeightChunkCache TerrainCache;
 };
 
 static FCameraProbe GCameraProbe;
