@@ -2535,6 +2535,13 @@ static void ExtractLakes(
             FMath::Max(CandidateBasin.MaximumDepth, MinimumBedDepth),
             MinimumBedDepth, FMath::Max(MinimumBedDepth, MaximumBedDepth)
         );
+        // The actual ground-carve depth for this specific basin, not floored
+        // up to MinimumBedDepth like MaximumDepth above. A shallow accepted
+        // basin should carve a shallow bed, not the same fixed depth as
+        // every other lake in the world.
+        Lake.ModifierBedDepth = FMath::Clamp(
+            CandidateBasin.MaximumDepth, 100.0, FMath::Max(100.0, MaximumBedDepth)
+        );
         Lake.BankBlendWidth = BankBlendWidth;
         Lake.DepthRampWidth = DepthRampWidth;
         Lake.Shoreline = TraceComponentBoundary(
@@ -5211,7 +5218,7 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
         Target.ShorelineHeight = Source.ShorelineHeight;
         Target.SurfaceHeight = Source.SurfaceHeight;
         Target.MaximumDepth = Source.MaximumDepth;
-        Target.ModifierBedDepth = WaterTerrain.LakeBedDepth;
+        Target.ModifierBedDepth = Source.ModifierBedDepth;
         Target.BankBlendWidth = Source.BankBlendWidth;
         Target.DepthRampWidth = Source.DepthRampWidth;
     }
@@ -5581,7 +5588,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ConfigureWaterSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
             Lake->GetWaterBodyComponent()->GetWaterSpline()->K2_SynchronizeAndBroadcastDataChange();
             ConfigureWaterTerrainSettings(
-                *Lake, true, Data->Lakes[Index].MaximumDepth,
+                *Lake, true, Data->Lakes[Index].ModifierBedDepth,
                 Data->Lakes[Index].BankBlendWidth, WaterTerrain
             );
             Lake->PostEditChange();
@@ -5600,17 +5607,38 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
                 Reach.Width, Reach.Depth
             );
-            // Feed the per-reach valley geomorphology (computed in
-            // ExtractRivers from resistance, slope and canyon detection) into
-            // the actual terrain carve, rather than one flat global
-            // width/depth reused for every reach regardless of character.
-            const double SteepnessFraction = FMath::Clamp(
-                (1.65 - Reach.CrossSectionExponent) / (1.65 - 0.55), 0.0, 1.0
+            // The broad valley shape belongs to erosion - already baked into
+            // the base terrain height field. This carve is only meant to
+            // hold the water channel with a modest, proportionate bank
+            // blend ("a nice graduated shore"), not re-cut the whole valley
+            // a second time at the water curve's blunter resolution, which
+            // produced a uniform, harsh-walled trench regardless of whether
+            // the reach was a headwater trickle or a main river - and
+            // CrossSectionExponent dips low on any steep mountain slope, not
+            // just true canyons, so gating steep walls on it made ordinary
+            // mountain streams carve like cliffs too. Canyon reaches get a
+            // real, but still bounded, deeper and steeper-walled cut instead
+            // of the full ValleyDepth/ValleyHalfWidth; everything else gets
+            // a gentle bank blend scaled to its own actual water width.
+            const double BankMargin = FMath::Clamp(
+                Reach.Width * 1.2, 400.0, Reach.ValleyHalfWidth
             );
-            const double EdgeOffsetScale = FMath::Lerp(1.3, 0.25, SteepnessFraction);
+            double CarveHalfWidth = Reach.Width * 0.5 + BankMargin;
+            double CarveDepth = Reach.Depth;
+            double EdgeOffsetScale = 1.3;
+            if (Reach.bIsCanyon)
+            {
+                CarveHalfWidth = FMath::Min(
+                    Reach.ValleyHalfWidth, Reach.Width * 0.5 + BankMargin * 2.0
+                );
+                CarveDepth = FMath::Max(
+                    Reach.Depth,
+                    FMath::Min(Reach.ValleyDepth, Reach.Depth * 4.0)
+                );
+                EdgeOffsetScale = 0.3;
+            }
             ConfigureWaterTerrainSettings(
-                *River, false, FMath::Max(Reach.Depth, Reach.ValleyDepth),
-                Reach.ValleyHalfWidth, WaterTerrain, EdgeOffsetScale
+                *River, false, CarveDepth, CarveHalfWidth, WaterTerrain, EdgeOffsetScale
             );
             AddNativeWaterModifier(
                 *River, *TargetMeshPartition, WaterPriorityLayer,
