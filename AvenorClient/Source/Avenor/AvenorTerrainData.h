@@ -135,19 +135,9 @@ struct AVENOR_API FAvenorBakedRiverReach
     UPROPERTY(VisibleAnywhere, Category = "River")
     TArray<FVector> Points;
 
-    /** Width at each spline point. Empty on older baked data; Width is the fallback. */
-    UPROPERTY(VisibleAnywhere, Category = "River")
-    TArray<float> PointWidths;
-
-    /** Water depth at each spline point. Empty on older baked data; Depth is the fallback. */
-    UPROPERTY(VisibleAnywhere, Category = "River")
-    TArray<float> PointDepths;
-
-    /** Downstream/fallback full channel width. */
     UPROPERTY(VisibleAnywhere, Category = "River")
     double Width = 500.0;
 
-    /** Downstream/fallback channel depth. */
     UPROPERTY(VisibleAnywhere, Category = "River")
     double Depth = 250.0;
 
