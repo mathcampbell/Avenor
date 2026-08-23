@@ -4569,18 +4569,33 @@ static void RefineClimateFromHydrology(
             0.08, 0.92
         );
         Data.Temperature[Cell] = Temperature;
-        // AlpineTundra/SnowIce are deliberately not classified here. This is
-        // the coarse, per-analysis-cell biome (feeds erosion/desert-mask
-        // consistency, not material painting), and AvenorBiomeBlendMap's
-        // local-override bake already derives those two from fine-grained
-        // per-pixel elevation against its own thresholds for exactly that
-        // purpose - having both meant the same "cold, high terrain" ground
-        // could read as plain ColdDry/ColdMoist here but Alpine/Snow there,
-        // with no way to tell which one the game actually uses. One place
-        // decides Alpine/Snow (the local override, since it's genuinely a
-        // fine-resolution material distinction); this one only ever
-        // produces the plain climate quadrant.
-        if (Temperature >= 0.50
+        // Correction: an earlier pass removed Alpine/Snow from here on the
+        // theory that AvenorBiomeBlendMap's local-override bake was the
+        // sole, correct place for that distinction. That bake has since
+        // been found to be the actual bug (see AvenorBiomeBlendMap.cpp) -
+        // it was independently re-deriving local climate from raw elevation
+        // and clobbering the correct values on every asset save.
+        // BuildClimateTextureTiles' WorldLocalBiomePixels bake (this file)
+        // reads Data.Biome directly and specifically checks for SnowIce/
+        // AlpineTundra to decide whether a cell carries a local override at
+        // all - removing them here silently broke that path instead of
+        // fixing anything. This is the one and only place Alpine/Snow are
+        // decided, using the same rain-shadow-aware, percentile-stretched
+        // Temperature as everything else in this function.
+        const double FinalMountain = FMath::Clamp(
+            Data.MountainMask[Cell], 0.0, 1.0
+        );
+        const double ElevationMetres = FMath::Max(0.0, Data.Height[Cell]) / 100.0;
+        const bool bHighTerrain = FinalMountain > 0.28 || ElevationMetres > 1400.0;
+        if (Temperature < 0.105 && bHighTerrain)
+        {
+            Biome = EAvenorBiomeClass::SnowIce;
+        }
+        else if (Temperature < 0.32 && bHighTerrain)
+        {
+            Biome = EAvenorBiomeClass::AlpineTundra;
+        }
+        else if (Temperature >= 0.50
             && Data.DesertMask.IsValidIndex(Cell) && Data.DesertMask[Cell] > 0.40
             && RegionalMoisture < 0.42
             && AvailableMoisture >= 0.48
