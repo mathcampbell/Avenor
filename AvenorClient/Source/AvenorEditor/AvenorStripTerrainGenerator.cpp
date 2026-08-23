@@ -513,6 +513,7 @@ struct FMountainRidgePrimitive
     TArray<FVector2D> Points;
     double CoreHalfWidth = 200000.0;
     double FoothillHalfWidth = 650000.0;
+    double PiedmontHalfWidth = 1100000.0;
     double Strength = 1.0;
     FBox2D Bounds = FBox2D(ForceInit);
 };
@@ -550,7 +551,7 @@ static void FinalizeMountainRidge(FMountainRidgePrimitive& Ridge)
     {
         Ridge.Bounds += Point;
     }
-    Ridge.Bounds = Ridge.Bounds.ExpandBy(Ridge.FoothillHalfWidth);
+    Ridge.Bounds = Ridge.Bounds.ExpandBy(Ridge.PiedmontHalfWidth);
 }
 
 static TArray<FVector2D> SmoothMountainRidge(
@@ -667,10 +668,13 @@ static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
             * Random.FRandRange(0.30f, 0.48f);
         const double FoothillHalfWidth = CoreHalfWidth + Scale
             * Random.FRandRange(0.35f, 0.55f);
+        const double PiedmontHalfWidth = FoothillHalfWidth + Scale
+            * Random.FRandRange(0.45f, 0.80f);
 
         FMountainRidgePrimitive& MainRidge = Range.Ridges.AddDefaulted_GetRef();
         MainRidge.CoreHalfWidth = CoreHalfWidth;
         MainRidge.FoothillHalfWidth = FoothillHalfWidth;
+        MainRidge.PiedmontHalfWidth = PiedmontHalfWidth;
         MainRidge.Strength = Random.FRandRange(0.78f, 1.0f);
         constexpr int32 MainPointCount = 9;
         const double BendAmplitude = Scale * Random.FRandRange(0.12f, 0.26f);
@@ -723,6 +727,7 @@ static TArray<FMountainRangePrimitive> GenerateMountainRangePlan(
             FMountainRidgePrimitive& Branch = Range.Ridges.AddDefaulted_GetRef();
             Branch.CoreHalfWidth = CoreHalfWidth * Random.FRandRange(0.55f, 0.72f);
             Branch.FoothillHalfWidth = FoothillHalfWidth * Random.FRandRange(0.62f, 0.80f);
+            Branch.PiedmontHalfWidth = PiedmontHalfWidth * Random.FRandRange(0.68f, 0.86f);
             Branch.Strength = MainRidge.Strength * Random.FRandRange(0.62f, 0.82f);
             Branch.Points = {
                 Attach,
@@ -741,11 +746,13 @@ static void EvaluateMountainRangePlan(
     const FVector2D& Position,
     const TArray<FMountainRangePrimitive>& Ranges,
     double& OutMountainEnvelope,
-    double& OutFoothillEnvelope
+    double& OutUplandEnvelope,
+    double& OutPiedmontEnvelope
 )
 {
     OutMountainEnvelope = 0.0;
-    OutFoothillEnvelope = 0.0;
+    OutUplandEnvelope = 0.0;
+    OutPiedmontEnvelope = 0.0;
     for (const FMountainRangePrimitive& Range : Ranges)
     {
         for (const FMountainRidgePrimitive& Ridge : Range.Ridges)
@@ -770,18 +777,27 @@ static void EvaluateMountainRangePlan(
             const double Outer = Smooth01(1.0 - FMath::Clamp(
                 Distance / FMath::Max(1.0, Ridge.FoothillHalfWidth), 0.0, 1.0
             ));
+            const double Piedmont = Smooth01(1.0 - FMath::Clamp(
+                Distance / FMath::Max(1.0, Ridge.PiedmontHalfWidth), 0.0, 1.0
+            ));
             const double Mountain = Core * Ridge.Strength;
-            const double Foothill = FMath::Max(
-                0.0, Outer - Core * 0.78
-            ) * Ridge.Strength;
-            OutMountainEnvelope = FMath::Max(
-                OutMountainEnvelope, Mountain
-            );
-            OutFoothillEnvelope = FMath::Max(
-                OutFoothillEnvelope, Foothill
-            );
+            const double Upland = Outer * Ridge.Strength;
+            const double PiedmontUplift = Piedmont * Ridge.Strength;
+
+            // Smooth union makes intersecting main/branch ridges one massif.
+            // Max-union left visible seams and, more importantly, treated the
+            // lower belts as a hollow ring instead of continuous uplift.
+            OutMountainEnvelope = 1.0
+                - (1.0 - OutMountainEnvelope) * (1.0 - Mountain);
+            OutUplandEnvelope = 1.0
+                - (1.0 - OutUplandEnvelope) * (1.0 - Upland);
+            OutPiedmontEnvelope = 1.0
+                - (1.0 - OutPiedmontEnvelope) * (1.0 - PiedmontUplift);
         }
     }
+    OutMountainEnvelope = FMath::Clamp(OutMountainEnvelope, 0.0, 1.0);
+    OutUplandEnvelope = FMath::Clamp(OutUplandEnvelope, 0.0, 1.0);
+    OutPiedmontEnvelope = FMath::Clamp(OutPiedmontEnvelope, 0.0, 1.0);
 }
 
 } // namespace UE::Avenor::Strip
@@ -887,7 +903,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 20;
+static constexpr int32 GeneratorAlgorithmVersion = 21;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3975,10 +3991,11 @@ static double EvaluateLandform(
     ));
 
     double RangeMountainEnvelope = 0.0;
-    double RangeFoothillEnvelope = 0.0;
+    double RangeUplandEnvelope = 0.0;
+    double RangePiedmontEnvelope = 0.0;
     EvaluateMountainRangePlan(
         Position, MountainRanges,
-        RangeMountainEnvelope, RangeFoothillEnvelope
+        RangeMountainEnvelope, RangeUplandEnvelope, RangePiedmontEnvelope
     );
 
     const double CrestRidges = RidgedFbm(
@@ -3991,18 +4008,13 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(211.0, 883.0),
         4, 0.54, 2.07
     );
-    const double CrestShape = FMath::Clamp(
-        0.82
-            + CrestRidges * 0.20
-            + CrestVariation * 0.18,
-        0.82, 1.20
-    );
-    // Range primitives decide where mountains exist. Noise only varies their
-    // internal crest character, while uplift modulates their strength.
+    // The ridge plan supplies geological uplift, not a finished mountain
+    // silhouette. Fine structure varies the uplift without punching isolated
+    // cones out of an otherwise flat surface.
     OutMountainMask = FMath::Clamp(
         RangeMountainEnvelope
-            * FMath::Lerp(0.42, 1.0, CrestRidges)
-            * FMath::Lerp(0.78, 1.08, CrestVariation)
+            * FMath::Lerp(0.68, 1.0, CrestRidges)
+            * FMath::Lerp(0.88, 1.06, CrestVariation)
             * FMath::Lerp(0.78, 1.0, PositiveUplift),
         0.0,
         1.0
@@ -4023,8 +4035,13 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(163.0, 1429.0),
         4, 0.52, 2.1
     );
-    const double FoothillEnvelope = FMath::Clamp(
-        RangeFoothillEnvelope * (1.0 - OutMountainMask * 0.35),
+    const double UplandShoulder = FMath::Clamp(
+        RangeUplandEnvelope * (1.0 - RangeMountainEnvelope * 0.42),
+        0.0,
+        1.0
+    );
+    const double PiedmontShoulder = FMath::Clamp(
+        RangePiedmontEnvelope * (1.0 - RangeUplandEnvelope * 0.58),
         0.0,
         1.0
     );
@@ -4033,9 +4050,12 @@ static double EvaluateLandform(
             + 0.40 * (0.5 + 0.5 * Rolling)
             + 0.20 * Province2 - 0.38) / 0.44,
         0.0, 1.0
-    )) * (1.0 - RangeMountainEnvelope * 0.72);
+    )) * (1.0 - RangePiedmontEnvelope * 0.38);
     OutHillMask = FMath::Clamp(
-        FMath::Max(FoothillEnvelope * 0.82, IndependentHills)
+        FMath::Max(
+            FMath::Max(UplandShoulder * 0.92, PiedmontShoulder * 0.72),
+            IndependentHills
+        )
             * (1.0 - OutMountainMask * 0.62),
         0.0, 1.0
     );
@@ -4096,26 +4116,38 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    // The distance-field envelope supplies range-scale relief; CrestShape
-    // supplies coherent variation within it. Keeping those responsibilities
-    // separate prevents both a uniform summit ceiling and high-frequency
-    // noise from deciding where mountains exist.
-    const double MountainHeight = OutMountainMask;
-    // Strong coherent uplift accelerates non-linearly so true mountain belts
-    // can reach kilometre-scale relief without lifting quiet plains with them.
-    const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
-    Height += MountainRelief * Relief
-        * FMath::Lerp(0.58, 0.92, Activity)
-        * FMath::Lerp(0.76, 1.18, MountainRelief)
-        * CrestShape;
+    // Build one continuous uplifted catchment from crest through upland and
+    // piedmont. Erosion can now cut branching valleys all the way down the
+    // range instead of receiving a steep mountain object on a flat plane.
+    Height += Relief * (
+        RangePiedmontEnvelope * 0.045
+        + RangeUplandEnvelope * 0.125
+        + RangeMountainEnvelope * 0.175
+    );
 
-    Height += FoothillEnvelope * Relief * 0.18
-        * (0.72 + UplandRidges * 0.28);
+    const double MountainRelief = FMath::Pow(OutMountainMask, 1.12);
+    Height += MountainRelief * Relief
+        * FMath::Lerp(0.30, 0.50, Activity)
+        * FMath::Lerp(0.62, 1.0, CrestRidges)
+        * FMath::Lerp(0.90, 1.08, CrestVariation);
+
+    // Coherent signed undulation seeds interlocking spurs and catchments in
+    // the uplifted belts. Stream-power erosion then selects and deepens the
+    // drainage valleys; this is terrain structure, not decorative bump noise.
+    Height += RangeUplandEnvelope * Relief * (
+        Rolling * 0.050
+        + (UplandRidges - 0.48) * 0.045
+        + HillDetail * 0.012
+    );
+    Height += RangePiedmontEnvelope * Relief * (
+        Rolling * 0.040
+        + (UplandRidges - 0.50) * 0.025
+    );
     Height += IndependentHills * Relief * (
-        0.050
-        + (0.5 + 0.5 * Rolling) * 0.052
-        + UplandRidges * 0.040
-        + HillDetail * 0.016
+        0.065
+        + (0.5 + 0.5 * Rolling) * 0.070
+        + UplandRidges * 0.045
+        + HillDetail * 0.020
     );
 
     Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
@@ -4162,7 +4194,7 @@ static double EvaluateLandform(
         4, 0.58, 2.0
     );
     const double ResistantCap = OutDesertMask
-        * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
+        * FMath::Clamp(OutHillMask + UplandShoulder * 0.45, 0.0, 1.0)
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
     const double DuneSuitability = OutDesertMask * OutPlainsMask
