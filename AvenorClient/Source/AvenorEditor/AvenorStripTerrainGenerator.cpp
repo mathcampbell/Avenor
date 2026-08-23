@@ -5748,6 +5748,32 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
 #endif
 }
 
+// Shared by CreateWaterActors' terrain carve and GenerateRefinementSplines'
+// mesh-remesh radius. These two used to compute this independently and had
+// drifted apart: the carve's actual falloff for an ordinary (non-canyon)
+// river extends to Width*0.5 + BankMargin (BankMargin scales up to
+// Width*1.2, so this is often much wider than just the water's own width),
+// but the refinement spline only remeshed out to Width*0.5 plus a small
+// fixed margin. The outer part of the carve's falloff ramp then fell
+// outside the finely-tessellated area and was rendered by the coarse base
+// terrain mesh instead - producing a faceted, terraced-looking bank on any
+// river wide enough for the two radii to diverge (typically the more
+// prominent main-stem rivers), which reads as an unnaturally harsh, canyon-
+// like cut even where the underlying height data is a gentle slope.
+static double ComputeRiverCarveHalfWidth(const FRiverReach& Reach)
+{
+    const double BankMargin = FMath::Clamp(
+        Reach.Width * 1.2, 400.0, Reach.ValleyHalfWidth
+    );
+    if (Reach.bIsCanyon)
+    {
+        return FMath::Min(
+            Reach.ValleyHalfWidth, Reach.Width * 0.5 + BankMargin * 2.0
+        );
+    }
+    return Reach.Width * 0.5 + BankMargin;
+}
+
 void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data)
 {
 #if WITH_EDITOR
@@ -5847,17 +5873,11 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             // real, but still bounded, deeper and steeper-walled cut instead
             // of the full ValleyDepth/ValleyHalfWidth; everything else gets
             // a gentle bank blend scaled to its own actual water width.
-            const double BankMargin = FMath::Clamp(
-                Reach.Width * 1.2, 400.0, Reach.ValleyHalfWidth
-            );
-            double CarveHalfWidth = Reach.Width * 0.5 + BankMargin;
+            const double CarveHalfWidth = ComputeRiverCarveHalfWidth(Reach);
             double CarveDepth = Reach.Depth;
             double EdgeOffsetScale = 1.3;
             if (Reach.bIsCanyon)
             {
-                CarveHalfWidth = FMath::Min(
-                    Reach.ValleyHalfWidth, Reach.Width * 0.5 + BankMargin * 2.0
-                );
                 CarveDepth = FMath::Max(
                     Reach.Depth,
                     FMath::Min(Reach.ValleyDepth, Reach.Depth * 4.0)
@@ -6156,12 +6176,17 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
                 RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
                 FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
             );
+        // Must cover the same extent as the actual terrain carve
+        // (ComputeRiverCarveHalfWidth), or the outer part of the carve's
+        // falloff ramp falls outside the finely-tessellated area and gets
+        // rendered by the coarse base terrain mesh instead - a faceted,
+        // terraced bank on any river wide enough for the two to diverge.
         const double CoverageRadius = River.bIsCanyon
             ? FMath::Min(
-                River.ValleyHalfWidth + RefinementCoverageMargin,
+                ComputeRiverCarveHalfWidth(River) + RefinementCoverageMargin,
                 RefinementMaximumCanyonRadius
             )
-            : River.Width * 0.5 + RefinementCoverageMargin;
+            : ComputeRiverCarveHalfWidth(River) + RefinementCoverageMargin;
         if (SpawnRefinementSpline(
             *World,
             FString::Printf(TEXT("Avenor_Strip_Refine_River_%03d"), Index + 1),
