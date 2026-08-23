@@ -3212,6 +3212,22 @@ static void ExtractRivers(
 
     TSet<int64> UsedEdges;
     TArray<FRiverCandidate> Candidates;
+    // Stopping at every confluence/breakpoint is correct for graph topology,
+    // but two breakpoints can sit right next to each other (a confluence
+    // immediately followed by another confluence, or by a lake-adjacent
+    // cell), producing a degenerate connector reach only a cell or two long.
+    // Later smoothing/resampling/simplification can collapse a reach that
+    // short to nothing, leaving a visible gap in the river even though the
+    // underlying drainage network is fully connected end to end. Only honour
+    // a breakpoint once a reach has covered a minimum real distance since
+    // its own start; a too-short connector instead continues through and is
+    // absorbed into a longer, reliably renderable reach. UsedEdges still
+    // prevents the passed-through breakpoint's own Start entry from
+    // re-rendering the same ground: it is left with zero new edges and
+    // dropped by the Cells.Num() >= 2 check below.
+    const double MinimumReachLength = FMath::Max(
+        Data.CellSize * 2.0, FeaturePointSpacing * 1.5
+    );
     for (int32 Start : Starts)
     {
         FRiverCandidate CandidateReach;
@@ -3224,6 +3240,7 @@ static void ExtractRivers(
             );
         }
         int32 Cell = Start;
+        double AccumulatedLength = 0.0;
         for (int32 Guard = 0; Guard < Data.Height.Num(); ++Guard)
         {
             CandidateReach.Cells.Add(Cell);
@@ -3243,12 +3260,15 @@ static void ExtractRivers(
                 break;
             }
             UsedEdges.Add(EdgeKey);
+            AccumulatedLength += FVector2D::Distance(
+                Data.CellPosition(Cell), Data.CellPosition(Receiver)
+            );
             Cell = Receiver;
             if (Data.LakeIndex.IsValidIndex(Cell) && Data.LakeIndex[Cell] != INDEX_NONE)
             {
                 break;
             }
-            if (UpstreamCount[Cell] != 1)
+            if (UpstreamCount[Cell] != 1 && AccumulatedLength >= MinimumReachLength)
             {
                 CandidateReach.Cells.Add(Cell);
                 break;
