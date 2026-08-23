@@ -3994,12 +3994,23 @@ static void ApplyTerrainClimate(
         const double MountainExposure = FMath::Clamp(
             Data.MountainMask[Cell], 0.0, 1.0
         );
-        // Roughly lapse-rate-like cooling: modest on foothills, substantial on
-        // kilometre-scale massifs. Final biome classification below determines
-        // the snowline from the resulting temperature rather than a fixed Z.
+        const double HillExposure = FMath::Clamp(
+            Data.HillMask.IsValidIndex(Cell) ? Data.HillMask[Cell] : 0.0,
+            0.0, 1.0
+        );
+        // Lapse-rate cooling from absolute elevation, plus an elevation-
+        // independent cooling for exposed mountain/hill terrain (wind
+        // exposure, bare rock, thin soil). The latter used to be multiplied
+        // by ElevationFraction, which made it nearly inert anywhere below
+        // ~1500m regardless of how mountainous the terrain actually was - a
+        // steep, rocky mountain shoulder or saddle at a few hundred metres
+        // read as "warm" purely because it wasn't the literal summit. Final
+        // biome classification below determines the snowline from the
+        // resulting temperature rather than a fixed Z.
         Data.Temperature[Cell] = FMath::Clamp(
             RegionalTemperature - ElevationFraction * 0.46
-                - MountainExposure * ElevationFraction * 0.05,
+                - MountainExposure * 0.16
+                - HillExposure * 0.06,
             0.0, 1.0
         );
 
