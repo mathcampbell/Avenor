@@ -4385,9 +4385,33 @@ static void RefineClimateFromHydrology(
     const double InfluenceDistance = FMath::Max(
         Data.CellSize, Generator.ClimateWaterInfluenceDistance
     );
+
+    // Temperature and moisture up to this point are built from anchors
+    // centred on the user's ClimateTemperature/ClimateMoisture sliders
+    // (0.5/0.5 by default) and then only ever pushed downward from there -
+    // elevation lapse rate, mountain/hill exposure and slope drying all
+    // subtract, nothing adds outside a narrow water-proximity boost. With
+    // defaults that sit exactly on a classification boundary and terrain
+    // that is mostly hills/mountains, that one-directional bias collapses
+    // almost the entire map into a single quadrant (observed: "Temperate
+    // Dry" everywhere on a 30km world) even though the macro anchors and
+    // per-cell noise really do vary across the map - the raw values just
+    // never spread far enough from the boundary to cross it. Stretch both
+    // fields by their own actual distribution across this generated world
+    // (a percentile remap, not a fixed formula) so whatever real spread
+    // exists - however small in absolute terms - is expanded to use the
+    // full classification range. This preserves the spatial gradient (a
+    // monotonic remap cannot reorder cells, so cold stays colder than warm,
+    // wet stays wetter than dry) while guaranteeing the biome palette
+    // actually varies instead of saturating to one bucket.
+    TArray<double> RawAvailableMoisture;
+    RawAvailableMoisture.SetNumUninitialized(CellCount);
+    TArray<double> WaterProximityByCell;
+    WaterProximityByCell.SetNumUninitialized(CellCount);
+    TArray<double> FlowMoistureByCell;
+    FlowMoistureByCell.SetNumUninitialized(CellCount);
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
-        const double RegionalMoisture = Data.Moisture[Cell];
         const double WaterProximity = Smooth01(
             1.0 - WaterDistance[Cell] / InfluenceDistance
         );
@@ -4399,17 +4423,64 @@ static void RefineClimateFromHydrology(
         const double SlopeDrying = FMath::Clamp(
             Data.Slope[Cell] / 0.32, 0.0, 1.0
         ) * 0.24;
-        const double AvailableMoisture = FMath::Clamp(
+        WaterProximityByCell[Cell] = WaterProximity;
+        FlowMoistureByCell[Cell] = FlowMoisture;
+        RawAvailableMoisture[Cell] = FMath::Clamp(
             Data.Moisture[Cell]
                 + WaterProximity * Generator.ClimateWaterMoistureBoost
                 + FlowMoisture * 0.10
                 - SlopeDrying,
             0.0, 1.0
         );
+    }
+
+    auto PercentileValue = [](TArray<double> Values, double Percentile) -> double
+    {
+        if (Values.Num() == 0)
+        {
+            return 0.5;
+        }
+        Values.Sort();
+        const int32 Index = FMath::Clamp(
+            FMath::RoundToInt(Percentile * static_cast<double>(Values.Num() - 1)),
+            0, Values.Num() - 1
+        );
+        return Values[Index];
+    };
+    const double MoistureLowPercentile = PercentileValue(RawAvailableMoisture, 0.10);
+    const double MoistureHighPercentile = PercentileValue(RawAvailableMoisture, 0.90);
+    const double TemperatureLowPercentile = PercentileValue(Data.Temperature, 0.10);
+    const double TemperatureHighPercentile = PercentileValue(Data.Temperature, 0.90);
+
+    auto StretchToRange = [](double Value, double Lo, double Hi, double TargetLo, double TargetHi) -> double
+    {
+        if (Hi - Lo < 1e-4)
+        {
+            return FMath::Clamp((TargetLo + TargetHi) * 0.5, 0.0, 1.0);
+        }
+        const double Alpha = (Value - Lo) / (Hi - Lo);
+        return FMath::Clamp(FMath::Lerp(TargetLo, TargetHi, Alpha), 0.0, 1.0);
+    };
+
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const double RegionalMoisture = Data.Moisture[Cell];
+        const double WaterProximity = WaterProximityByCell[Cell];
+        const double FlowMoisture = FlowMoistureByCell[Cell];
+        const double AvailableMoisture = StretchToRange(
+            RawAvailableMoisture[Cell],
+            MoistureLowPercentile, MoistureHighPercentile,
+            0.08, 0.92
+        );
         Data.Moisture[Cell] = AvailableMoisture;
 
         EAvenorBiomeClass Biome = EAvenorBiomeClass::TemperateMoist;
-        const double Temperature = Data.Temperature[Cell];
+        const double Temperature = StretchToRange(
+            Data.Temperature[Cell],
+            TemperatureLowPercentile, TemperatureHighPercentile,
+            0.08, 0.92
+        );
+        Data.Temperature[Cell] = Temperature;
         const double FinalMountain = FMath::Clamp(
             Data.MountainMask[Cell], 0.0, 1.0
         );
