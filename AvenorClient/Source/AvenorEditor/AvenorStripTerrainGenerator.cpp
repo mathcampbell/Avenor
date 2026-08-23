@@ -550,6 +550,13 @@ struct FAvenorStripData
     TArray<int32> ReceiverA;
     TArray<int32> ReceiverB;
     TArray<double> ReceiverWeightA;
+    // Single steepest-descent receiver/accumulation, transient and rebuilt
+    // each BuildContinuousFlow call. Not part of the baked chunk format -
+    // used only during generation to give river/lake network extraction a
+    // single, stable channel topology instead of reducing the MFD split
+    // above per-cell.
+    TArray<int32> ReceiverD8;
+    TArray<double> AccumulationD8;
     TArray<int32> FillParent;
     TArray<int32> LakeIndex;
     TArray<UE::Avenor::Strip::FRiverReach> Rivers;
@@ -1595,6 +1602,7 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
     Data.ReceiverA.Init(INDEX_NONE, CellCount);
     Data.ReceiverB.Init(INDEX_NONE, CellCount);
     Data.ReceiverWeightA.Init(1.0, CellCount);
+    Data.ReceiverD8.Init(INDEX_NONE, CellCount);
     Data.Slope.Init(0.0, CellCount);
     Data.Accumulation.SetNumUninitialized(CellCount);
     const bool bHasRunoff = Data.Runoff.Num() == CellCount;
@@ -1605,6 +1613,9 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
             : 1.0;
         Data.Accumulation[Cell] = Data.CellAreaSquareKilometres() * Runoff;
     }
+    // AccumulationD8 starts from the same per-cell contribution as the MFD
+    // Accumulation above and only diverges in how it is routed downstream.
+    Data.AccumulationD8 = Data.Accumulation;
 
     for (int32 Y = 0; Y < Data.Rows; ++Y)
     {
@@ -1654,6 +1665,13 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
             Data.ReceiverA[Cell] = A;
             Data.ReceiverB[Cell] = B;
             Data.ReceiverWeightA[Cell] = B == INDEX_NONE ? 1.0 : 1.0 - UpperWeight;
+            // Single steepest-descent receiver, independent of the MFD split
+            // above. Network topology (channel extraction, confluences, lake
+            // termini) reduces the MFD field back to one direction per cell
+            // anyway; deriving that reduction independently as true D8 avoids
+            // per-cell weight tie-breaks producing braided/unstable channels
+            // and diluted accumulation at basin outlets.
+            Data.ReceiverD8[Cell] = SteepestReceiver(Data, X, Y);
         }
     }
 
@@ -1676,6 +1694,11 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
         if (B != INDEX_NONE)
         {
             Data.Accumulation[B] += Data.Accumulation[Cell] * (1.0 - WeightA);
+        }
+        const int32 D8Receiver = Data.ReceiverD8[Cell];
+        if (D8Receiver != INDEX_NONE)
+        {
+            Data.AccumulationD8[D8Receiver] += Data.AccumulationD8[Cell];
         }
     }
 }
@@ -1914,19 +1937,22 @@ static void EvolveTerrainFromDrainage(
     BuildContinuousFlow(Data);
 }
 
+// The authoritative single-direction receiver for river/lake network
+// topology. This used to reduce the MFD split (ReceiverA/B) back to one
+// direction per cell via a >=0.5 weight tie-break, but that reduction is
+// independent at every cell along a flow path - wherever the MFD split sits
+// near 50/50 (common in wide valley floors and, worst of all, right at
+// basin spillways/saddles) it produces braided parallel "channels" and
+// unstable outlet routing. ReceiverD8 is a true single steepest-descent
+// tree computed directly from FilledHeight, so it stays a coherent,
+// non-braided tree end to end.
 static int32 PrimaryReceiver(const FAvenorStripData& Data, int32 Cell)
 {
-    if (Cell == INDEX_NONE)
+    if (Cell == INDEX_NONE || !Data.ReceiverD8.IsValidIndex(Cell))
     {
         return INDEX_NONE;
     }
-    const int32 A = Data.ReceiverA[Cell];
-    const int32 B = Data.ReceiverB[Cell];
-    if (B == INDEX_NONE || Data.ReceiverWeightA[Cell] >= 0.5)
-    {
-        return A;
-    }
-    return B;
+    return Data.ReceiverD8[Cell];
 }
 
 static double DrainageScaleAlpha(double Area, double MainRiverArea)
@@ -2109,7 +2135,11 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
         const double StartArea = FMath::Lerp(
             LowlandStartArea, MountainStartArea, MountainFraction
         ) * DrainageSourceMultiplier(Data, Cell);
-        if (Data.Accumulation[Cell] >= StartArea
+        // Use the D8 accumulation here, matching the D8-based PrimaryReceiver
+        // topology this function builds Channel from - the MFD Accumulation
+        // used for erosion incision doesn't necessarily agree cell-for-cell
+        // with which single path PrimaryReceiver says the water takes.
+        if (Data.AccumulationD8[Cell] >= StartArea
             && PrimaryReceiver(Data, Cell) != INDEX_NONE)
         {
             SeedCells[Cell] = true;
@@ -2353,7 +2383,11 @@ static void ExtractLakes(
                 Data.FilledHeight[Cell]
             );
             Basin.MaximumDepth = FMath::Max(Basin.MaximumDepth, Data.FilledHeight[Cell] - Data.Height[Cell]);
-            Basin.CatchmentArea = FMath::Max(Basin.CatchmentArea, Data.Accumulation[Cell]);
+            // D8, not MFD: catchment sizing feeds mandatory/optional lake
+            // acceptance, which is decided from the same D8 channel network
+            // (see FindRiverFedBasinSeeds/PrimaryReceiver) that determines
+            // whether this basin is a real river terminus in the first place.
+            Basin.CatchmentArea = FMath::Max(Basin.CatchmentArea, Data.AccumulationD8[Cell]);
             const FVector2D CellPos = Data.CellPosition(Cell);
             Basin.MinX = FMath::Min(Basin.MinX, CellPos.X);
             Basin.MaxX = FMath::Max(Basin.MaxX, CellPos.X);
@@ -3107,7 +3141,7 @@ static void ExtractRivers(
         {
             const int32 EndCell = CandidateReach.Cells.Last();
             CandidateReach.Score = CandidateReach.Cells.Num() * Data.CellSize *
-                FMath::Sqrt(FMath::Max(0.01, Data.Accumulation[EndCell])) *
+                FMath::Sqrt(FMath::Max(0.01, Data.AccumulationD8[EndCell])) *
                 (1.0 + 0.35 * FMath::Clamp(Data.Slope[Start] / 0.12, 0.0, 1.0));
             Candidates.Add(MoveTemp(CandidateReach));
         }
@@ -3144,7 +3178,7 @@ static void ExtractRivers(
         MeanMountain /= CandidateReach.Cells.Num();
 
         const int32 EndCell = CandidateReach.Cells.Last();
-        const double Area = Data.Accumulation[EndCell];
+        const double Area = Data.AccumulationD8[EndCell];
         const double RiverAlpha = DrainageScaleAlpha(Area, MainRiverArea);
         // Hydrological receiver cells are the authoritative route. On steeper
         // reaches, smoothing is suppressed so the visual spline cannot cut
@@ -3701,15 +3735,20 @@ static double EvaluateLandform(
         + (PlainRidges - 0.46) * 0.016
     );
 
-    const double Warmth = bClimateEnabled
+    // Desert/mesa/canyon character belongs to genuinely hot-dry climate, not
+    // merely warm-dry (that reads as savannah/scrubland instead). Ramp this
+    // sharply through the warm->hot boundary rather than starting just above
+    // the cold/temperate line, so warm-dry areas stay savannah-like and only
+    // deep-hot-dry areas get full desert/resistant-cap/canyon treatment.
+    const double HotFraction = bClimateEnabled
         ? Smooth01(FMath::Clamp(
-            (ClimateTemperature - 0.28) / 0.58, 0.0, 1.0
+            (ClimateTemperature - 0.58) / 0.30, 0.0, 1.0
         )) : 0.0;
     const double Dryness = bClimateEnabled
         ? Smooth01(FMath::Clamp(
             (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
         )) : 0.0;
-    const double Aridity = Warmth * Dryness;
+    const double Aridity = HotFraction * Dryness;
     OutDesertMask = Aridity * FMath::Clamp(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
     );
@@ -3919,6 +3958,27 @@ static void ApplyTerrainClimate(
     {
         return;
     }
+
+    // Rain shadow: march a short ray upwind of each cell and find the
+    // highest terrain crossed. A high barrier upwind means the prevailing
+    // wind already dropped its moisture climbing that ridge, so this cell is
+    // in its lee and drier than the regional baseline; a cell that is itself
+    // rising above its immediate upwind neighbour is on the windward face
+    // catching that lift, so it is wetter. This is a strip world with no
+    // ocean/trade-wind simulation, so this is deliberately a simple
+    // terrain-silhouette approximation, not an atmospheric model.
+    const bool bRainShadow = Generator.RainShadowStrength > 0.0;
+    const double WindAngleRadians = FMath::DegreesToRadians(
+        Generator.PrevailingWindDirectionDegrees
+    );
+    const FVector2D UpwindDirection(
+        -FMath::Cos(WindAngleRadians), -FMath::Sin(WindAngleRadians)
+    );
+    const double RainShadowSearchDistance = FMath::Clamp(
+        Generator.StructuralScale * 2.2, 400000.0, 6000000.0
+    );
+    constexpr int32 RainShadowSamples = 7;
+
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
         // Always derive local climate from the regional baseline so this pass
@@ -3942,10 +4002,47 @@ static void ApplyTerrainClimate(
                 - MountainExposure * ElevationFraction * 0.05,
             0.0, 1.0
         );
+
+        double RainShadowMoisture = 0.0;
+        if (bRainShadow)
+        {
+            const FVector2D Position = Data.CellPosition(Cell);
+            double MaxUpwindHeight = Data.Height[Cell];
+            double NearUpwindHeight = Data.Height[Cell];
+            for (int32 Step = 1; Step <= RainShadowSamples; ++Step)
+            {
+                const double Distance = RainShadowSearchDistance
+                    * (static_cast<double>(Step) / RainShadowSamples);
+                const double SampledHeight = Data.SampleGrid(
+                    Data.Height, Position + UpwindDirection * Distance
+                );
+                MaxUpwindHeight = FMath::Max(MaxUpwindHeight, SampledHeight);
+                if (Step == 1)
+                {
+                    NearUpwindHeight = SampledHeight;
+                }
+            }
+            const double BarrierRiseMetres = FMath::Max(
+                0.0, MaxUpwindHeight - Data.Height[Cell]
+            ) / 100.0;
+            const double LeeFactor = Smooth01(FMath::Clamp(
+                BarrierRiseMetres / 1200.0, 0.0, 1.0
+            ));
+            const double WindwardRiseMetres = FMath::Max(
+                0.0, Data.Height[Cell] - NearUpwindHeight
+            ) / 100.0;
+            const double WindwardFactor = Smooth01(FMath::Clamp(
+                WindwardRiseMetres / 400.0, 0.0, 1.0
+            ));
+            RainShadowMoisture = (WindwardFactor * 0.28 - LeeFactor * 0.55)
+                * Generator.RainShadowStrength;
+        }
+
         Data.Moisture[Cell] = FMath::Clamp(
             RegionalMoisture
                 - ElevationFraction * 0.11
-                - MountainExposure * 0.035,
+                - MountainExposure * 0.035
+                + RainShadowMoisture,
             0.0, 1.0
         );
         Data.Runoff[Cell] = FMath::Clamp(
@@ -4516,17 +4613,22 @@ static void ConfigureWaterTerrainSettings(
     bool bLake,
     double ChannelDepth,
     double BankOrShoreWidth,
-    const FAvenorWaterTerrainSettings& Settings
+    const FAvenorWaterTerrainSettings& Settings,
+    double EdgeOffsetScale = 1.0
 )
 {
+    // EdgeOffsetScale narrows the flat dry-bank shelf before the falloff ramp
+    // for steep-sided reaches (canyons), so the water meets the carved walls
+    // almost directly instead of sitting behind a floodplain-width shelf.
+    const double DryBankWidth = FMath::Max(0.0, Settings.DryBankWidth)
+        * FMath::Clamp(EdgeOffsetScale, 0.2, 1.5);
+
     FWaterCurveSettings& Curve = const_cast<FWaterCurveSettings&>(
         Water.GetWaterCurveSettings()
     );
     Curve.bUseCurveChannel = true;
     Curve.ChannelDepth = static_cast<float>(FMath::Max(100.0, ChannelDepth));
-    Curve.ChannelEdgeOffset = static_cast<float>(
-        FMath::Max(0.0, Settings.DryBankWidth)
-    );
+    Curve.ChannelEdgeOffset = static_cast<float>(DryBankWidth);
     Curve.CurveRampWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
 
     FWaterBodyHeightmapSettings& Heightmap = const_cast<FWaterBodyHeightmapSettings&>(
@@ -4535,9 +4637,7 @@ static void ConfigureWaterTerrainSettings(
     Heightmap.BlendMode = EWaterBrushBlendType::AlphaBlend;
     Heightmap.FalloffSettings.FalloffMode = EWaterBrushFalloffMode::Width;
     Heightmap.FalloffSettings.FalloffWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
-    Heightmap.FalloffSettings.EdgeOffset = static_cast<float>(
-        FMath::Max(0.0, Settings.DryBankWidth)
-    );
+    Heightmap.FalloffSettings.EdgeOffset = static_cast<float>(DryBankWidth);
     Heightmap.FalloffSettings.ZOffset = 0.0f;
     Heightmap.Effects.Blurring.bBlurShape = Settings.BlurRadius > 0;
     Heightmap.Effects.Blurring.Radius = FMath::Clamp(Settings.BlurRadius, 0, 16);
@@ -4769,6 +4869,10 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
         Climate.WaterMoistureBoost, 0.0, 1.0
     );
     bShowcaseClimateCompression = Climate.bShowcaseClimateCompression;
+    PrevailingWindDirectionDegrees = FMath::Fmod(
+        FMath::Max(0.0, Climate.PrevailingWindDirectionDegrees), 360.0
+    );
+    RainShadowStrength = FMath::Clamp(Climate.RainShadowStrength, 0.0, 1.0);
 
     ErosionResistanceStrength = (bGenerateClimate || bGenerateMesasAndCanyons)
         ? 0.55 : 0.0;
@@ -5440,8 +5544,8 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ConfigureWaterSpline(*Lake->GetWaterBodyComponent()->GetWaterSpline(), LakePoints, true);
             Lake->GetWaterBodyComponent()->GetWaterSpline()->K2_SynchronizeAndBroadcastDataChange();
             ConfigureWaterTerrainSettings(
-                *Lake, true, WaterTerrain.LakeBedDepth,
-                WaterTerrain.LakeShoreWidth, WaterTerrain
+                *Lake, true, Data->Lakes[Index].MaximumDepth,
+                Data->Lakes[Index].BankBlendWidth, WaterTerrain
             );
             Lake->PostEditChange();
         }
@@ -5459,9 +5563,17 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
                 Reach.Width, Reach.Depth
             );
+            // Feed the per-reach valley geomorphology (computed in
+            // ExtractRivers from resistance, slope and canyon detection) into
+            // the actual terrain carve, rather than one flat global
+            // width/depth reused for every reach regardless of character.
+            const double SteepnessFraction = FMath::Clamp(
+                (1.65 - Reach.CrossSectionExponent) / (1.65 - 0.55), 0.0, 1.0
+            );
+            const double EdgeOffsetScale = FMath::Lerp(1.3, 0.25, SteepnessFraction);
             ConfigureWaterTerrainSettings(
-                *River, false, Reach.Depth,
-                WaterTerrain.RiverBankWidth, WaterTerrain
+                *River, false, FMath::Max(Reach.Depth, Reach.ValleyDepth),
+                Reach.ValleyHalfWidth, WaterTerrain, EdgeOffsetScale
             );
             AddNativeWaterModifier(
                 *River, *TargetMeshPartition, WaterPriorityLayer,
