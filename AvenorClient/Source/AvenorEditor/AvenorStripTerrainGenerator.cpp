@@ -4247,6 +4247,7 @@ static void RefineClimateFromHydrology(
             Biome = EAvenorBiomeClass::AlpineTundra;
         }
         else if (Temperature >= 0.50
+            && Data.DesertMask.IsValidIndex(Cell) && Data.DesertMask[Cell] > 0.40
             && RegionalMoisture < 0.42
             && AvailableMoisture >= 0.48
             && WaterProximity > 0.30)
@@ -4872,7 +4873,16 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     ClimateRegionalVariation = FMath::Clamp(
         Climate.RegionalVariation, 0.0, 1.0
     );
-    ClimateRegionSpacing = FMath::Max(100000.0, Climate.RegionSpacing);
+    // 0 means "auto": derive region spacing from the world's long-axis
+    // length so a short test world still gets several climate anchors
+    // instead of only 1-2, which barely lets temperature/moisture drift
+    // from the midpoint before the world ends.
+    const double LongAxisExtent = FMath::Max(
+        100000.0, LongAxis == EAvenorStripLongAxis::X ? WorldSize.X : WorldSize.Y
+    );
+    ClimateRegionSpacing = Climate.RegionSpacing > 0.0
+        ? FMath::Max(100000.0, Climate.RegionSpacing)
+        : FMath::Clamp(LongAxisExtent / 6.0, 300000.0, 3000000.0);
     ClimateWaterInfluenceDistance = FMath::Max(
         10000.0, Climate.WaterInfluenceDistance
     );

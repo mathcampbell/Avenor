@@ -58,8 +58,8 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Controls how strongly successive broad climate regions differ. The default is deliberately high enough for a long Avenor strip to contain clearly different wet, dry, cold and warm regions without abrupt biome bands."))
     double RegionalVariation = 0.72;
 
-    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "500000.0", ClampMax = "3000000.0", ToolTip = "Characteristic length of a broad climate region along the world's long axis. Default 1,500,000 cm = 15 km. Values are smoothly interpolated, so this is not a hard biome boundary or grid size."))
-    double RegionSpacing = 1500000.0;
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "3000000.0", ToolTip = "Characteristic length of a broad climate region along the world's long axis. Values are smoothly interpolated, so this is not a hard biome boundary or grid size. Set to 0 to auto-derive this as roughly 1/6 of the world's long-axis length (about 6-7 climate regions across the world regardless of size), so a short test world still shows real climate variety instead of only 1-2 anchors. Enter an explicit value to pin a specific region length regardless of world size."))
+    double RegionSpacing = 0.0;
 
     UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Climate", meta = (Units = "cm", ClampMin = "10000.0", ToolTip = "Distance over which rivers and lakes increase local habitat moisture."))
     double WaterInfluenceDistance = 100000.0;
