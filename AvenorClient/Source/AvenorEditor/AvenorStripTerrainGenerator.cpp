@@ -629,7 +629,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 17;
+static constexpr int32 GeneratorAlgorithmVersion = 18;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3742,11 +3742,24 @@ static double EvaluateLandform(
     const double BeltSignal = FMath::Clamp(
         BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
     );
-    double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
+    // Ridged noise is deliberately bright over much of its domain: values
+    // near a Perlin zero crossing become a ridge. It therefore cannot itself
+    // be treated as a mountain-presence mask. The old low threshold plus
+    // non-zero 0.50/0.68 multiplier floors left virtually the entire world
+    // mountain-eligible. Require a genuine high ridge inside a coherent
+    // mountain province instead. Both gates can now reach zero, preserving
+    // large quiet provinces for plains, rolling country and broad valleys.
+    const double BeltCore = Smooth01(FMath::Clamp(
+        (BeltSignal - FMath::Lerp(0.72, 0.60, Activity)) / 0.24,
         0.0, 1.0
-    )) * FMath::Lerp(0.50, 1.0, MountainProvince)
-       * FMath::Lerp(0.68, 1.0, PositiveUplift);
+    ));
+    const double MountainProvinceGate = Smooth01(FMath::Clamp(
+        (MountainProvince - 0.08) / 0.82,
+        0.0, 1.0
+    ));
+    const double BroadRange = BeltCore
+        * MountainProvinceGate
+        * FMath::Lerp(0.55, 1.0, PositiveUplift);
 
     const double CrestRidges = RidgedFbm(
         Warped, Scale * 0.30,
@@ -3759,10 +3772,10 @@ static double EvaluateLandform(
         4, 0.54, 2.07
     );
     const double CrestShape = FMath::Clamp(
-        0.68
-            + CrestRidges * 0.48
-            + CrestVariation * 0.34,
-        0.68, 1.50
+        0.74
+            + CrestRidges * 0.34
+            + CrestVariation * 0.22,
+        0.74, 1.30
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3857,8 +3870,8 @@ static double EvaluateLandform(
     // can reach kilometre-scale relief without lifting quiet plains with them.
     const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
     Height += MountainRelief * Relief
-        * FMath::Lerp(0.72, 1.12, Activity)
-        * FMath::Lerp(0.82, 1.72, MountainRelief)
+        * FMath::Lerp(0.58, 0.92, Activity)
+        * FMath::Lerp(0.76, 1.18, MountainRelief)
         * CrestShape;
 
     Height += FoothillEnvelope * Relief * 0.18
