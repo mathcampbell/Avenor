@@ -567,11 +567,11 @@ struct FAvenorStripData
     TArray<int32> ReceiverA;
     TArray<int32> ReceiverB;
     TArray<double> ReceiverWeightA;
-    // Single steepest-descent receiver/accumulation, transient and rebuilt
+    // Single adjacent-downhill receiver/accumulation, transient and rebuilt
     // each BuildContinuousFlow call. Not part of the baked chunk format -
     // used only during generation to give river/lake network extraction a
     // single, stable channel topology instead of reducing the MFD split
-    // above per-cell.
+    // above per-cell. Its local edge also follows the broader valley signal.
     TArray<int32> ReceiverD8;
     TArray<double> AccumulationD8;
     TArray<int32> FillParent;
@@ -634,7 +634,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 23;
+static constexpr int32 GeneratorAlgorithmVersion = 24;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1733,6 +1733,141 @@ static int32 SteepestReceiver(const FAvenorStripData& Data, int32 X, int32 Y)
     return Best != INDEX_NONE ? Best : Data.FillParent[Cell];
 }
 
+// D8's immediate steepest neighbour is topologically safe but myopic: on a
+// broad hillslope it can commit a channel to a shallow side-gully even when a
+// much stronger valley lies only a few analysis cells ahead. Build a broad
+// routing surface for that valley-scale signal, then still return one of the
+// eight immediately adjacent, strictly downhill cells. This preserves an
+// acyclic drainage tree while allowing the next step to anticipate the
+// downstream hydraulic gradient rather than behaving greedily cell by cell.
+static void BuildBroadRoutingSurface(
+    const FAvenorStripData& Data,
+    TArray<double>& OutRoutingHeight
+)
+{
+    const int32 CellCount = Data.FilledHeight.Num();
+    OutRoutingHeight = Data.FilledHeight;
+    if (CellCount == 0)
+    {
+        return;
+    }
+    const int32 Radius = FMath::Clamp(
+        FMath::CeilToInt(40000.0 / FMath::Max(1.0, Data.CellSize)),
+        4,
+        12
+    );
+    TArray<double> Horizontal;
+    Horizontal.SetNumUninitialized(CellCount);
+    for (int32 Y = 0; Y < Data.Rows; ++Y)
+    {
+        double RunningSum = 0.0;
+        int32 RunningCount = 0;
+        for (int32 SampleX = 0;
+             SampleX <= FMath::Min(Radius, Data.Columns - 1);
+             ++SampleX)
+        {
+            RunningSum += Data.FilledHeight[Data.Index(SampleX, Y)];
+            ++RunningCount;
+        }
+        for (int32 X = 0; X < Data.Columns; ++X)
+        {
+            Horizontal[Data.Index(X, Y)] =
+                RunningSum / FMath::Max(1, RunningCount);
+            const int32 RemoveX = X - Radius;
+            if (RemoveX >= 0)
+            {
+                RunningSum -= Data.FilledHeight[Data.Index(RemoveX, Y)];
+                --RunningCount;
+            }
+            const int32 AddX = X + Radius + 1;
+            if (AddX < Data.Columns)
+            {
+                RunningSum += Data.FilledHeight[Data.Index(AddX, Y)];
+                ++RunningCount;
+            }
+        }
+    }
+    for (int32 X = 0; X < Data.Columns; ++X)
+    {
+        double RunningSum = 0.0;
+        int32 RunningCount = 0;
+        for (int32 SampleY = 0;
+             SampleY <= FMath::Min(Radius, Data.Rows - 1);
+             ++SampleY)
+        {
+            RunningSum += Horizontal[Data.Index(X, SampleY)];
+            ++RunningCount;
+        }
+        for (int32 Y = 0; Y < Data.Rows; ++Y)
+        {
+            const int32 Cell = Data.Index(X, Y);
+            const double BroadHeight =
+                RunningSum / FMath::Max(1, RunningCount);
+            OutRoutingHeight[Cell] = FMath::Lerp(
+                Data.FilledHeight[Cell], BroadHeight, 0.76
+            );
+            const int32 RemoveY = Y - Radius;
+            if (RemoveY >= 0)
+            {
+                RunningSum -= Horizontal[Data.Index(X, RemoveY)];
+                --RunningCount;
+            }
+            const int32 AddY = Y + Radius + 1;
+            if (AddY < Data.Rows)
+            {
+                RunningSum += Horizontal[Data.Index(X, AddY)];
+                ++RunningCount;
+            }
+        }
+    }
+}
+
+static int32 ValleyAwareReceiver(
+    const FAvenorStripData& Data,
+    const TArray<double>& RoutingHeight,
+    int32 X,
+    int32 Y
+)
+{
+    const int32 Cell = Data.Index(X, Y);
+    if (!RoutingHeight.IsValidIndex(Cell))
+    {
+        return SteepestReceiver(Data, X, Y);
+    }
+    double BestScore = -TNumericLimits<double>::Max();
+    int32 Best = INDEX_NONE;
+    for (int32 Direction = 0; Direction < 8; ++Direction)
+    {
+        const int32 NX = X + NeighborX[Direction];
+        const int32 NY = Y + NeighborY[Direction];
+        if (!Data.IsValid(NX, NY))
+        {
+            continue;
+        }
+        const int32 Neighbor = Data.Index(NX, NY);
+        const double ImmediateDrop =
+            Data.FilledHeight[Cell] - Data.FilledHeight[Neighbor];
+        if (ImmediateDrop <= 0.0)
+        {
+            continue;
+        }
+        const double Distance =
+            NeighborX[Direction] != 0 && NeighborY[Direction] != 0
+            ? Data.CellSize * 1.4142135623730951
+            : Data.CellSize;
+        const double ImmediateSlope = ImmediateDrop / Distance;
+        const double ValleySlope =
+            (RoutingHeight[Cell] - RoutingHeight[Neighbor]) / Distance;
+        const double Score = ImmediateSlope * 0.25 + ValleySlope * 0.75;
+        if (Score > BestScore)
+        {
+            BestScore = Score;
+            Best = Neighbor;
+        }
+    }
+    return Best != INDEX_NONE ? Best : Data.FillParent[Cell];
+}
+
 static void BuildContinuousFlow(FAvenorStripData& Data)
 {
     const int32 CellCount = Data.Height.Num();
@@ -1753,6 +1888,8 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
     // AccumulationD8 starts from the same per-cell contribution as the MFD
     // Accumulation above and only diverges in how it is routed downstream.
     Data.AccumulationD8 = Data.Accumulation;
+    TArray<double> RoutingHeight;
+    BuildBroadRoutingSurface(Data, RoutingHeight);
 
     for (int32 Y = 0; Y < Data.Rows; ++Y)
     {
@@ -1802,13 +1939,13 @@ static void BuildContinuousFlow(FAvenorStripData& Data)
             Data.ReceiverA[Cell] = A;
             Data.ReceiverB[Cell] = B;
             Data.ReceiverWeightA[Cell] = B == INDEX_NONE ? 1.0 : 1.0 - UpperWeight;
-            // Single steepest-descent receiver, independent of the MFD split
-            // above. Network topology (channel extraction, confluences, lake
-            // termini) reduces the MFD field back to one direction per cell
-            // anyway; deriving that reduction independently as true D8 avoids
-            // per-cell weight tie-breaks producing braided/unstable channels
-            // and diluted accumulation at basin outlets.
-            Data.ReceiverD8[Cell] = SteepestReceiver(Data, X, Y);
+            // Single local receiver, independent of the MFD split above.
+            // It remains a strict adjacent downhill D8 edge, but its choice is
+            // informed by the broader routing surface so it follows the main
+            // valley rather than committing greedily to a shallow side-gully.
+            Data.ReceiverD8[Cell] = ValleyAwareReceiver(
+                Data, RoutingHeight, X, Y
+            );
         }
     }
 
@@ -2106,9 +2243,9 @@ static void EvolveTerrainFromDrainage(
 // independent at every cell along a flow path - wherever the MFD split sits
 // near 50/50 (common in wide valley floors and, worst of all, right at
 // basin spillways/saddles) it produces braided parallel "channels" and
-// unstable outlet routing. ReceiverD8 is a true single steepest-descent
-// tree computed directly from FilledHeight, so it stays a coherent,
-// non-braided tree end to end.
+// unstable outlet routing. ReceiverD8 is one coherent adjacent-downhill tree
+// informed by both local FilledHeight and the broad routing surface, so it
+// stays non-braided end to end without being limited to a one-cell view.
 static int32 PrimaryReceiver(const FAvenorStripData& Data, int32 Cell)
 {
     if (Cell == INDEX_NONE || !Data.ReceiverD8.IsValidIndex(Cell))
