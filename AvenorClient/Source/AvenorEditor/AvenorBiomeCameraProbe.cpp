@@ -288,7 +288,7 @@ private:
             {
                 const EAvenorBiomeClass BaseBiome = ClosestBiomeColour(*BaseBiomePixel);
                 const bool bHasLocalOverride = LocalBiomePixel && LocalBiomePixel->A > 0;
-                const EAvenorBiomeClass FinalBiome = bHasLocalOverride
+                const EAvenorBiomeClass LocalOverlay = bHasLocalOverride
                     ? ClosestBiomeColour(*LocalBiomePixel)
                     : BaseBiome;
                 const double MacroTemperature = Climate->R / 255.0;
@@ -296,10 +296,9 @@ private:
                 const double LocalTemperature = Climate->B / 255.0;
                 const double LocalMoisture = Climate->A / 255.0;
                 Status = FString::Printf(
-                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nShaping masks: Mountain %.2f  Hill %.2f  Desert %.2f  Slope %.3f\nLandform: %s   Elevation: %s%s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
-                    *BiomeName(FinalBiome),
-                    bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
+                    TEXT("AVENOR LOCATION PROBE\nBiome: %s   Overlay: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nShaping masks: Mountain %.2f  Hill %.2f  Desert %.2f  Slope %.3f\nLandform: %s   Elevation: %s%s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
                     *BiomeName(BaseBiome),
+                    bHasLocalOverride ? *BiomeName(LocalOverlay) : TEXT("None"),
                     TemperatureLabel(MacroTemperature), MoistureLabel(MacroMoisture),
                     MacroTemperature, MacroMoisture,
                     TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),

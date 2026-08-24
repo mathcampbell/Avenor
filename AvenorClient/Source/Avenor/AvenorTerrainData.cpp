@@ -213,60 +213,11 @@ bool UAvenorTerrainData::SampleFinalHeight(
         return false;
     }
 
-    // Erosion owns the valley shape. The final river pass only guarantees
-    // enough clearance for the wetted channel and a very small bank shoulder.
-    // It must never excavate a second artificial valley around the spline.
-    for (const FAvenorBakedRiverReach& River : Rivers)
-    {
-        for (int32 Index = 0; Index + 1 < River.Points.Num(); ++Index)
-        {
-            const FVector& A3 = River.Points[Index];
-            const FVector& B3 = River.Points[Index + 1];
-            const FVector2D A(A3);
-            const FVector2D B(B3);
-            const FVector2D Segment = B - A;
-            const double LengthSquared = Segment.SizeSquared();
-            const double Alpha = LengthSquared > UE_DOUBLE_SMALL_NUMBER
-                ? FMath::Clamp(FVector2D::DotProduct(WorldPosition - A, Segment)
-                    / LengthSquared, 0.0, 1.0)
-                : 0.0;
-            const double Distance = (WorldPosition - (A + Segment * Alpha)).Size();
-            const double BankMargin = FMath::Min(
-                FMath::Max(75.0, River.Width * 0.12),
-                FMath::Max(0.0, River.BankWidth)
-            );
-            const double CarveHalfWidth = FMath::Max(
-                River.Width * 0.52,
-                River.Width * 0.5 + BankMargin
-            );
-            if (Distance >= CarveHalfWidth)
-            {
-                continue;
-            }
-            if (bOutWaterAffected)
-            {
-                *bOutWaterAffected = true;
-            }
-            const double WaterZ = FMath::Lerp(A3.Z, B3.Z, Alpha);
-            const double CrossAlpha = FMath::Clamp(
-                Distance / CarveHalfWidth, 0.0, 1.0
-            );
-            const double ClearanceDepth = FMath::Min(
-                FMath::Max(60.0, River.Width * 0.10),
-                FMath::Max(60.0, River.Depth)
-            );
-            const double BedZ = WaterZ - ClearanceDepth;
-            const double BankBlend = FMath::SmoothStep(
-                0.0, 1.0, FMath::Pow(CrossAlpha, 0.72)
-            );
-            const float CarvedZ = static_cast<float>(FMath::Lerp(
-                BedZ,
-                static_cast<double>(OutHeight),
-                BankBlend
-            ));
-            OutHeight = FMath::Min(OutHeight, CarvedZ);
-        }
-    }
+    // Rivers deliberately do not modify final terrain height here. Fluvial
+    // and thermal erosion own the valley, while the generated water spline is
+    // fitted to that final surface. Keeping a second spline-centred carve in
+    // this runtime sampler made the supposedly diagnostic no-carve mode still
+    // excavate deep, narrow trenches and concealed routing/Z errors.
 
     // Lake modifiers are polygonal rather than spline based. Use the signed
     // distance to their shoreline so consumers see both the lake bed and the

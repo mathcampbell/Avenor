@@ -48,11 +48,11 @@ struct AVENOR_API FAvenorClimateTileReference
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     FIntPoint CellCount = FIntPoint::ZeroValue;
 
-    /** Regional climate biome IDs; local terrain does not overwrite them. */
+    /** Strict eight-class temperature x moisture ground-biome IDs. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     TSoftObjectPtr<UTexture2D> BaseBiomeTexture;
 
-    /** Snow/alpine/wetland/oasis and water-surface biome overlays. */
+    /** Ecological/surface overlays; never a replacement ground-biome table. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     TSoftObjectPtr<UTexture2D> LocalBiomeTexture;
 
@@ -85,11 +85,11 @@ struct AVENOR_API FAvenorWorldClimateMapReference
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     double CellSize = 0.0;
 
-    /** Regional climate biome IDs; sampled with nearest filtering. */
+    /** Strict eight-class temperature x moisture ground-biome IDs. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     TSoftObjectPtr<UTexture2D> BaseBiomeTexture;
 
-    /** Snow/alpine/wetland/oasis and water-surface biome overlays. */
+    /** Ecological/surface overlays; never a replacement ground-biome table. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Climate")
     TSoftObjectPtr<UTexture2D> LocalBiomeTexture;
 

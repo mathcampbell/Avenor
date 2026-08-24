@@ -638,7 +638,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 26;
+static constexpr int32 GeneratorAlgorithmVersion = 27;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3167,66 +3167,22 @@ static void EnforceDownhill(TArray<FVector>& Points)
     {
         return;
     }
-    // Fit the terrain samples to the nearest strictly downstream water
-    // profile (pool-adjacent-violators isotonic regression). Unlike the old
-    // forward clamp, a small local rise is shared across the surrounding
-    // profile instead of accumulating into kilometres of underground river;
-    // unlike the temporary bounded clamp, no uphill segment is permitted.
+    // Preserve the terrain sample at every point unless it would make the
+    // river climb. A symmetric isotonic fit used to average local rises over
+    // whole reaches, lifting some water visibly above the final mesh. This
+    // one-sided lower envelope is the generated equivalent of projecting a
+    // spline onto the ground while retaining a strictly downstream profile:
+    // it can lower a point at a residual routing rise, but can never raise a
+    // point away from its sampled terrain surface.
     constexpr double MinimumGradient = 0.0001;
-    TArray<double> Distance;
-    Distance.SetNum(Points.Num());
-    Distance[0] = 0.0;
     for (int32 Index = 1; Index < Points.Num(); ++Index)
     {
-        Distance[Index] = Distance[Index - 1] + FVector2D::Distance(
+        const double Distance = FVector2D::Distance(
             FVector2D(Points[Index - 1]), FVector2D(Points[Index])
         );
-    }
-    struct FMonotonicBlock
-    {
-        int32 Start = 0;
-        int32 End = 0;
-        double Sum = 0.0;
-        double Weight = 0.0;
-        double Mean() const { return Sum / FMath::Max(1.0, Weight); }
-    };
-    TArray<FMonotonicBlock> Blocks;
-    Blocks.Reserve(Points.Num());
-    for (int32 Index = 0; Index < Points.Num(); ++Index)
-    {
-        const double TransformedHeight =
-            Points[Index].Z + Distance[Index] * MinimumGradient;
-        FMonotonicBlock NewBlock;
-        NewBlock.Start = Index;
-        NewBlock.End = Index;
-        NewBlock.Sum = TransformedHeight;
-        NewBlock.Weight = 1.0;
-        Blocks.Add(NewBlock);
-        while (Blocks.Num() >= 2
-            && Blocks[Blocks.Num() - 2].Mean() < Blocks.Last().Mean())
-        {
-            FMonotonicBlock Right = Blocks.Pop(EAllowShrinking::No);
-            FMonotonicBlock& Left = Blocks.Last();
-            Left.End = Right.End;
-            Left.Sum += Right.Sum;
-            Left.Weight += Right.Weight;
-        }
-    }
-    for (const FMonotonicBlock& Block : Blocks)
-    {
-        const double FittedHeight = Block.Mean();
-        for (int32 Index = Block.Start; Index <= Block.End; ++Index)
-        {
-            Points[Index].Z =
-                FittedHeight - Distance[Index] * MinimumGradient;
-        }
-    }
-    // Numerical backstop for spline points at extremely small separation.
-    for (int32 Index = 1; Index < Points.Num(); ++Index)
-    {
         Points[Index].Z = FMath::Min(
             Points[Index].Z,
-            Points[Index - 1].Z
+            Points[Index - 1].Z - Distance * MinimumGradient
         );
     }
 }
@@ -4171,10 +4127,17 @@ static void ExtractRivers(
             false
         );
         CutOffSelfIntersections(Points);
+        // WaterSpline Z is a surface datum, while Data.Height is the final
+        // ground surface. Keep the water only a few centimetres above that
+        // sampled mesh to avoid coplanar flicker without creating a visible
+        // floating ribbon. EnforceDownhill may lower points where the routed
+        // terrain still contains a residual rise, but it never raises them.
+        constexpr double RiverSurfaceClearance = 35.0;
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
-            Point.Z = Data.SampleGrid(Data.Height, Position);
+            Point.Z = Data.SampleGrid(Data.Height, Position)
+                + RiverSurfaceClearance;
         }
         EnforceDownhill(Points);
 
@@ -5691,7 +5654,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8ae")); }
+    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b0")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
