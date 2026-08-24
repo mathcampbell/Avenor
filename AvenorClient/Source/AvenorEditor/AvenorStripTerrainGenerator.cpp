@@ -415,14 +415,15 @@ static void AddBroadMeanders(
     TArray<FVector>& Points,
     double CellSize,
     double Strength,
-    double LowlandFraction,
+    const TArray<double>& LocalSuitability,
     double DischargeFraction,
     double ValleyFreedom,
     int32 Seed,
     const FBox& Bounds
 )
 {
-    if (Points.Num() < 4 || Strength <= 0.0)
+    if (Points.Num() < 4 || Strength <= 0.0
+        || LocalSuitability.Num() != Points.Num())
     {
         return;
     }
@@ -436,44 +437,35 @@ static void AddBroadMeanders(
         );
     }
     const double TotalLength = Lengths.Last();
-    // A dendritic network's short headwater tributaries vastly outnumber
-    // its main-stem reaches, so a 4-cell (400m) cutoff meant most of the
-    // visible network got literally zero meander, not just a small one.
-    if (TotalLength < CellSize * 2.0)
+    if (TotalLength < CellSize * 4.0)
     {
         return;
     }
 
-    const double Lowland = FMath::Clamp(LowlandFraction, 0.0, 1.0);
     const double Discharge = FMath::Clamp(DischargeFraction, 0.0, 1.0);
-    // Floor kept above the gate threshold below: a clamped-to-floor Freedom
-    // used to land at exactly the same value the gate rejected, so any
-    // valley-constrained reach (common wherever resistance/mountain masks
-    // are non-trivial, which is most of this terrain) silently got zero
-    // meander instead of the reduced-but-nonzero wiggle the floor implies.
-    const double Freedom = FMath::Clamp(ValleyFreedom, 0.20, 1.0);
-    if (Lowland < 0.04 || Freedom < 0.16)
+    const double Freedom = FMath::Clamp(ValleyFreedom, 0.0, 1.0);
+    double MaximumSuitability = 0.0;
+    for (double Suitability : LocalSuitability)
+    {
+        MaximumSuitability = FMath::Max(
+            MaximumSuitability,
+            FMath::Clamp(Suitability, 0.0, 1.0)
+        );
+    }
+    if (MaximumSuitability < 0.05 || Freedom < 0.10)
     {
         return;
     }
 
     FRandomStream Random(Seed);
-    // This used to multiply five independent ~[0,1] factors together (the
-    // length cap, Strength, Lowland raised to a 1.35 exponent, a Discharge
-    // lerp bottoming out at 0.55, Freedom) - each looked reasonable in
-    // isolation, but compounded they routinely reduced a short, moderately
-    // steep headwater tributary's amplitude to 1-3m: "some" meander on
-    // paper, invisible in practice and well under any simplification
-    // tolerance, which is exactly why a dendritic network's many short
-    // branches (the majority of any river system by count) were rendering
-    // as straight lines even after the simplification-tolerance fix.
-    // Loosened the length cap, dropped the extra Lowland exponent, and
-    // raised the Discharge floor so a typical short stream keeps a real,
-    // visible wiggle instead of vanishing under compounded multipliers.
+    // Discharge controls the scale of a meander, while the point-local
+    // suitability below decides whether that section is free to meander at
+    // all. Large rivers therefore form broad bends; steep/source sections
+    // stay direct rather than inheriting a reach-wide minimum wiggle.
     const double RawAmplitude = FMath::Min(
         TotalLength * 0.16,
         CellSize * FMath::Lerp(2.4, 5.5, Discharge)
-    ) * Strength * Lowland * FMath::Lerp(0.75, 1.0, Discharge) * Freedom;
+    ) * Strength * FMath::Lerp(0.35, 1.0, Discharge) * Freedom;
     const double Wavelength = Random.FRandRange(0.88, 1.16)
         * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;
     // The active channel can form a tight meander neck, but it must never
@@ -499,7 +491,11 @@ static void AddBroadMeanders(
             0.30 * FMath::Sin(
                 2.0 * PI * Distance / (Wavelength * 2.43) + PhaseB
             );
-        const FVector2D Offset = Normal * Amplitude * Fade * Wave;
+        const double Suitability = FMath::Clamp(
+            LocalSuitability[Index], 0.0, 1.0
+        );
+        const FVector2D Offset =
+            Normal * Amplitude * Suitability * Fade * Wave;
         Points[Index].X = FMath::Clamp(
             Points[Index].X + Offset.X,
             Bounds.Min.X + CellSize,
@@ -651,7 +647,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 20;
+static constexpr int32 GeneratorAlgorithmVersion = 21;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3029,31 +3025,72 @@ static void ExtractLakes(
 
 namespace UE::Avenor::Strip
 {
-static void EnforceDownhill(
-    TArray<FVector>& Points,
-    double MaximumSurfaceUndercut = 200.0
-)
+static void EnforceDownhill(TArray<FVector>& Points)
 {
     if (Points.Num() < 2)
     {
         return;
     }
+    // Fit the terrain samples to the nearest strictly downstream water
+    // profile (pool-adjacent-violators isotonic regression). Unlike the old
+    // forward clamp, a small local rise is shared across the surrounding
+    // profile instead of accumulating into kilometres of underground river;
+    // unlike the temporary bounded clamp, no uphill segment is permitted.
+    constexpr double MinimumGradient = 0.0001;
+    TArray<double> Distance;
+    Distance.SetNum(Points.Num());
+    Distance[0] = 0.0;
     for (int32 Index = 1; Index < Points.Num(); ++Index)
     {
-        const double HorizontalDistance = FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
-        const double GroundHeight = Points[Index].Z;
-        const double DesiredHeight = FMath::Min(
-            GroundHeight,
-            Points[Index - 1].Z - HorizontalDistance * 0.00015
+        Distance[Index] = Distance[Index - 1] + FVector2D::Distance(
+            FVector2D(Points[Index - 1]), FVector2D(Points[Index])
         );
-        // Never solve a locally awkward spline by cumulatively driving the
-        // water surface far underground. If the route cannot remain downhill
-        // within this small allowance, preserve the near-ground datum; the
-        // geometry problem remains visible for diagnosis instead of becoming
-        // an artificial gorge hundreds of metres deep.
-        Points[Index].Z = FMath::Max(
-            DesiredHeight,
-            GroundHeight - FMath::Max(0.0, MaximumSurfaceUndercut)
+    }
+    struct FMonotonicBlock
+    {
+        int32 Start = 0;
+        int32 End = 0;
+        double Sum = 0.0;
+        double Weight = 0.0;
+        double Mean() const { return Sum / FMath::Max(1.0, Weight); }
+    };
+    TArray<FMonotonicBlock> Blocks;
+    Blocks.Reserve(Points.Num());
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        const double TransformedHeight =
+            Points[Index].Z + Distance[Index] * MinimumGradient;
+        FMonotonicBlock NewBlock;
+        NewBlock.Start = Index;
+        NewBlock.End = Index;
+        NewBlock.Sum = TransformedHeight;
+        NewBlock.Weight = 1.0;
+        Blocks.Add(NewBlock);
+        while (Blocks.Num() >= 2
+            && Blocks[Blocks.Num() - 2].Mean() < Blocks.Last().Mean())
+        {
+            FMonotonicBlock Right = Blocks.Pop(EAllowShrinking::No);
+            FMonotonicBlock& Left = Blocks.Last();
+            Left.End = Right.End;
+            Left.Sum += Right.Sum;
+            Left.Weight += Right.Weight;
+        }
+    }
+    for (const FMonotonicBlock& Block : Blocks)
+    {
+        const double FittedHeight = Block.Mean();
+        for (int32 Index = Block.Start; Index <= Block.End; ++Index)
+        {
+            Points[Index].Z =
+                FittedHeight - Distance[Index] * MinimumGradient;
+        }
+    }
+    // Numerical backstop for spline points at extremely small separation.
+    for (int32 Index = 1; Index < Points.Num(); ++Index)
+    {
+        Points[Index].Z = FMath::Min(
+            Points[Index].Z,
+            Points[Index - 1].Z
         );
     }
 }
@@ -3780,27 +3817,44 @@ static void ExtractRivers(
         // scale on long reaches.
         Points = ChaikinSmooth(Points, false, 2);
         Points = ResamplePolyline(Points, Data.CellSize * 0.80, false);
-        // A hard clamp to exactly 0 at a 12% grade gave every reach through
-        // typically-mountainous terrain zero meander whatsoever - not just
-        // reduced, mathematically zero, since Lowland multiplies straight
-        // into AddBroadMeanders' Amplitude. Widened and floored so a steep
-        // reach still gets a small residual wiggle instead of a perfectly
-        // straight line; genuinely torrential terrain still tapers hard.
-        const double LowlandFraction = FMath::Clamp(
-            1.0 - MeanSlope / 0.22, 0.12, 1.0
-        );
+        // Meandering is an alluvial, low-gradient process. A 12-22% slope is
+        // not "less meandering" river country; it is a constrained mountain
+        // stream and should receive no synthetic lateral wave at all.
+        const double LowlandFraction = 1.0 - Smooth01(FMath::Clamp(
+            (MeanSlope - 0.006) / 0.050, 0.0, 1.0
+        ));
         const double ValleyFreedom = FMath::Clamp(
             (1.0 - MeanResistance * 0.72)
                 * (1.0 - MeanMountain * 0.62),
-            0.18,
+            0.0,
             1.0
         );
+        TArray<double> LocalMeanderSuitability;
+        LocalMeanderSuitability.Reserve(Points.Num());
+        for (const FVector& Point : Points)
+        {
+            const FVector2D Position(Point);
+            const double LocalSlope = Data.SampleGrid(Data.Slope, Position);
+            const double Flatness = 1.0 - Smooth01(FMath::Clamp(
+                (LocalSlope - 0.004) / 0.042, 0.0, 1.0
+            ));
+            const double LocalArea = Data.SampleGrid(
+                Data.AccumulationD8, Position
+            );
+            const double LocalMaturity = Smooth01(FMath::Clamp(
+                (DrainageScaleAlpha(LocalArea, MainRiverArea) - 0.06) / 0.50,
+                0.0, 1.0
+            ));
+            LocalMeanderSuitability.Add(
+                Flatness * LocalMaturity * LowlandFraction
+            );
+        }
         const TArray<FVector> BaseMeanderPoints = Points;
         AddBroadMeanders(
             Points,
             Data.CellSize,
             MeanderStrength,
-            LowlandFraction,
+            LocalMeanderSuitability,
             RiverAlpha,
             ValleyFreedom,
             Seed ^ (ReachIndex * 0x45D9F3B),
