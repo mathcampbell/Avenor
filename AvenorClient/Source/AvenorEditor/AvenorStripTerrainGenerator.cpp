@@ -645,7 +645,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 16;
+static constexpr int32 GeneratorAlgorithmVersion = 17;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1480,6 +1480,67 @@ namespace UE::Avenor::Strip
 static constexpr int32 NeighborX[8] = {1, 1, 0, -1, -1, -1, 0, 1};
 static constexpr int32 NeighborY[8] = {0, 1, 1, 1, 0, -1, -1, -1};
 
+// Remove analysis-grid-scale chatter from terrain classes whose identity is
+// broad form. Plains and rolling hills are low-passed, while true mountains
+// and resistant desert relief retain their sharper structure. Erosion runs
+// afterward and supplies coherent drainage detail.
+static void SmoothLowReliefTerrain(FAvenorStripData& Data, int32 Iterations)
+{
+    if (Iterations <= 0 || Data.Height.Num() == 0)
+    {
+        return;
+    }
+    TArray<double> Smoothed = Data.Height;
+    for (int32 Iteration = 0; Iteration < Iterations; ++Iteration)
+    {
+        Smoothed = Data.Height;
+        for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
+        {
+            for (int32 X = 1; X + 1 < Data.Columns; ++X)
+            {
+                const int32 Cell = Data.Index(X, Y);
+                const double Mountain = FMath::Clamp(
+                    Data.MountainMask[Cell], 0.0, 1.0
+                );
+                const double Hill = FMath::Clamp(Data.HillMask[Cell], 0.0, 1.0);
+                const double Plains = FMath::Clamp(
+                    Data.PlainsMask[Cell], 0.0, 1.0
+                );
+                const double Desert = FMath::Clamp(
+                    Data.DesertMask[Cell], 0.0, 1.0
+                );
+                const double ProtectedRelief = FMath::Clamp(
+                    FMath::Max(Mountain, Desert * 0.62), 0.0, 1.0
+                );
+                const double Smoothing = FMath::Clamp(
+                    (Plains * 0.48 + Hill * 0.30)
+                        * (1.0 - ProtectedRelief * 0.90),
+                    0.0, 0.52
+                );
+                if (Smoothing <= 0.01)
+                {
+                    continue;
+                }
+                double NeighborSum = 0.0;
+                for (int32 Direction = 0; Direction < 8; ++Direction)
+                {
+                    NeighborSum += Data.Height[Data.Index(
+                        X + NeighborX[Direction], Y + NeighborY[Direction]
+                    )];
+                }
+                const double Target = NeighborSum / 8.0;
+                const double Change = FMath::Clamp(
+                    (Target - Data.Height[Cell]) * Smoothing,
+                    -Data.CellSize * 0.20,
+                    Data.CellSize * 0.20
+                );
+                Smoothed[Cell] = Data.Height[Cell] + Change;
+            }
+        }
+        Data.Height = Smoothed;
+    }
+}
+
 static void ApplyThermalErosion(
     FAvenorStripData& Data,
     int32 Iterations,
@@ -1889,7 +1950,7 @@ static void ApplyStreamPowerErosion(
                 ? FMath::Clamp(
                     Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
                 ) : 1.0;
-            Delta[Cell] = FMath::Min(Data.CellSize * 6.0, Strength * 760.0 * AreaFactor * SlopeFactor) *
+            Delta[Cell] = FMath::Min(Data.CellSize * 2.5, Strength * 520.0 * AreaFactor * SlopeFactor) *
                 (1.0 - LocalResistance) * D8Dominance;
         }
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
@@ -1983,7 +2044,7 @@ static void EvolveTerrainFromDrainage(
                     Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
                 ) : 1.0;
             const double Incision = Strength * Data.CellSize
-                * FMath::Lerp(0.035, 0.085, CanyonSuitability)
+                * FMath::Lerp(0.022, 0.065, CanyonSuitability)
                 * ChannelPower
                 * (0.45 + FMath::Clamp(Slope / 0.09, 0.0, 1.0) * 0.55)
                 * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability)
@@ -2030,7 +2091,7 @@ static void EvolveTerrainFromDrainage(
                         Delta[Neighbor] -= FMath::Max(
                             0.0,
                             Incision * BroadValley * Falloff
-                                * (1.0 - NeighborResistance * 0.82) * 0.46
+                                * (1.0 - NeighborResistance * 0.82) * 0.34
                         );
                     }
                 }
@@ -3716,19 +3777,34 @@ static double EvaluateLandform(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
     );
-    const double SeedAngleA = FMath::Fmod(
+    auto AvoidCardinalAlignment = [](double Angle)
+    {
+        double Wrapped = FMath::Fmod(Angle, PI * 0.5);
+        if (Wrapped < 0.0)
+        {
+            Wrapped += PI * 0.5;
+        }
+        const double CardinalDistance = FMath::Min(Wrapped, PI * 0.5 - Wrapped);
+        return FMath::Fmod(
+            Angle + (CardinalDistance < 0.14 ? 0.19 : 0.0), PI
+        );
+    };
+    const double RawSeedAngleA = FMath::Fmod(
         FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
     );
-    const double SeedAngleB = FMath::Fmod(
-        SeedAngleA + 1.047
+    const double RawSeedAngleB = FMath::Fmod(
+        RawSeedAngleA + 1.047
             + FMath::Abs(static_cast<double>(Seed)) * 0.000217,
         PI
     );
-    const double SeedAngleC = FMath::Fmod(
-        SeedAngleB + 0.731
+    const double RawSeedAngleC = FMath::Fmod(
+        RawSeedAngleB + 0.731
             + FMath::Abs(static_cast<double>(Seed)) * 0.000137,
         PI
     );
+    const double SeedAngleA = AvoidCardinalAlignment(RawSeedAngleA);
+    const double SeedAngleB = AvoidCardinalAlignment(RawSeedAngleB);
+    const double SeedAngleC = AvoidCardinalAlignment(RawSeedAngleC);
     const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
     const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
     const FVector2D AxisC(FMath::Cos(SeedAngleC), FMath::Sin(SeedAngleC));
@@ -3817,40 +3893,41 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    // Two warp scales: a slow, large-amplitude one so the belt's overall
-    // path actually bends over its length (a real orogenic belt sweeps in
-    // broad arcs, it doesn't run ruler-straight for tens of kilometres),
-    // plus the original fast, small one for local jitter on top of that
-    // bend. AxisA/AxisB's own 4-5x along:across stretch already makes each
-    // belt an elongated, mountain-range-like feature - without a large-
-    // scale bend it reads as an unnaturally straight corrugation instead,
-    // and any river valley following it inherits that same straightness.
-    const FVector2D BeltWarpedA = Warped + AcrossA * (
-        Fbm(Warped, Scale * 0.42,
-            SeedOffset + FVector2D(2903.0, 641.0), 3, 0.58, 2.0) * Scale * 0.85
-        + Fbm(Warped, Scale * 1.55,
-            SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0) * Scale * 0.24
-    );
-    const FVector2D BeltWarpedB = Warped + AcrossB * (
-        Fbm(Warped, Scale * 0.37,
-            SeedOffset + FVector2D(367.0, 3121.0), 3, 0.58, 2.0) * Scale * 0.80
-        + Fbm(Warped, Scale * 1.35,
-            SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0) * Scale * 0.22
-    );
+    // Bend each geological belt with a genuinely broad, restrained domain
+    // warp. A previous version used Scale*0.4 (a shorter wavelength) with an
+    // enormous 0.8*Scale displacement and consequently amplified local noise
+    // into corrugated relief rather than bending the range at macro scale.
+    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
+        Warped, Scale * 3.8,
+        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
+    ) * Scale * 0.32;
+    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
+        Warped, Scale * 3.4,
+        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
+    ) * Scale * 0.30;
     const double BeltA = RidgedFbm(
         Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
         Scale * 0.95,
         SeedOffset + FVector2D(421.0, 719.0),
-        5
+        3
     );
     const double BeltB = RidgedFbm(
         Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
         Scale * 1.05,
         SeedOffset + FVector2D(877.0, 149.0),
-        5
+        3
     );
+    // Select one dominant structural orientation regionally. Adding both
+    // ridged fields everywhere makes their crests visibly intersect as an X.
+    const double RawBeltSelector = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 3.6,
+        SeedOffset + FVector2D(3181.0, 1297.0), 3, 0.56, 2.0
+    );
+    const double BeltSelector = Smooth01(FMath::Clamp(
+        (RawBeltSelector - 0.43) / 0.14, 0.0, 1.0
+    ));
     const double BeltSignal = FMath::Clamp(
-        BeltA * 0.58 + BeltB * 0.42, 0.0, 1.0
+        FMath::Lerp(BeltA, BeltB, BeltSelector), 0.0, 1.0
     );
     double BroadRange = Smooth01(FMath::Clamp(
         (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
@@ -3863,9 +3940,9 @@ static double EvaluateLandform(
     // is handled later by directly altering the terrain along its path,
     // not by biasing the height field the corridor might run through.
     const double CrestRidges = RidgedFbm(
-        Warped, Scale * 0.30,
+        Warped, Scale * 0.42,
         SeedOffset + FVector2D(947.0, 271.0),
-        5
+        3
     );
     const double CrestVariation = 0.5 + 0.5 * Fbm(
         Warped, Scale * 0.42,
@@ -3888,19 +3965,19 @@ static double EvaluateLandform(
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
     const double UplandRidges = RidgedFbm(
-        Warped, Scale * 0.48,
+        Warped, Scale * 0.62,
         SeedOffset + FVector2D(347.0, 1039.0),
-        5
+        3
     );
     const double Rolling = Fbm(
         Warped, Scale * 0.62,
         SeedOffset + FVector2D(1171.0, 673.0),
-        5, 0.54, 2.03
+        3, 0.54, 2.03
     );
     const double HillDetail = Fbm(
         Warped, Scale * 0.24,
         SeedOffset + FVector2D(163.0, 1429.0),
-        4, 0.52, 2.1
+        2, 0.52, 2.1
     );
     const double FoothillEnvelope = Smooth01(FMath::Clamp(
         (BeltSignal - 0.38) / 0.38, 0.0, 1.0
@@ -3969,12 +4046,13 @@ static double EvaluateLandform(
         + RegionalStructure * Relief * 0.025;
 
     const double MountainHeight = Smooth01(OutMountainMask);
-    // Strong coherent uplift accelerates non-linearly so true mountain belts
-    // can reach kilometre-scale relief without lifting quiet plains with them.
-    const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
+    // Preserve kilometre-scale relief without the self-amplifying term that
+    // turned every small mask fluctuation into a large bump and pushed strong
+    // crests toward the same ceiling.
+    const double MountainRelief = FMath::Pow(MountainHeight, 1.16);
     Height += MountainRelief * Relief
-        * FMath::Lerp(0.72, 1.12, Activity)
-        * FMath::Lerp(0.82, 1.72, MountainRelief)
+        * FMath::Lerp(0.62, 1.02, Activity)
+        * FMath::Lerp(0.90, 1.10, CrestVariation)
         * CrestShape;
 
     // Reverted: two attempts this session (a ridged secondary-ridge layer,
@@ -3986,19 +4064,17 @@ static double EvaluateLandform(
 
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
-    // Wetter climates get a bit more small-scale bump amplitude (rolling,
-    // forest-covered hill country); drier-but-not-desert climates flatten
-    // out toward open prairie/grassland instead. Deserts are already
-    // handled separately above (dunes/mesas), and mountains keep their own
-    // Harshness-driven crest logic untouched by this.
-    const double HillHumidityScale = bClimateEnabled
-        ? FMath::Lerp(0.62, 1.28, ClimateMoisture)
-        : 1.0;
-    Height += IndependentHills * Relief * HillHumidityScale * (
-        0.050
-        + (0.5 + 0.5 * Rolling) * 0.052
-        + UplandRidges * 0.040
-        + HillDetail * 0.016
+    // Humid hill country should be broad and rounded, not globally rougher.
+    // Rolling controls the macro undulation; short detail is deliberately
+    // small and fades further in moist climates.
+    const double HillDetailScale = bClimateEnabled
+        ? FMath::Lerp(1.0, 0.45, ClimateMoisture)
+        : 0.70;
+    Height += IndependentHills * Relief * (
+        0.060
+        + (0.5 + 0.5 * Rolling) * 0.075
+        + UplandRidges * 0.025
+        + HillDetail * 0.008 * HillDetailScale
     );
 
     Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
@@ -4007,19 +4083,11 @@ static double EvaluateLandform(
     Height -= BasinMask * Relief * 0.085;
 
     const double PlainRoll = Fbm(
-        Warped, Scale * 0.95,
+        Warped, Scale * 1.35,
         SeedOffset + FVector2D(101.0, 43.0),
-        4, 0.56, 2.0
+        3, 0.56, 2.0
     );
-    const double PlainRidges = RidgedFbm(
-        Warped, Scale * 0.72,
-        SeedOffset + FVector2D(607.0, 1489.0),
-        4
-    );
-    Height += OutPlainsMask * Relief * (
-        PlainRoll * 0.024
-        + (PlainRidges - 0.46) * 0.016
-    );
+    Height += OutPlainsMask * Relief * PlainRoll * 0.014;
 
     OutDesertMask = Aridity * FMath::Clamp(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
@@ -4077,7 +4145,7 @@ static double EvaluateLandform(
             2.0 * PI * WindCoordinate / DuneWavelength
         );
         Height += (FMath::Pow(DuneWave, 2.1) - 0.31)
-            * Relief * 0.018 * DuneSuitability;
+            * Relief * 0.012 * DuneSuitability;
     }
 
     OutResistance = FMath::Clamp(
@@ -4753,6 +4821,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Data->PlainsMask[Cell] = CellPlainsMask;
     }
 
+    SmoothLowReliefTerrain(*Data, 3);
     ApplyTerrainClimate(*Data, Generator);
 
     ApplyThermalErosion(
@@ -5914,30 +5983,18 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
 #endif
 }
 
-// Shared by CreateWaterActors' terrain carve and GenerateRefinementSplines'
-// mesh-remesh radius. These two used to compute this independently and had
-// drifted apart: the carve's actual falloff for an ordinary (non-canyon)
-// river extends to Width*0.5 + BankMargin (BankMargin scales up to
-// Width*1.2, so this is often much wider than just the water's own width),
-// but the refinement spline only remeshed out to Width*0.5 plus a small
-// fixed margin. The outer part of the carve's falloff ramp then fell
-// outside the finely-tessellated area and was rendered by the coarse base
-// terrain mesh instead - producing a faceted, terraced-looking bank on any
-// river wide enough for the two radii to diverge (typically the more
-// prominent main-stem rivers), which reads as an unnaturally harsh, canyon-
-// like cut even where the underlying height data is a gentle slope.
-static double ComputeRiverCarveHalfWidth(const FRiverReach& Reach)
+// ConfigureWaterTerrainSettings expects the transition width outside the
+// WaterBody spline edge, not a total radius from the centreline. Passing
+// half the water width again here double-counted the channel and produced a
+// broad secondary trench. The water spline owns its wet width; this helper
+// supplies only a modest terrain shoulder beyond it.
+static double ComputeRiverBankTransitionWidth(const FRiverReach& Reach)
 {
-    const double BankMargin = FMath::Clamp(
-        Reach.Width * 1.2, 400.0, Reach.ValleyHalfWidth
-    );
     if (Reach.bIsCanyon)
     {
-        return FMath::Min(
-            Reach.ValleyHalfWidth, Reach.Width * 0.5 + BankMargin * 2.0
-        );
+        return FMath::Clamp(Reach.Width * 0.18, 150.0, 800.0);
     }
-    return Reach.Width * 0.5 + BankMargin;
+    return FMath::Clamp(Reach.Width * 0.08, 100.0, 400.0);
 }
 
 void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data)
@@ -6039,19 +6096,23 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             // real, but still bounded, deeper and steeper-walled cut instead
             // of the full ValleyDepth/ValleyHalfWidth; everything else gets
             // a gentle bank blend scaled to its own actual water width.
-            const double CarveHalfWidth = ComputeRiverCarveHalfWidth(Reach);
-            double CarveDepth = Reach.Depth;
-            double EdgeOffsetScale = 1.3;
+            const double BankTransition =
+                ComputeRiverBankTransitionWidth(Reach);
+            double CarveDepth = FMath::Clamp(
+                Reach.Depth * 0.55, 100.0, 700.0
+            );
+            double EdgeOffsetScale = 1.0;
             if (Reach.bIsCanyon)
             {
                 CarveDepth = FMath::Max(
                     Reach.Depth,
-                    FMath::Min(Reach.ValleyDepth, Reach.Depth * 4.0)
+                    FMath::Min(Reach.ValleyDepth, Reach.Depth * 2.0)
                 );
                 EdgeOffsetScale = 0.3;
             }
             ConfigureWaterTerrainSettings(
-                *River, false, CarveDepth, CarveHalfWidth, WaterTerrain, EdgeOffsetScale
+                *River, false, CarveDepth, BankTransition, WaterTerrain,
+                EdgeOffsetScale
             );
             AddNativeWaterModifier(
                 *River, *TargetMeshPartition, WaterPriorityLayer,
@@ -6342,17 +6403,17 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
                 RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
                 FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
             );
-        // Must cover the same extent as the actual terrain carve
-        // (ComputeRiverCarveHalfWidth), or the outer part of the carve's
-        // falloff ramp falls outside the finely-tessellated area and gets
-        // rendered by the coarse base terrain mesh instead - a faceted,
-        // terraced bank on any river wide enough for the two to diverge.
+        // Cover the wet channel and its bank transition. Otherwise the outer
+        // falloff ramp lands on the coarse base mesh and produces faceted,
+        // terraced banks.
+        const double CarveCoverageRadius =
+            River.Width * 0.5 + ComputeRiverBankTransitionWidth(River);
         const double CoverageRadius = River.bIsCanyon
             ? FMath::Min(
-                ComputeRiverCarveHalfWidth(River) + RefinementCoverageMargin,
+                CarveCoverageRadius + RefinementCoverageMargin,
                 RefinementMaximumCanyonRadius
             )
-            : ComputeRiverCarveHalfWidth(River) + RefinementCoverageMargin;
+            : CarveCoverageRadius + RefinementCoverageMargin;
         if (SpawnRefinementSpline(
             *World,
             FString::Printf(TEXT("Avenor_Strip_Refine_River_%03d"), Index + 1),
