@@ -3872,25 +3872,18 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(211.0, 883.0),
         4, 0.54, 2.07
     );
-    // Cold, high terrain earns a sharper, more jagged alpine crest (freeze-
-    // thaw and glacial carving keep ridgelines knife-edged); warm/moist
-    // mountains weather down to rounder, gentler summits instead. Arid
-    // terrain sharpens the same way for a different reason - thin soil and
-    // no vegetation expose bare, angular rock instead of the deep chemical
-    // weathering that rounds off a wet range. Combine both into one
-    // Harshness term rather than stacking two independent multipliers, so a
-    // cold-and-arid range doesn't get double-sharpened into something
-    // absurd. Otherwise every mountain range looked the same regardless of
-    // climate - only the biome colour changed, never the actual peak shape.
-    const double Coldness = bClimateEnabled
-        ? Smooth01(FMath::Clamp((0.45 - ClimateTemperature) / 0.42, 0.0, 1.0))
-        : 0.0;
-    const double Harshness = FMath::Max(Coldness, Aridity);
+    // Reverted: this session tried a climate-linked crest sharpener here
+    // (Coldness, then Coldness+Aridity as "Harshness") plus a secondary
+    // ridge/peak-detail layer further down. Neither fixed the reported
+    // straight, flat-sided, geometric-looking peaks, and one attempt (a
+    // second ridged-noise layer) made it visibly worse. Reverted both back
+    // to the original fixed formula rather than keep layering unproven
+    // changes on top of a problem that predates this session's edits.
     const double CrestShape = FMath::Clamp(
         0.88
-            + (CrestRidges - 0.50) * FMath::Lerp(0.11, 0.24, Harshness)
-            + (CrestVariation - 0.50) * FMath::Lerp(0.08, 0.18, Harshness),
-        0.70, 1.10
+            + (CrestRidges - 0.50) * 0.16
+            + (CrestVariation - 0.50) * 0.12,
+        0.76, 1.03
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -3978,47 +3971,18 @@ static double EvaluateLandform(
     const double MountainHeight = Smooth01(OutMountainMask);
     // Strong coherent uplift accelerates non-linearly so true mountain belts
     // can reach kilometre-scale relief without lifting quiet plains with them.
-    // A higher exponent concentrates that relief onto fewer, more isolated
-    // summits (sharp alpine peaks); a lower one spreads it into broader,
-    // more rounded massifs, matching the CrestShape climate split above.
-    const double MountainRelief = FMath::Pow(MountainHeight, FMath::Lerp(1.08, 1.34, Harshness));
+    const double MountainRelief = FMath::Pow(MountainHeight, 1.18);
     Height += MountainRelief * Relief
         * FMath::Lerp(0.72, 1.12, Activity)
         * FMath::Lerp(0.82, 1.72, MountainRelief)
         * CrestShape;
 
-    // Where a mountain exists at all is decided by BroadRange, a ridged-
-    // noise cusp (BeltA/BeltB); CrestShape only modulates that cusp's
-    // amplitude within a narrow band, it doesn't break its shape up. Since
-    // erosion (ApplyStreamPowerErosion/EvolveTerrainFromDrainage) only cuts
-    // narrow valley channels into the surface, not the broad crest, that
-    // smooth cusp survived almost intact as one big, flat-sided, knife-
-    // straight pyramidal fold with only river notches cut into it.
-    //
-    // A first attempt at fixing this added a second ridged-noise layer here
-    // for "secondary ridges" - wrong tool: ridged noise is built from a
-    // sharp |noise| cusp, so any two ridged layers combined tend to produce
-    // clean, straight, intersecting crease lines (a visible geometric "X")
-    // instead of organic roughness. Using only plain (non-ridged) Fbm here
-    // instead - it has no cusp to align into a crease no matter how it
-    // combines with the belt noise, only smooth, rounded, irregular bumps.
-    // Two octave sets at different wavelengths, both scaled by how
-    // mountainous the cell already is so lowlands are untouched.
-    const double PeakDetail = Fbm(
-        Warped, Scale * 0.045,
-        SeedOffset + FVector2D(1447.0, 331.0),
-        4, 0.55, 2.05
-    );
-    const double PeakDetailBroad = Fbm(
-        Warped, Scale * 0.11,
-        SeedOffset + FVector2D(2591.0, 733.0),
-        4, 0.55, 2.0
-    );
-    const double MountainRoughness = FMath::Clamp(MountainHeight * 1.15, 0.0, 1.0);
-    Height += MountainRoughness * Relief * (
-        PeakDetail * 0.095
-        + PeakDetailBroad * 0.10
-    );
+    // Reverted: two attempts this session (a ridged secondary-ridge layer,
+    // then a plain-Fbm replacement) tried adding extra height detail here
+    // to break up the mountain belt's smooth cross-section. Neither was
+    // confirmed to fix the reported straight, flat-sided peaks, and the
+    // first made it visibly worse (a geometric "X" crease). Removed rather
+    // than keep stacking unproven changes on this code path.
 
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
