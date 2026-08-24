@@ -2,6 +2,7 @@
 
 #include "AvenorTerrainData.h"
 
+#include "Algo/Reverse.h"
 #include "ActorFactories/ActorFactory.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Serialization/ArchiveLoadCompressedProxy.h"
@@ -635,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 28;
+static constexpr int32 GeneratorAlgorithmVersion = 29;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1708,6 +1709,89 @@ static void ComputeDepressionFillHeight(FAvenorStripData& Data)
     }
 }
 
+static int32 FillMinorDepressions(
+    FAvenorStripData& Data,
+    double MinimumLakeDepth
+)
+{
+    if (Data.DepressionFillHeight.Num() != Data.Height.Num())
+    {
+        return 0;
+    }
+    constexpr double DepressionThreshold = 50.0;
+    constexpr int32 MinimumLakeCells = 9;
+    TArray<bool> Candidate;
+    Candidate.Init(false, Data.Height.Num());
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        Candidate[Cell] =
+            Data.DepressionFillHeight[Cell] - Data.Height[Cell]
+            >= DepressionThreshold;
+    }
+
+    TArray<bool> Visited;
+    Visited.Init(false, Data.Height.Num());
+    constexpr int32 CardinalX[4] = {1, 0, -1, 0};
+    constexpr int32 CardinalY[4] = {0, 1, 0, -1};
+    int32 FilledComponents = 0;
+    for (int32 Seed = 0; Seed < Candidate.Num(); ++Seed)
+    {
+        if (!Candidate[Seed] || Visited[Seed])
+        {
+            continue;
+        }
+        TArray<int32> Component;
+        TArray<int32> Queue;
+        Queue.Add(Seed);
+        Visited[Seed] = true;
+        double MaximumDepth = 0.0;
+        for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+        {
+            const int32 Cell = Queue[QueueIndex];
+            Component.Add(Cell);
+            MaximumDepth = FMath::Max(
+                MaximumDepth,
+                Data.DepressionFillHeight[Cell] - Data.Height[Cell]
+            );
+            const int32 X = Cell % Data.Columns;
+            const int32 Y = Cell / Data.Columns;
+            for (int32 Direction = 0; Direction < 4; ++Direction)
+            {
+                const int32 NX = X + CardinalX[Direction];
+                const int32 NY = Y + CardinalY[Direction];
+                if (!Data.IsValid(NX, NY))
+                {
+                    continue;
+                }
+                const int32 Neighbor = Data.Index(NX, NY);
+                if (Candidate[Neighbor] && !Visited[Neighbor])
+                {
+                    Visited[Neighbor] = true;
+                    Queue.Add(Neighbor);
+                }
+            }
+        }
+
+        // Preserve depressions large and deep enough to become real lakes.
+        // Smaller pits are sub-grid/alluvial irregularities: retaining them
+        // forces priority-flood routing to climb their raw terrain rim, while
+        // turning each into a WaterBody produces the blocky pond artefacts we
+        // deliberately reject later. Fill those minor pits into the terrain
+        // before the final drainage graph is built.
+        if (Component.Num() >= MinimumLakeCells
+            && MaximumDepth >= MinimumLakeDepth)
+        {
+            continue;
+        }
+        for (int32 Cell : Component)
+        {
+            Data.Height[Cell] = Data.DepressionFillHeight[Cell];
+        }
+        ++FilledComponents;
+    }
+    return FilledComponents;
+}
+
 static int32 SteepestReceiver(const FAvenorStripData& Data, int32 X, int32 Y)
 {
     const int32 Cell = Data.Index(X, Y);
@@ -2641,12 +2725,128 @@ static void RebuildD8Accumulation(FAvenorStripData& Data)
     }
 }
 
+static bool FindAdjacentDownhillCapturePath(
+    const FAvenorStripData& Data,
+    const TArray<bool>& ExistingChannel,
+    const TArray<bool>& ReservedConnector,
+    int32 StartCell,
+    int32 TargetCell,
+    int32 SearchRadius,
+    TArray<int32>& OutPath
+)
+{
+    OutPath.Reset();
+    if (!Data.Height.IsValidIndex(StartCell)
+        || !Data.Height.IsValidIndex(TargetCell))
+    {
+        return false;
+    }
+
+    const int32 StartX = StartCell % Data.Columns;
+    const int32 StartY = StartCell / Data.Columns;
+    TArray<int32> Open;
+    TSet<int32> Closed;
+    TMap<int32, double> Cost;
+    TMap<int32, int32> Previous;
+    Open.Add(StartCell);
+    Cost.Add(StartCell, 0.0);
+
+    while (!Open.IsEmpty())
+    {
+        int32 BestOpenIndex = 0;
+        double BestOpenCost = TNumericLimits<double>::Max();
+        for (int32 OpenIndex = 0; OpenIndex < Open.Num(); ++OpenIndex)
+        {
+            const double CandidateCost = Cost.FindRef(Open[OpenIndex]);
+            if (CandidateCost < BestOpenCost)
+            {
+                BestOpenCost = CandidateCost;
+                BestOpenIndex = OpenIndex;
+            }
+        }
+        const int32 Cell = Open[BestOpenIndex];
+        Open.RemoveAtSwap(BestOpenIndex);
+        if (Cell == TargetCell)
+        {
+            int32 PathCell = TargetCell;
+            OutPath.Add(PathCell);
+            while (PathCell != StartCell)
+            {
+                const int32* Parent = Previous.Find(PathCell);
+                if (!Parent)
+                {
+                    OutPath.Reset();
+                    return false;
+                }
+                PathCell = *Parent;
+                OutPath.Add(PathCell);
+            }
+            Algo::Reverse(OutPath);
+            return OutPath.Num() >= 2;
+        }
+        if (Closed.Contains(Cell))
+        {
+            continue;
+        }
+        Closed.Add(Cell);
+        const int32 X = Cell % Data.Columns;
+        const int32 Y = Cell / Data.Columns;
+        for (int32 Direction = 0; Direction < 8; ++Direction)
+        {
+            const int32 NX = X + NeighborX[Direction];
+            const int32 NY = Y + NeighborY[Direction];
+            if (!Data.IsValid(NX, NY)
+                || FMath::Abs(NX - StartX) > SearchRadius
+                || FMath::Abs(NY - StartY) > SearchRadius)
+            {
+                continue;
+            }
+            const int32 Neighbor = Data.Index(NX, NY);
+            if (Closed.Contains(Neighbor)
+                || (Neighbor != TargetCell
+                    && ((ExistingChannel.IsValidIndex(Neighbor)
+                            && ExistingChannel[Neighbor])
+                        || (ReservedConnector.IsValidIndex(Neighbor)
+                            && ReservedConnector[Neighbor]))))
+            {
+                continue;
+            }
+            // A capture connector is still a river course, not a bridge. Each
+            // edge must be adjacent and non-rising on the actual terrain as
+            // well as strictly descending on the filled routing surface.
+            if (Data.FilledHeight[Neighbor] >= Data.FilledHeight[Cell]
+                || Data.Height[Neighbor] > Data.Height[Cell] + 0.01)
+            {
+                continue;
+            }
+            const double StepDistance =
+                NeighborX[Direction] != 0 && NeighborY[Direction] != 0
+                ? Data.CellSize * 1.4142135623730951
+                : Data.CellSize;
+            const double TerrainDrop = FMath::Max(
+                0.0, Data.Height[Cell] - Data.Height[Neighbor]
+            );
+            const double NewCost = BestOpenCost + StepDistance
+                / (1.0 + TerrainDrop / FMath::Max(1.0, Data.CellSize));
+            const double* ExistingCost = Cost.Find(Neighbor);
+            if (!ExistingCost || NewCost < *ExistingCost)
+            {
+                Cost.Add(Neighbor, NewCost);
+                Previous.Add(Neighbor, Cell);
+                Open.AddUnique(Neighbor);
+            }
+        }
+    }
+    return false;
+}
+
 // A small tributary can run parallel to a much larger, lower trunk because
 // D8 only examines the eight immediate neighbours. Over geomorphic time a
-// low, narrow divide in that situation is normally breached by headward
-// erosion (stream capture). Resolve only that conservative case: nearby,
-// substantially stronger lower channel, minor intervening rise, and never a
-// shortcut to the river's own existing downstream path.
+// low, narrow divide can be breached by headward erosion (stream capture),
+// but the captured river must still reach the trunk through adjacent,
+// downhill cells. The old implementation assigned a distant trunk cell as
+// the immediate receiver, creating a straight spline chord over intervening
+// hills. This version commits only a complete terrain-valid connector.
 static int32 CaptureNearbyDominantChannels(
     FAvenorStripData& Data,
     const TArray<bool>& Channel
@@ -2670,6 +2870,9 @@ static int32 CaptureNearbyDominantChannels(
     });
 
     constexpr int32 SearchRadius = 3;
+    constexpr int32 PathSearchRadius = SearchRadius + 1;
+    TArray<bool> ReservedConnector;
+    ReservedConnector.Init(false, Channel.Num());
     int32 CaptureCount = 0;
     for (int32 Cell : ChannelOrder)
     {
@@ -2679,9 +2882,9 @@ static int32 CaptureNearbyDominantChannels(
         {
             continue;
         }
-        const double CellHeight = Data.FilledHeight[Cell];
+        const double CellHeight = Data.Height[Cell];
         const double CellArea = Data.AccumulationD8[Cell];
-        int32 BestTarget = INDEX_NONE;
+        TArray<int32> BestPath;
         double BestScore = 0.0;
         for (int32 DY = -SearchRadius; DY <= SearchRadius; ++DY)
         {
@@ -2738,44 +2941,55 @@ static int32 CaptureNearbyDominantChannels(
                 const double Distance = FVector2D::Distance(
                     StartPosition, TargetPosition
                 );
-                const double Drop = CellHeight - Data.FilledHeight[Target];
+                const double Drop = CellHeight - Data.Height[Target];
                 if (Drop < FMath::Max(50.0, Distance * 0.004))
                 {
                     continue;
                 }
-                double MaximumBarrier = CellHeight;
-                constexpr int32 BarrierSamples = 6;
-                for (int32 Sample = 1; Sample < BarrierSamples; ++Sample)
-                {
-                    const double Alpha =
-                        static_cast<double>(Sample) / BarrierSamples;
-                    MaximumBarrier = FMath::Max(
-                        MaximumBarrier,
-                        Data.SampleGrid(
-                            Data.Height,
-                            FMath::Lerp(StartPosition, TargetPosition, Alpha)
-                        )
-                    );
-                }
-                const double AllowedBarrier = FMath::Max(
-                    100.0, Distance * 0.035
-                );
-                if (MaximumBarrier > CellHeight + AllowedBarrier)
+                TArray<int32> CandidatePath;
+                if (!FindAdjacentDownhillCapturePath(
+                    Data,
+                    Channel,
+                    ReservedConnector,
+                    Cell,
+                    Target,
+                    PathSearchRadius,
+                    CandidatePath))
                 {
                     continue;
                 }
-                const double Score = (Drop / FMath::Max(1.0, Distance))
+                double PathLength = 0.0;
+                for (int32 PathIndex = 1;
+                     PathIndex < CandidatePath.Num();
+                     ++PathIndex)
+                {
+                    PathLength += FVector2D::Distance(
+                        Data.CellPosition(CandidatePath[PathIndex - 1]),
+                        Data.CellPosition(CandidatePath[PathIndex])
+                    );
+                }
+                const double Score = (Drop / FMath::Max(1.0, PathLength))
                     * (1.0 + FMath::Loge(TargetArea / FMath::Max(0.001, CellArea)));
                 if (Score > BestScore)
                 {
                     BestScore = Score;
-                    BestTarget = Target;
+                    BestPath = MoveTemp(CandidatePath);
                 }
             }
         }
-        if (BestTarget != INDEX_NONE)
+        if (BestPath.Num() >= 2)
         {
-            Data.ReceiverD8[Cell] = BestTarget;
+            for (int32 PathIndex = 0;
+                 PathIndex + 1 < BestPath.Num();
+                 ++PathIndex)
+            {
+                Data.ReceiverD8[BestPath[PathIndex]] =
+                    BestPath[PathIndex + 1];
+                if (PathIndex > 0)
+                {
+                    ReservedConnector[BestPath[PathIndex]] = true;
+                }
+            }
             ++CaptureCount;
         }
     }
@@ -3036,8 +3250,16 @@ static void ExtractLakes(
             (0.58 - MeanMoisture) / 0.43, 0.0, 1.0
         ));
         const double EvaporationStress = HeatStress * DrynessStress;
+        // A closed basin carrying an authoritative river cannot simply be
+        // ignored because the climate is arid: doing so leaves the river to
+        // climb the spill rim. River-fed basins retain the base hydrological
+        // depth test; evaporation still limits optional lakes and should
+        // later influence their equilibrium shoreline, not invalidate the
+        // drainage topology.
         const double RequiredDepth = BaseRequiredDepth
-            * FMath::Lerp(1.0, 2.1, EvaporationStress);
+            * (CandidateBasin.bRiverTerminus
+                ? 1.0
+                : FMath::Lerp(1.0, 2.1, EvaporationStress));
         const double SupportedBasinArea = FMath::Max(
             Data.CellAreaSquareKilometres() * 4.0,
             CandidateBasin.CatchmentArea
@@ -3047,7 +3269,8 @@ static void ExtractLakes(
         if (AcceptedCount >= MaximumCount ||
             CandidateBasin.MaximumDepth < RequiredDepth ||
             BasinArea > SustainableMaximumLakeArea ||
-            BasinArea > SupportedBasinArea ||
+            (!CandidateBasin.bRiverTerminus
+                && BasinArea > SupportedBasinArea) ||
             AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
             continue;
@@ -5207,6 +5430,19 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Generator.ThermalErosionStrength * 0.32,
         Generator.TalusAngleDegrees, Generator.ErosionResistanceStrength
     );
+    ComputeDepressionFillHeight(*Data);
+    const int32 FilledMinorDepressions = FillMinorDepressions(
+        *Data, Generator.MinimumLakeDepth
+    );
+    if (FilledMinorDepressions > 0)
+    {
+        UE_LOG(
+            LogTemp,
+            Display,
+            TEXT("Avenor hydrology: %d minor non-lake depressions filled before final drainage routing."),
+            FilledMinorDepressions
+        );
+    }
     PriorityFlood(*Data, Generator.DrainageEpsilon);
     BuildContinuousFlow(*Data);
 
@@ -5246,7 +5482,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             UE_LOG(
                 LogTemp,
                 Display,
-                TEXT("Avenor hydrology: %d minor drainage divides breached by stream capture."),
+                TEXT("Avenor hydrology: %d tributaries captured through adjacent downhill connectors."),
                 StreamCaptureCount
             );
         }
@@ -5385,7 +5621,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b1")); }
+    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b2")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -5796,6 +6032,7 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
     FastPreviewMesh->SetVisibility(false);
     LastBuildStamp = TEXT("Never generated");
     BakedDataStatus = TEXT("No baked terrain data assigned");
+    LastRiverProjectionStatus = TEXT("River projection has not run");
     ResolveSettings();
 }
 
@@ -6560,6 +6797,12 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     }
     if (UphillRiverSegments > 0 || MissedRiverPoints > 0)
     {
+        LastRiverProjectionStatus = FString::Printf(
+            TEXT("%d snapped | %d misses | %d uphill"),
+            SnappedRiverPoints,
+            MissedRiverPoints,
+            UphillRiverSegments
+        );
         UE_LOG(
             LogTemp,
             Warning,
@@ -6571,6 +6814,10 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     }
     else
     {
+        LastRiverProjectionStatus = FString::Printf(
+            TEXT("%d snapped | 0 misses | 0 uphill"),
+            SnappedRiverPoints
+        );
         UE_LOG(
             LogTemp,
             Display,
@@ -6977,13 +7224,14 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
     const int32 GeneratedLakeCount = GeneratedData->Lakes.Num();
     BuildCompleteWorldFromCurrentData();
     LastBuildStamp = FString::Printf(
-        TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes"),
+        TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes | projection %s"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *BakedTerrainData.ToSoftObjectPath().ToString(),
         *BuildSettingsHash(),
         BakedTerrainData.LoadSynchronous() ? BakedTerrainData.LoadSynchronous()->Chunks.Num() : 0,
         GeneratedRiverCount,
-        GeneratedLakeCount
+        GeneratedLakeCount,
+        *LastRiverProjectionStatus
     );
     ReleaseCachedData();
 #endif
@@ -7023,12 +7271,13 @@ void AAvenorStripTerrainGenerator::BuildCompleteWorldFromCurrentData()
     // Rivers themselves remain modifier-free diagnostic surfaces.
     bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     LastBuildStamp = FString::Printf(
-        TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes | native water modifiers bound"),
+        TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes | projection %s | native water modifiers bound"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed,
         CachedData ? CachedData->Rivers.Num() : 0,
-        CachedData ? CachedData->Lakes.Num() : 0
+        CachedData ? CachedData->Lakes.Num() : 0,
+        *LastRiverProjectionStatus
     );
 #endif
 }
@@ -7105,10 +7354,11 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
         bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     }
     LastBuildStamp = FString::Printf(
-        TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes"),
+        TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes | projection %s"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         Data ? Data->Rivers.Num() : 0,
-        Data ? Data->Lakes.Num() : 0
+        Data ? Data->Lakes.Num() : 0,
+        *LastRiverProjectionStatus
     );
     ReleaseCachedData();
 #endif
@@ -7329,10 +7579,11 @@ void AAvenorStripTerrainGenerator::GenerateWater()
     BindModifiersAndRefresh(true);
 
     LastBuildStamp = FString::Printf(
-        TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes"),
+        TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes | projection %s"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
-        Seed, Data->Rivers.Num(), Data->Lakes.Num()
+        Seed, Data->Rivers.Num(), Data->Lakes.Num(),
+        *LastRiverProjectionStatus
     );
     UE_LOG(LogTemp, Display, TEXT("Avenor strip water generated: %s"), *LastBuildStamp);
     ReleaseCachedData();

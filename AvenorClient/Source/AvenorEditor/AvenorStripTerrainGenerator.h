@@ -301,6 +301,9 @@ public:
     UPROPERTY(VisibleAnywhere, Category = "Avenor|Status")
     FString BakedDataStatus;
 
+    UPROPERTY(VisibleAnywhere, Category = "Avenor|Status")
+    FString LastRiverProjectionStatus;
+
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
     bool bTerrainPlanReadyForWater = false;
 
