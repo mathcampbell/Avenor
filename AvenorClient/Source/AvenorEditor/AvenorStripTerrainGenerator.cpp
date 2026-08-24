@@ -415,15 +415,14 @@ static void AddBroadMeanders(
     TArray<FVector>& Points,
     double CellSize,
     double Strength,
-    const TArray<double>& LocalSuitability,
+    double LowlandFraction,
     double DischargeFraction,
     double ValleyFreedom,
     int32 Seed,
     const FBox& Bounds
 )
 {
-    if (Points.Num() < 4 || Strength <= 0.0
-        || LocalSuitability.Num() != Points.Num())
+    if (Points.Num() < 4 || Strength <= 0.0)
     {
         return;
     }
@@ -437,35 +436,27 @@ static void AddBroadMeanders(
         );
     }
     const double TotalLength = Lengths.Last();
-    if (TotalLength < CellSize * 4.0)
+    if (TotalLength < CellSize * 2.0)
     {
         return;
     }
 
+    const double Lowland = FMath::Clamp(LowlandFraction, 0.0, 1.0);
     const double Discharge = FMath::Clamp(DischargeFraction, 0.0, 1.0);
-    const double Freedom = FMath::Clamp(ValleyFreedom, 0.0, 1.0);
-    double MaximumSuitability = 0.0;
-    for (double Suitability : LocalSuitability)
-    {
-        MaximumSuitability = FMath::Max(
-            MaximumSuitability,
-            FMath::Clamp(Suitability, 0.0, 1.0)
-        );
-    }
-    if (MaximumSuitability < 0.05 || Freedom < 0.10)
+    const double Freedom = FMath::Clamp(ValleyFreedom, 0.20, 1.0);
+    if (Lowland < 0.04 || Freedom < 0.16)
     {
         return;
     }
 
     FRandomStream Random(Seed);
-    // Discharge controls the scale of a meander, while the point-local
-    // suitability below decides whether that section is free to meander at
-    // all. Large rivers therefore form broad bends; steep/source sections
-    // stay direct rather than inheriting a reach-wide minimum wiggle.
+    // Preserve some curvature even on short or partially constrained reaches.
+    // The underlying drainage graph is intentionally coarse; allowing the
+    // shaping amplitude to collapse to zero exposes its long straight chords.
     const double RawAmplitude = FMath::Min(
         TotalLength * 0.16,
         CellSize * FMath::Lerp(2.4, 5.5, Discharge)
-    ) * Strength * FMath::Lerp(0.35, 1.0, Discharge) * Freedom;
+    ) * Strength * Lowland * FMath::Lerp(0.75, 1.0, Discharge) * Freedom;
     const double Wavelength = Random.FRandRange(0.88, 1.16)
         * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;
     // The active channel can form a tight meander neck, but it must never
@@ -491,11 +482,7 @@ static void AddBroadMeanders(
             0.30 * FMath::Sin(
                 2.0 * PI * Distance / (Wavelength * 2.43) + PhaseB
             );
-        const double Suitability = FMath::Clamp(
-            LocalSuitability[Index], 0.0, 1.0
-        );
-        const FVector2D Offset =
-            Normal * Amplitude * Suitability * Fade * Wave;
+        const FVector2D Offset = Normal * Amplitude * Fade * Wave;
         Points[Index].X = FMath::Clamp(
             Points[Index].X + Offset.X,
             Bounds.Min.X + CellSize,
@@ -647,7 +634,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 21;
+static constexpr int32 GeneratorAlgorithmVersion = 22;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3817,44 +3804,24 @@ static void ExtractRivers(
         // scale on long reaches.
         Points = ChaikinSmooth(Points, false, 2);
         Points = ResamplePolyline(Points, Data.CellSize * 0.80, false);
-        // Meandering is an alluvial, low-gradient process. A 12-22% slope is
-        // not "less meandering" river country; it is a constrained mountain
-        // stream and should receive no synthetic lateral wave at all.
-        const double LowlandFraction = 1.0 - Smooth01(FMath::Clamp(
-            (MeanSlope - 0.006) / 0.050, 0.0, 1.0
-        ));
+        // Reduce lateral shaping continuously with slope, but retain enough
+        // curvature to hide the coarse drainage graph. A hard local gate
+        // exposed long D8-derived chords as an artificial transit map.
+        const double LowlandFraction = FMath::Clamp(
+            1.0 - MeanSlope / 0.22, 0.12, 1.0
+        );
         const double ValleyFreedom = FMath::Clamp(
             (1.0 - MeanResistance * 0.72)
                 * (1.0 - MeanMountain * 0.62),
-            0.0,
+            0.18,
             1.0
         );
-        TArray<double> LocalMeanderSuitability;
-        LocalMeanderSuitability.Reserve(Points.Num());
-        for (const FVector& Point : Points)
-        {
-            const FVector2D Position(Point);
-            const double LocalSlope = Data.SampleGrid(Data.Slope, Position);
-            const double Flatness = 1.0 - Smooth01(FMath::Clamp(
-                (LocalSlope - 0.004) / 0.042, 0.0, 1.0
-            ));
-            const double LocalArea = Data.SampleGrid(
-                Data.AccumulationD8, Position
-            );
-            const double LocalMaturity = Smooth01(FMath::Clamp(
-                (DrainageScaleAlpha(LocalArea, MainRiverArea) - 0.06) / 0.50,
-                0.0, 1.0
-            ));
-            LocalMeanderSuitability.Add(
-                Flatness * LocalMaturity * LowlandFraction
-            );
-        }
         const TArray<FVector> BaseMeanderPoints = Points;
         AddBroadMeanders(
             Points,
             Data.CellSize,
             MeanderStrength,
-            LocalMeanderSuitability,
+            LowlandFraction,
             RiverAlpha,
             ValleyFreedom,
             Seed ^ (ReachIndex * 0x45D9F3B),
