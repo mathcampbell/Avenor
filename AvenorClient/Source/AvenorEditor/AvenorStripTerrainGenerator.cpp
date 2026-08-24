@@ -10,6 +10,7 @@
 #include "Editor.h"
 #include "Engine/Blueprint.h"
 #include "Engine/Texture2D.h"
+#include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Modules/ModuleManager.h"
 #include "MeshPartition.h"
@@ -499,10 +500,6 @@ static void AddBroadMeanders(
 struct FRiverReach
 {
     TArray<FVector> Points;
-    // Transient generation topology. Shared start/end cells identify one
-    // hydraulic node even after each reach has been independently smoothed.
-    int32 StartCell = INDEX_NONE;
-    int32 EndCell = INDEX_NONE;
     double Width = 500.0;
     double Depth = 250.0;
     double ValleyHalfWidth = 15000.0;
@@ -638,7 +635,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 27;
+static constexpr int32 GeneratorAlgorithmVersion = 28;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3161,32 +3158,6 @@ static void ExtractLakes(
 
 namespace UE::Avenor::Strip
 {
-static void EnforceDownhill(TArray<FVector>& Points)
-{
-    if (Points.Num() < 2)
-    {
-        return;
-    }
-    // Preserve the terrain sample at every point unless it would make the
-    // river climb. A symmetric isotonic fit used to average local rises over
-    // whole reaches, lifting some water visibly above the final mesh. This
-    // one-sided lower envelope is the generated equivalent of projecting a
-    // spline onto the ground while retaining a strictly downstream profile:
-    // it can lower a point at a residual routing rise, but can never raise a
-    // point away from its sampled terrain surface.
-    constexpr double MinimumGradient = 0.0001;
-    for (int32 Index = 1; Index < Points.Num(); ++Index)
-    {
-        const double Distance = FVector2D::Distance(
-            FVector2D(Points[Index - 1]), FVector2D(Points[Index])
-        );
-        Points[Index].Z = FMath::Min(
-            Points[Index].Z,
-            Points[Index - 1].Z - Distance * MinimumGradient
-        );
-    }
-}
-
 static void ConstrainMeandersToValley(
     const FAvenorStripData& Data,
     const TArray<FVector>& BasePoints,
@@ -3524,40 +3495,6 @@ static bool FindClosestLakeShorePoint(
     return OutLakeIndex != INDEX_NONE;
 }
 
-static void BlendRiverEndpointToHeight(
-    TArray<FVector>& Points,
-    bool bAtStart,
-    double TargetHeight,
-    double ApproachLength
-)
-{
-    if (Points.Num() < 2)
-    {
-        return;
-    }
-    const int32 EndpointIndex = bAtStart ? 0 : Points.Num() - 1;
-    const double HeightDelta = TargetHeight - Points[EndpointIndex].Z;
-    double Distance = 0.0;
-    for (int32 Step = 0; Step < Points.Num(); ++Step)
-    {
-        const int32 Index = bAtStart ? Step : Points.Num() - 1 - Step;
-        if (Step > 0)
-        {
-            const int32 Previous = bAtStart ? Index - 1 : Index + 1;
-            Distance += FVector2D::Distance(
-                FVector2D(Points[Previous]), FVector2D(Points[Index])
-            );
-        }
-        if (Distance >= ApproachLength)
-        {
-            break;
-        }
-        const double Weight = Smooth01(1.0 - Distance / FMath::Max(1.0, ApproachLength));
-        Points[Index].Z += HeightDelta * Weight;
-    }
-    Points[EndpointIndex].Z = TargetHeight;
-}
-
 static void AnchorRiverToLakes(
     const FAvenorStripData& Data,
     TArray<FVector>& Points,
@@ -3568,78 +3505,11 @@ static void AnchorRiverToLakes(
     {
         return;
     }
-    constexpr double MinimumGradient = 0.0006;
     const bool bStartsAtLake = Data.Lakes.IsValidIndex(StartLakeIndex);
     const bool bEndsAtLake = Data.Lakes.IsValidIndex(EndLakeIndex);
-    const double ApproachLength = FMath::Max(Data.CellSize * 4.0, 40000.0);
-
-    if (bStartsAtLake)
-    {
-        BlendRiverEndpointToHeight(
-            Points, true, Data.Lakes[StartLakeIndex].SurfaceHeight, ApproachLength
-        );
-    }
-    if (bEndsAtLake)
-    {
-        BlendRiverEndpointToHeight(
-            Points, false, Data.Lakes[EndLakeIndex].SurfaceHeight, ApproachLength
-        );
-    }
-
-    if (bStartsAtLake && bEndsAtLake)
-    {
-        TArray<double> Distances;
-        Distances.SetNum(Points.Num());
-        Distances[0] = 0.0;
-        for (int32 Index = 1; Index < Points.Num(); ++Index)
-        {
-            Distances[Index] = Distances[Index - 1] + FVector2D::Distance(
-                FVector2D(Points[Index - 1]), FVector2D(Points[Index])
-            );
-        }
-        const double TotalLength = Distances.Last();
-        const double StartHeight = Data.Lakes[StartLakeIndex].SurfaceHeight;
-        const double EndHeight = Data.Lakes[EndLakeIndex].SurfaceHeight;
-        if (StartHeight >= EndHeight + TotalLength * MinimumGradient)
-        {
-            for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
-            {
-                const double HighestAllowed =
-                    StartHeight - Distances[Index] * MinimumGradient;
-                const double LowestAllowed =
-                    EndHeight + (TotalLength - Distances[Index]) * MinimumGradient;
-                Points[Index].Z = FMath::Clamp(
-                    Points[Index].Z, LowestAllowed, HighestAllowed
-                );
-            }
-        }
-        else
-        {
-            for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
-            {
-                const double Alpha = TotalLength > UE_DOUBLE_SMALL_NUMBER
-                    ? Distances[Index] / TotalLength : 0.0;
-                Points[Index].Z = FMath::Lerp(StartHeight, EndHeight, Alpha);
-            }
-        }
-    }
-    else if (bStartsAtLake)
-    {
-        EnforceDownhill(Points);
-    }
-    else if (bEndsAtLake)
-    {
-        for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
-        {
-            const double HorizontalDistance = FVector2D::Distance(
-                FVector2D(Points[Index]), FVector2D(Points[Index + 1])
-            );
-            Points[Index].Z = FMath::Max(
-                Points[Index].Z,
-                Points[Index + 1].Z + HorizontalDistance * MinimumGradient
-            );
-        }
-    }
+    // Only the exact shoreline endpoint owns the lake datum. Extending that
+    // height along an approach reach moved water away from the rendered land;
+    // every non-endpoint is now projected onto the finished terrain mesh.
     if (bStartsAtLake)
     {
         Points[0].Z = Data.Lakes[StartLakeIndex].SurfaceHeight;
@@ -3708,137 +3578,6 @@ static void AddLevelLakeJunctionPads(
             Points.Insert(Outside, ShoreIndex);
             Points.Add(Inside);
         }
-    }
-}
-
-struct FRiverEndpointReference
-{
-    int32 RiverIndex = INDEX_NONE;
-    bool bStart = false;
-};
-
-static void ApplyCompatibleSharedNodeHeights(
-    FRiverReach& River,
-    bool bFixStart,
-    double StartHeight,
-    bool bFixEnd,
-    double EndHeight
-)
-{
-    if (River.Points.Num() < 2)
-    {
-        return;
-    }
-    if (bFixStart)
-    {
-        River.Points[0].Z = StartHeight;
-    }
-    if (bFixEnd)
-    {
-        River.Points.Last().Z = EndHeight;
-    }
-}
-
-static void SynchronizeRiverJunctionHeights(FAvenorStripData& Data)
-{
-    TMap<int32, TArray<FRiverEndpointReference>> Nodes;
-    for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
-    {
-        const FRiverReach& River = Data.Rivers[RiverIndex];
-        if (Data.Height.IsValidIndex(River.StartCell)
-            && !Data.Lakes.IsValidIndex(River.StartLakeIndex))
-        {
-            FRiverEndpointReference Reference;
-            Reference.RiverIndex = RiverIndex;
-            Reference.bStart = true;
-            Nodes.FindOrAdd(River.StartCell).Add(Reference);
-        }
-        if (Data.Height.IsValidIndex(River.EndCell)
-            && !Data.Lakes.IsValidIndex(River.EndLakeIndex))
-        {
-            FRiverEndpointReference Reference;
-            Reference.RiverIndex = RiverIndex;
-            Reference.bStart = false;
-            Nodes.FindOrAdd(River.EndCell).Add(Reference);
-        }
-    }
-
-    TArray<bool> FixedStart;
-    TArray<bool> FixedEnd;
-    TArray<double> StartHeight;
-    TArray<double> EndHeight;
-    FixedStart.Init(false, Data.Rivers.Num());
-    FixedEnd.Init(false, Data.Rivers.Num());
-    StartHeight.Init(0.0, Data.Rivers.Num());
-    EndHeight.Init(0.0, Data.Rivers.Num());
-
-    for (const TPair<int32, TArray<FRiverEndpointReference>>& Pair : Nodes)
-    {
-        if (Pair.Value.Num() < 2)
-        {
-            continue;
-        }
-        // Choose one elevation that is compatible with the point immediately
-        // before every incoming reach and immediately after every outgoing
-        // reach. Merely sampling the terrain at the node can put the shared
-        // point above an incoming spline or below its downstream continuation
-        // after independent smoothing.
-        double MinimumHeight = -TNumericLimits<double>::Max();
-        double MaximumHeight = TNumericLimits<double>::Max();
-        for (const FRiverEndpointReference& Endpoint : Pair.Value)
-        {
-            const FRiverReach& River = Data.Rivers[Endpoint.RiverIndex];
-            if (River.Points.Num() < 2)
-            {
-                continue;
-            }
-            if (Endpoint.bStart)
-            {
-                MinimumHeight = FMath::Max(MinimumHeight, River.Points[1].Z);
-            }
-            else
-            {
-                MaximumHeight = FMath::Min(
-                    MaximumHeight, River.Points[River.Points.Num() - 2].Z
-                );
-            }
-        }
-        if (MinimumHeight > MaximumHeight)
-        {
-            // There is no single Z that can join these independently fitted
-            // reaches without making at least one of them climb. The previous
-            // fallback used FilledHeight and propagated it through the whole
-            // reach, which could lift kilometres of water off the terrain.
-            // Preserve the terrain-aligned profiles here; these rare nodes
-            // need graph-level constrained fitting, not a destructive local
-            // fallback.
-            continue;
-        }
-        const double NodeHeight = FMath::Clamp(
-            Data.Height[Pair.Key], MinimumHeight, MaximumHeight
-        );
-        for (const FRiverEndpointReference& Endpoint : Pair.Value)
-        {
-            if (Endpoint.bStart)
-            {
-                FixedStart[Endpoint.RiverIndex] = true;
-                StartHeight[Endpoint.RiverIndex] = NodeHeight;
-            }
-            else
-            {
-                FixedEnd[Endpoint.RiverIndex] = true;
-                EndHeight[Endpoint.RiverIndex] = NodeHeight;
-            }
-        }
-    }
-
-    for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
-    {
-        ApplyCompatibleSharedNodeHeights(
-            Data.Rivers[RiverIndex],
-            FixedStart[RiverIndex], StartHeight[RiverIndex],
-            FixedEnd[RiverIndex], EndHeight[RiverIndex]
-        );
     }
 }
 
@@ -4130,8 +3869,8 @@ static void ExtractRivers(
         // WaterSpline Z is a surface datum, while Data.Height is the final
         // ground surface. Keep the water only a few centimetres above that
         // sampled mesh to avoid coplanar flicker without creating a visible
-        // floating ribbon. EnforceDownhill may lower points where the routed
-        // terrain still contains a residual rise, but it never raises them.
+        // floating ribbon. The rendered-mesh raycast later replaces this
+        // analysis-grid estimate wherever collision data is available.
         constexpr double RiverSurfaceClearance = 35.0;
         for (FVector& Point : Points)
         {
@@ -4139,8 +3878,6 @@ static void ExtractRivers(
             Point.Z = Data.SampleGrid(Data.Height, Position)
                 + RiverSurfaceClearance;
         }
-        EnforceDownhill(Points);
-
         if (Data.Lakes.IsValidIndex(CandidateReach.StartLakeIndex))
         {
             int32 IgnoredLakeIndex = INDEX_NONE;
@@ -4167,8 +3904,6 @@ static void ExtractRivers(
         }
         FRiverReach River;
         River.Points = MoveTemp(Points);
-        River.StartCell = CandidateReach.Cells[0];
-        River.EndCell = CandidateReach.Cells.Last();
         River.DrainageArea = Area;
         River.StartLakeIndex = CandidateReach.StartLakeIndex;
         River.EndLakeIndex = CandidateReach.EndLakeIndex;
@@ -4249,15 +3984,11 @@ static void ExtractRivers(
             River.Points, SimplificationTolerance, false
         );
         CutOffSelfIntersections(River.Points);
-        EnforceDownhill(River.Points);
     }
 
-    // Reach fitting is deliberately local, but graph junctions are not. Give
-    // every confluence/breakpoint a single hydraulic Z before lake pads and
-    // final bounds are produced, then propagate that constraint into each
-    // adjoining reach.
-    SynchronizeRiverJunctionHeights(Data);
-
+    // Lake endpoints retain their authoritative common water datum. All other
+    // final river-point heights are projected onto the rendered terrain after
+    // Mesh Partition has completed its terrain/refinement refresh.
     for (FRiverReach& River : Data.Rivers)
     {
         AddLevelLakeJunctionPads(
@@ -5654,7 +5385,7 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b0")); }
+    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b1")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -5711,6 +5442,75 @@ static void ConfigureWaterSpline(
         }
     }
     Spline.UpdateSpline();
+}
+
+static int32 ProjectRiverSplineToRenderedTerrain(
+    UWorld& World,
+    UE::MeshPartition::AMeshPartition& MeshPartition,
+    TArray<FVector>& Points,
+    bool bKeepStartDatum,
+    bool bKeepEndDatum,
+    int32& OutMissedPoints,
+    int32& OutUphillSegments
+)
+{
+    constexpr double SurfaceClearance = 35.0;
+    constexpr double TraceHalfHeight = 5000000.0;
+    constexpr double UphillTolerance = 10.0;
+    int32 SnappedPoints = 0;
+    OutMissedPoints = 0;
+    OutUphillSegments = 0;
+
+    FCollisionObjectQueryParams ObjectQuery;
+    ObjectQuery.AddObjectTypesToQuery(ECC_WorldStatic);
+    FCollisionQueryParams QueryParams(
+        SCENE_QUERY_STAT(AvenorRiverTerrainProjection), true
+    );
+    TArray<FHitResult> Hits;
+    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    {
+        if ((Index == 0 && bKeepStartDatum)
+            || (Index + 1 == Points.Num() && bKeepEndDatum))
+        {
+            continue;
+        }
+        const FVector Start(
+            Points[Index].X, Points[Index].Y,
+            Points[Index].Z + TraceHalfHeight
+        );
+        const FVector End(
+            Points[Index].X, Points[Index].Y,
+            Points[Index].Z - TraceHalfHeight
+        );
+        Hits.Reset();
+        World.LineTraceMultiByObjectType(
+            Hits, Start, End, ObjectQuery, QueryParams
+        );
+        const FHitResult* TerrainHit = Hits.FindByPredicate(
+            [&](const FHitResult& Hit)
+            {
+                return Hit.GetActor() == &MeshPartition
+                    || (Hit.GetComponent()
+                        && Hit.GetComponent()->GetOwner() == &MeshPartition);
+            }
+        );
+        if (!TerrainHit)
+        {
+            ++OutMissedPoints;
+            continue;
+        }
+        Points[Index].Z = TerrainHit->ImpactPoint.Z + SurfaceClearance;
+        ++SnappedPoints;
+    }
+
+    for (int32 Index = 1; Index < Points.Num(); ++Index)
+    {
+        if (Points[Index].Z > Points[Index - 1].Z + UphillTolerance)
+        {
+            ++OutUphillSegments;
+        }
+    }
+    return SnappedPoints;
 }
 
 static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
@@ -6720,10 +6520,26 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             Lake->PostEditChange();
         }
     }
+    int32 SnappedRiverPoints = 0;
+    int32 MissedRiverPoints = 0;
+    int32 UphillRiverSegments = 0;
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
         const FRiverReach& Reach = Data->Rivers[Index];
         TArray<FVector> RiverPoints = ToWorldPoints(Reach.Points);
+        int32 ReachMisses = 0;
+        int32 ReachUphillSegments = 0;
+        SnappedRiverPoints += ProjectRiverSplineToRenderedTerrain(
+            *World,
+            *TargetMeshPartition,
+            RiverPoints,
+            Data->Lakes.IsValidIndex(Reach.StartLakeIndex),
+            Data->Lakes.IsValidIndex(Reach.EndLakeIndex),
+            ReachMisses,
+            ReachUphillSegments
+        );
+        MissedRiverPoints += ReachMisses;
+        UphillRiverSegments += ReachUphillSegments;
         if (AWaterBodyRiver* River = SpawnWaterActor<AWaterBodyRiver>(
             *World,
             FString::Printf(TEXT("Avenor_Strip_River_%03d"), Index + 1),
@@ -6741,6 +6557,26 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             // those source geometries are proven correct.
             River->PostEditChange();
         }
+    }
+    if (UphillRiverSegments > 0 || MissedRiverPoints > 0)
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Avenor river terrain projection: %d points snapped to rendered Mesh Partition, %d misses, %d uphill segments exposed."),
+            SnappedRiverPoints,
+            MissedRiverPoints,
+            UphillRiverSegments
+        );
+    }
+    else
+    {
+        UE_LOG(
+            LogTemp,
+            Display,
+            TEXT("Avenor river terrain projection: all %d points snapped to rendered Mesh Partition; no uphill segments."),
+            SnappedRiverPoints
+        );
     }
 #endif
 }
@@ -7168,16 +7004,23 @@ void AAvenorStripTerrainGenerator::BuildCompleteWorldFromCurrentData()
     {
         GenerateRefinementSplines();
     }
-    if (bTerrainPlanReadyForWater && bRefinementPlanReadyForWater)
-    {
-        CreateWaterActors(CachedData);
-    }
     bDeferMeshRefresh = false;
 
     if (!bTerrainPlanReadyForWater || !bRefinementPlanReadyForWater)
     {
         return;
     }
+    // First build the final terrain/refinement mesh. River water is projected
+    // against this rendered result, so creating it before this refresh would
+    // raycast against stale geometry from the previous generation.
+    bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+    if (!bRefinementPlanReadyForWater)
+    {
+        return;
+    }
+    CreateWaterActors(CachedData);
+    // A second refresh binds lake modifiers created with the water actors.
+    // Rivers themselves remain modifier-free diagnostic surfaces.
     bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     LastBuildStamp = FString::Printf(
         TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes | native water modifiers bound"),
@@ -7251,13 +7094,14 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
     ClearGeneratedWater();
     ClearGeneratedRefinementSplines();
     GenerateRefinementSplines();
-    if (bRefinementPlanReadyForWater)
-    {
-        CreateWaterActors(Data);
-    }
     bDeferMeshRefresh = false;
     if (bRefinementPlanReadyForWater)
     {
+        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+    }
+    if (bRefinementPlanReadyForWater)
+    {
+        CreateWaterActors(Data);
         bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     }
     LastBuildStamp = FString::Printf(
