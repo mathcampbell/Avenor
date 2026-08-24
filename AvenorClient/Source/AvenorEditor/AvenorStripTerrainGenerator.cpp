@@ -3974,6 +3974,34 @@ static double EvaluateLandform(
         * FMath::Lerp(0.82, 1.72, MountainRelief)
         * CrestShape;
 
+    // Where a mountain exists at all is decided by BroadRange, a ridged-
+    // noise cusp (BeltA/BeltB); CrestShape only modulates that cusp's
+    // amplitude within a narrow band, it doesn't break its shape up. Since
+    // erosion (ApplyStreamPowerErosion/EvolveTerrainFromDrainage) only cuts
+    // narrow valley channels into the surface, not the broad crest, that
+    // smooth cusp survived almost intact as one big, flat-sided, knife-
+    // straight pyramidal fold with only river notches cut into it - not a
+    // jagged range. Add real secondary structure at a wavelength well below
+    // the belt itself: minor spurs/subsidiary ridgelines plus irregular
+    // peak-to-peak bump, both scaled by how mountainous the cell already
+    // is so lowlands are untouched. This is what actually breaks a smooth
+    // wedge into something that reads as a mountain up close.
+    const double SecondaryRidges = RidgedFbm(
+        Warped, Scale * 0.085,
+        SeedOffset + FVector2D(2591.0, 733.0),
+        4
+    );
+    const double PeakDetail = Fbm(
+        Warped, Scale * 0.045,
+        SeedOffset + FVector2D(1447.0, 331.0),
+        4, 0.55, 2.05
+    );
+    const double MountainRoughness = FMath::Clamp(MountainHeight * 1.15, 0.0, 1.0);
+    Height += MountainRoughness * Relief * (
+        (SecondaryRidges - 0.42) * 0.16
+        + PeakDetail * 0.075
+    );
+
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
     // Wetter climates get a bit more small-scale bump amplitude (rolling,
