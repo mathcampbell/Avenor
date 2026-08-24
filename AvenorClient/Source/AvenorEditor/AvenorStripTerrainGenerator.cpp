@@ -645,7 +645,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 18;
+static constexpr int32 GeneratorAlgorithmVersion = 19;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2473,6 +2473,184 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
     return Channel;
 }
 
+static void RebuildD8Accumulation(FAvenorStripData& Data)
+{
+    const int32 CellCount = Data.Height.Num();
+    Data.AccumulationD8.SetNumUninitialized(CellCount);
+    const bool bHasRunoff = Data.Runoff.Num() == CellCount;
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        const double Runoff = bHasRunoff
+            ? FMath::Clamp(Data.Runoff[Cell], 0.05, 2.0)
+            : 1.0;
+        Data.AccumulationD8[Cell] =
+            Data.CellAreaSquareKilometres() * Runoff;
+    }
+    TArray<int32> Order;
+    Order.SetNumUninitialized(CellCount);
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        Order[Cell] = Cell;
+    }
+    Order.Sort([&](int32 A, int32 B)
+    {
+        return Data.FilledHeight[A] > Data.FilledHeight[B];
+    });
+    for (int32 Cell : Order)
+    {
+        const int32 Receiver = PrimaryReceiver(Data, Cell);
+        if (Receiver != INDEX_NONE && Data.AccumulationD8.IsValidIndex(Receiver))
+        {
+            Data.AccumulationD8[Receiver] += Data.AccumulationD8[Cell];
+        }
+    }
+}
+
+// A small tributary can run parallel to a much larger, lower trunk because
+// D8 only examines the eight immediate neighbours. Over geomorphic time a
+// low, narrow divide in that situation is normally breached by headward
+// erosion (stream capture). Resolve only that conservative case: nearby,
+// substantially stronger lower channel, minor intervening rise, and never a
+// shortcut to the river's own existing downstream path.
+static int32 CaptureNearbyDominantChannels(
+    FAvenorStripData& Data,
+    const TArray<bool>& Channel
+)
+{
+    if (Channel.Num() != Data.Height.Num())
+    {
+        return 0;
+    }
+    TArray<int32> ChannelOrder;
+    for (int32 Cell = 0; Cell < Channel.Num(); ++Cell)
+    {
+        if (Channel[Cell])
+        {
+            ChannelOrder.Add(Cell);
+        }
+    }
+    ChannelOrder.Sort([&](int32 A, int32 B)
+    {
+        return Data.AccumulationD8[A] > Data.AccumulationD8[B];
+    });
+
+    constexpr int32 SearchRadius = 3;
+    int32 CaptureCount = 0;
+    for (int32 Cell : ChannelOrder)
+    {
+        const int32 X = Cell % Data.Columns;
+        const int32 Y = Cell / Data.Columns;
+        if (Data.IsBoundary(X, Y))
+        {
+            continue;
+        }
+        const double CellHeight = Data.FilledHeight[Cell];
+        const double CellArea = Data.AccumulationD8[Cell];
+        int32 BestTarget = INDEX_NONE;
+        double BestScore = 0.0;
+        for (int32 DY = -SearchRadius; DY <= SearchRadius; ++DY)
+        {
+            for (int32 DX = -SearchRadius; DX <= SearchRadius; ++DX)
+            {
+                if ((DX == 0 && DY == 0)
+                    || DX * DX + DY * DY > SearchRadius * SearchRadius)
+                {
+                    continue;
+                }
+                const int32 NX = X + DX;
+                const int32 NY = Y + DY;
+                if (!Data.IsValid(NX, NY))
+                {
+                    continue;
+                }
+                const int32 Target = Data.Index(NX, NY);
+                if (!Channel[Target])
+                {
+                    continue;
+                }
+                const double TargetArea = Data.AccumulationD8[Target];
+                const double MinimumDominance = FMath::Max(
+                    CellArea * 1.20,
+                    CellArea + Data.CellAreaSquareKilometres() * 4.0
+                );
+                if (TargetArea < MinimumDominance)
+                {
+                    continue;
+                }
+
+                bool bAlreadyDownstream = false;
+                int32 Probe = Cell;
+                for (int32 Step = 0; Step < 24; ++Step)
+                {
+                    Probe = PrimaryReceiver(Data, Probe);
+                    if (Probe == INDEX_NONE)
+                    {
+                        break;
+                    }
+                    if (Probe == Target)
+                    {
+                        bAlreadyDownstream = true;
+                        break;
+                    }
+                }
+                if (bAlreadyDownstream)
+                {
+                    continue;
+                }
+
+                const FVector2D StartPosition = Data.CellPosition(Cell);
+                const FVector2D TargetPosition = Data.CellPosition(Target);
+                const double Distance = FVector2D::Distance(
+                    StartPosition, TargetPosition
+                );
+                const double Drop = CellHeight - Data.FilledHeight[Target];
+                if (Drop < FMath::Max(50.0, Distance * 0.004))
+                {
+                    continue;
+                }
+                double MaximumBarrier = CellHeight;
+                constexpr int32 BarrierSamples = 6;
+                for (int32 Sample = 1; Sample < BarrierSamples; ++Sample)
+                {
+                    const double Alpha =
+                        static_cast<double>(Sample) / BarrierSamples;
+                    MaximumBarrier = FMath::Max(
+                        MaximumBarrier,
+                        Data.SampleGrid(
+                            Data.Height,
+                            FMath::Lerp(StartPosition, TargetPosition, Alpha)
+                        )
+                    );
+                }
+                const double AllowedBarrier = FMath::Max(
+                    100.0, Distance * 0.035
+                );
+                if (MaximumBarrier > CellHeight + AllowedBarrier)
+                {
+                    continue;
+                }
+                const double Score = (Drop / FMath::Max(1.0, Distance))
+                    * (1.0 + FMath::Loge(TargetArea / FMath::Max(0.001, CellArea)));
+                if (Score > BestScore)
+                {
+                    BestScore = Score;
+                    BestTarget = Target;
+                }
+            }
+        }
+        if (BestTarget != INDEX_NONE)
+        {
+            Data.ReceiverD8[Cell] = BestTarget;
+            ++CaptureCount;
+        }
+    }
+    if (CaptureCount > 0)
+    {
+        RebuildD8Accumulation(Data);
+    }
+    return CaptureCount;
+}
+
 static TArray<int32> FindRiverFedBasinSeeds(
     const FAvenorStripData& Data,
     const TArray<bool>& Channel,
@@ -2680,13 +2858,44 @@ static void ExtractLakes(
         {
             continue;
         }
-        const double RequiredDepth = CandidateBasin.bRiverTerminus
+        const double BaseRequiredDepth = CandidateBasin.bRiverTerminus
             ? MinimumDepth
             : MinimumDepth * 1.5;
+        double MeanSlope = 0.0;
+        double MeanResistance = 0.0;
+        double MeanDesert = 0.0;
+        double MeanTemperature = 0.0;
+        double MeanMoisture = 0.0;
+        for (int32 Cell : CandidateBasin.Cells)
+        {
+            MeanSlope += Data.Slope.IsValidIndex(Cell) ? Data.Slope[Cell] : 0.0;
+            MeanResistance += Data.Resistance.IsValidIndex(Cell) ? Data.Resistance[Cell] : 0.0;
+            MeanDesert += Data.DesertMask.IsValidIndex(Cell) ? Data.DesertMask[Cell] : 0.0;
+            MeanTemperature += Data.MacroTemperature.IsValidIndex(Cell)
+                ? Data.MacroTemperature[Cell] : 0.5;
+            MeanMoisture += Data.MacroMoisture.IsValidIndex(Cell)
+                ? Data.MacroMoisture[Cell] : 0.5;
+        }
+        const double BasinCellCount = FMath::Max(1, CandidateBasin.Cells.Num());
+        MeanSlope /= BasinCellCount;
+        MeanResistance /= BasinCellCount;
+        MeanDesert /= BasinCellCount;
+        MeanTemperature /= BasinCellCount;
+        MeanMoisture /= BasinCellCount;
+        const double HeatStress = Smooth01(FMath::Clamp(
+            (MeanTemperature - 0.55) / 0.35, 0.0, 1.0
+        ));
+        const double DrynessStress = Smooth01(FMath::Clamp(
+            (0.58 - MeanMoisture) / 0.43, 0.0, 1.0
+        ));
+        const double EvaporationStress = HeatStress * DrynessStress;
+        const double RequiredDepth = BaseRequiredDepth
+            * FMath::Lerp(1.0, 2.1, EvaporationStress);
         const double SupportedBasinArea = FMath::Max(
             Data.CellAreaSquareKilometres() * 4.0,
             CandidateBasin.CatchmentArea
                 * (CandidateBasin.bRiverTerminus ? 0.42 : 0.22)
+                * FMath::Lerp(1.0, 0.30, EvaporationStress)
         );
         if (AcceptedCount >= MaximumCount ||
             CandidateBasin.MaximumDepth < RequiredDepth ||
@@ -2709,19 +2918,6 @@ static void ExtractLakes(
                 continue;
             }
 
-            double MeanSlope = 0.0;
-            double MeanResistance = 0.0;
-            double MeanDesert = 0.0;
-            for (int32 Cell : CandidateBasin.Cells)
-            {
-                MeanSlope += Data.Slope.IsValidIndex(Cell) ? Data.Slope[Cell] : 0.0;
-                MeanResistance += Data.Resistance.IsValidIndex(Cell) ? Data.Resistance[Cell] : 0.0;
-                MeanDesert += Data.DesertMask.IsValidIndex(Cell) ? Data.DesertMask[Cell] : 0.0;
-            }
-            const double Count = FMath::Max(1, CandidateBasin.Cells.Num());
-            MeanSlope /= Count;
-            MeanResistance /= Count;
-            MeanDesert /= Count;
             const bool bAridCanyonTrough =
                 MeanDesert > 0.38
                 && MeanResistance > 0.26
@@ -4873,6 +5069,30 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Data->RiverSeedCells, Data->RiverContinuationCells,
             Data->RejectedShortRiverSystems
         );
+        const int32 StreamCaptureCount = CaptureNearbyDominantChannels(
+            *Data, AuthoritativeRiverNetwork
+        );
+        if (StreamCaptureCount > 0)
+        {
+            // Receiver topology and D8 accumulation changed; rebuild the
+            // authoritative channel mask so every captured tributary follows
+            // its new trunk and widths use the combined downstream flow.
+            AuthoritativeRiverNetwork = BuildAuthoritativeRiverNetwork(
+                *Data,
+                Generator.MountainStreamStartArea,
+                Generator.LowlandStreamStartArea,
+                Generator.MinimumRiverSystemLength,
+                Data->RiverSeedCells,
+                Data->RiverContinuationCells,
+                Data->RejectedShortRiverSystems
+            );
+            UE_LOG(
+                LogTemp,
+                Display,
+                TEXT("Avenor hydrology: %d minor drainage divides breached by stream capture."),
+                StreamCaptureCount
+            );
+        }
         for (bool bChannelCell : AuthoritativeRiverNetwork)
         {
             Data->AuthoritativeRiverCells += bChannelCell ? 1 : 0;
@@ -5126,8 +5346,15 @@ static void ConfigureWaterTerrainSettings(
     // EdgeOffsetScale narrows the flat dry-bank shelf before the falloff ramp
     // for steep-sided reaches (canyons), so the water meets the carved walls
     // almost directly instead of sitting behind a floodplain-width shelf.
-    const double DryBankWidth = FMath::Max(0.0, Settings.DryBankWidth)
-        * FMath::Clamp(EdgeOffsetScale, 0.2, 1.5);
+    // A dry edge-offset shelf is useful around a level lake, but on a river
+    // it can raise/preserve a continuous levee after hydrology has already
+    // chosen its route. That is the visible divider in the parallel
+    // "highway river" case. Ordinary river modifiers should only cut the wet
+    // channel and blend outward from its edge.
+    const double DryBankWidth = bLake
+        ? FMath::Max(0.0, Settings.DryBankWidth)
+            * FMath::Clamp(EdgeOffsetScale, 0.2, 1.5)
+        : 0.0;
 
     FWaterCurveSettings& Curve = const_cast<FWaterCurveSettings&>(
         Water.GetWaterCurveSettings()
@@ -5140,7 +5367,12 @@ static void ConfigureWaterTerrainSettings(
     FWaterBodyHeightmapSettings& Heightmap = const_cast<FWaterBodyHeightmapSettings&>(
         Water.GetWaterHeightmapSettings()
     );
-    Heightmap.BlendMode = EWaterBrushBlendType::AlphaBlend;
+    // Never let a river brush raise terrain above the solved base height.
+    // Lakes retain alpha blending because their level shore/basin transition
+    // deliberately needs to meet one common water surface.
+    Heightmap.BlendMode = bLake
+        ? EWaterBrushBlendType::AlphaBlend
+        : EWaterBrushBlendType::Min;
     Heightmap.FalloffSettings.FalloffMode = EWaterBrushFalloffMode::Width;
     Heightmap.FalloffSettings.FalloffWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
     Heightmap.FalloffSettings.EdgeOffset = static_cast<float>(DryBankWidth);
