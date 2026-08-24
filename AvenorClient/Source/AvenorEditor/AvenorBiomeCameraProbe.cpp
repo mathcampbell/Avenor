@@ -138,11 +138,15 @@ static const TCHAR* TemperatureLabel(double Value)
     return TEXT("Hot");
 }
 
+// Must match the actual classifier's bMoist = (Moisture >= 0.5) cutoff
+// (AvenorStripTerrainGenerator.cpp's ClassifyBaseBiome/RefineClimateFrom
+// Hydrology) - this used to bucket at 0.33/0.66, so a value like 0.41 could
+// display as "Moist" here while the real Biome it was building was "Dry",
+// making the probe look self-contradictory even when the classification
+// itself was correct.
 static const TCHAR* MoistureLabel(double Value)
 {
-    if (Value < 0.33) return TEXT("Dry");
-    if (Value < 0.66) return TEXT("Moist");
-    return TEXT("Wet");
+    return Value >= 0.5 ? TEXT("Moist") : TEXT("Dry");
 }
 
 static const TCHAR* ClassifyFinalLandform(const FAvenorTerrainSample& Centre)
@@ -292,7 +296,7 @@ private:
                 const double LocalTemperature = Climate->B / 255.0;
                 const double LocalMoisture = Climate->A / 255.0;
                 Status = FString::Printf(
-                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nLandform: %s   Elevation: %s%s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
+                    TEXT("AVENOR LOCATION PROBE\nBiome: %s%s   Base: %s\nRegional: %s / %s   T %.2f  M %.2f\nLocal: %s / %s   T %.2f  M %.2f\nShaping masks: Mountain %.2f  Hill %.2f  Desert %.2f  Slope %.3f\nLandform: %s   Elevation: %s%s   Drainage: %s\nWorld: X %.2f km   Y %.2f km"),
                     *BiomeName(FinalBiome),
                     bHasLocalOverride ? TEXT(" (local override)") : TEXT(""),
                     *BiomeName(BaseBiome),
@@ -300,6 +304,10 @@ private:
                     MacroTemperature, MacroMoisture,
                     TemperatureLabel(LocalTemperature), MoistureLabel(LocalMoisture),
                     LocalTemperature, LocalMoisture,
+                    bTerrain ? Terrain.Mountain : 0.0f,
+                    bTerrain ? Terrain.Hill : 0.0f,
+                    bTerrain ? Terrain.Desert : 0.0f,
+                    bTerrain ? Terrain.Slope : 0.0f,
                     bTerrain ? ClassifyFinalLandform(Terrain) : TEXT("Unknown"),
                     bTerrain ? *FString::Printf(TEXT("%.0f m"), FinalHeight / 100.0f) : TEXT("n/a"),
                     bWaterAffected ? TEXT(" (water)") : TEXT(""),
