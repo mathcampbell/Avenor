@@ -638,7 +638,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 25;
+static constexpr int32 GeneratorAlgorithmVersion = 26;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -3761,7 +3761,7 @@ struct FRiverEndpointReference
     bool bStart = false;
 };
 
-static void EnforceReachFromSharedNodes(
+static void ApplyCompatibleSharedNodeHeights(
     FRiverReach& River,
     bool bFixStart,
     double StartHeight,
@@ -3772,42 +3772,6 @@ static void EnforceReachFromSharedNodes(
     if (River.Points.Num() < 2)
     {
         return;
-    }
-    if (bFixStart)
-    {
-        River.Points[0].Z = StartHeight;
-        const int32 LastForward = bFixEnd
-            ? River.Points.Num() - 2 : River.Points.Num() - 1;
-        for (int32 Index = 1; Index <= LastForward; ++Index)
-        {
-            River.Points[Index].Z = FMath::Min(
-                River.Points[Index].Z, River.Points[Index - 1].Z
-            );
-        }
-    }
-    if (bFixEnd)
-    {
-        River.Points.Last().Z = EndHeight;
-        const int32 FirstBackward = bFixStart ? 1 : 0;
-        for (int32 Index = River.Points.Num() - 2;
-             Index >= FirstBackward; --Index)
-        {
-            River.Points[Index].Z = FMath::Max(
-                River.Points[Index].Z, River.Points[Index + 1].Z
-            );
-        }
-    }
-    if (bFixStart && bFixEnd)
-    {
-        // A valid receiver graph guarantees the upstream node is no lower
-        // than the downstream node. Re-cap after the backward pass so a
-        // corrected interior point cannot rise above its upstream neighbour.
-        for (int32 Index = 1; Index + 1 < River.Points.Num(); ++Index)
-        {
-            River.Points[Index].Z = FMath::Min(
-                River.Points[Index].Z, River.Points[Index - 1].Z
-            );
-        }
     }
     if (bFixStart)
     {
@@ -3883,19 +3847,20 @@ static void SynchronizeRiverJunctionHeights(FAvenorStripData& Data)
                 );
             }
         }
-        double NodeHeight = Data.Height[Pair.Key];
-        if (MinimumHeight <= MaximumHeight)
+        if (MinimumHeight > MaximumHeight)
         {
-            NodeHeight = FMath::Clamp(
-                NodeHeight, MinimumHeight, MaximumHeight
-            );
+            // There is no single Z that can join these independently fitted
+            // reaches without making at least one of them climb. The previous
+            // fallback used FilledHeight and propagated it through the whole
+            // reach, which could lift kilometres of water off the terrain.
+            // Preserve the terrain-aligned profiles here; these rare nodes
+            // need graph-level constrained fitting, not a destructive local
+            // fallback.
+            continue;
         }
-        else if (Data.FilledHeight.IsValidIndex(Pair.Key))
-        {
-            // The routing surface is the authoritative hydraulic elevation
-            // when independently refined reaches leave incompatible bounds.
-            NodeHeight = Data.FilledHeight[Pair.Key];
-        }
+        const double NodeHeight = FMath::Clamp(
+            Data.Height[Pair.Key], MinimumHeight, MaximumHeight
+        );
         for (const FRiverEndpointReference& Endpoint : Pair.Value)
         {
             if (Endpoint.bStart)
@@ -3913,7 +3878,7 @@ static void SynchronizeRiverJunctionHeights(FAvenorStripData& Data)
 
     for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
     {
-        EnforceReachFromSharedNodes(
+        ApplyCompatibleSharedNodeHeights(
             Data.Rivers[RiverIndex],
             FixedStart[RiverIndex], StartHeight[RiverIndex],
             FixedEnd[RiverIndex], EndHeight[RiverIndex]
