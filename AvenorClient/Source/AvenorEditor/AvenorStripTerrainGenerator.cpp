@@ -3980,26 +3980,31 @@ static double EvaluateLandform(
     // erosion (ApplyStreamPowerErosion/EvolveTerrainFromDrainage) only cuts
     // narrow valley channels into the surface, not the broad crest, that
     // smooth cusp survived almost intact as one big, flat-sided, knife-
-    // straight pyramidal fold with only river notches cut into it - not a
-    // jagged range. Add real secondary structure at a wavelength well below
-    // the belt itself: minor spurs/subsidiary ridgelines plus irregular
-    // peak-to-peak bump, both scaled by how mountainous the cell already
-    // is so lowlands are untouched. This is what actually breaks a smooth
-    // wedge into something that reads as a mountain up close.
-    const double SecondaryRidges = RidgedFbm(
-        Warped, Scale * 0.085,
-        SeedOffset + FVector2D(2591.0, 733.0),
-        4
-    );
+    // straight pyramidal fold with only river notches cut into it.
+    //
+    // A first attempt at fixing this added a second ridged-noise layer here
+    // for "secondary ridges" - wrong tool: ridged noise is built from a
+    // sharp |noise| cusp, so any two ridged layers combined tend to produce
+    // clean, straight, intersecting crease lines (a visible geometric "X")
+    // instead of organic roughness. Using only plain (non-ridged) Fbm here
+    // instead - it has no cusp to align into a crease no matter how it
+    // combines with the belt noise, only smooth, rounded, irregular bumps.
+    // Two octave sets at different wavelengths, both scaled by how
+    // mountainous the cell already is so lowlands are untouched.
     const double PeakDetail = Fbm(
         Warped, Scale * 0.045,
         SeedOffset + FVector2D(1447.0, 331.0),
         4, 0.55, 2.05
     );
+    const double PeakDetailBroad = Fbm(
+        Warped, Scale * 0.11,
+        SeedOffset + FVector2D(2591.0, 733.0),
+        4, 0.55, 2.0
+    );
     const double MountainRoughness = FMath::Clamp(MountainHeight * 1.15, 0.0, 1.0);
     Height += MountainRoughness * Relief * (
-        (SecondaryRidges - 0.42) * 0.16
-        + PeakDetail * 0.075
+        PeakDetail * 0.095
+        + PeakDetailBroad * 0.10
     );
 
     Height += FoothillEnvelope * Relief * 0.18
