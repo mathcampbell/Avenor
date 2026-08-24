@@ -634,7 +634,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 22;
+static constexpr int32 GeneratorAlgorithmVersion = 23;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -4407,15 +4407,29 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    const double MountainHeight = Smooth01(OutMountainMask);
-    // Preserve kilometre-scale relief without the self-amplifying term that
-    // turned every small mask fluctuation into a large bump and pushed strong
-    // crests toward the same ceiling.
-    const double MountainRelief = FMath::Pow(MountainHeight, 1.16);
-    Height += MountainRelief * Relief
-        * FMath::Lerp(0.62, 1.02, Activity)
-        * FMath::Lerp(0.90, 1.10, CrestVariation)
-        * CrestShape;
+    // The broad range mask deliberately saturates so it can describe one
+    // coherent mountain massif. It must not also be the summit height field:
+    // once BroadRange reached 1, unrelated crests all received effectively
+    // the same elevation and erosion could only round that artificial
+    // ceiling. Keep the envelope for the mountain mass, but derive summit
+    // relief from the unsaturated portion of BeltSignal. Only a BeltSignal of
+    // 1 reaches the summit field's maximum, rather than everything above the
+    // broad-mask threshold being flattened to the same value.
+    const double MountainEnvelope = FMath::Pow(
+        FMath::Clamp(OutMountainMask, 0.0, 1.0), 1.22
+    );
+    const double SummitCore = FMath::Pow(
+        FMath::Clamp((BeltSignal - 0.38) / 0.62, 0.0, 1.0), 2.4
+    ) * FMath::Lerp(0.45, 1.0, MountainProvince)
+      * FMath::Lerp(0.60, 1.0, PositiveUplift);
+    const double SummitBreakup =
+        FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
+        * FMath::Lerp(0.78, 1.22, CrestVariation);
+    const double ActivityScale = FMath::Lerp(0.62, 1.02, Activity);
+    Height += Relief * ActivityScale * (
+        MountainEnvelope * 0.62 * CrestShape
+        + SummitCore * 0.38 * SummitBreakup
+    );
 
     // Reverted: two attempts this session (a ridged secondary-ridge layer,
     // then a plain-Fbm replacement) tried adding extra height detail here
