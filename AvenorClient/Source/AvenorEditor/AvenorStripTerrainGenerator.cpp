@@ -499,6 +499,10 @@ static void AddBroadMeanders(
 struct FRiverReach
 {
     TArray<FVector> Points;
+    // Transient generation topology. Shared start/end cells identify one
+    // hydraulic node even after each reach has been independently smoothed.
+    int32 StartCell = INDEX_NONE;
+    int32 EndCell = INDEX_NONE;
     double Width = 500.0;
     double Depth = 250.0;
     double ValleyHalfWidth = 15000.0;
@@ -634,7 +638,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 24;
+static constexpr int32 GeneratorAlgorithmVersion = 25;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2076,7 +2080,15 @@ static void ApplyStreamPowerErosion(
                 ? FMath::Clamp(
                     Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
                 ) : 1.0;
-            Delta[Cell] = FMath::Min(Data.CellSize * 2.5, Strength * 520.0 * AreaFactor * SlopeFactor) *
+            // This is pre-water geomorphic incision, not the visible channel
+            // modifier. The previous 2.5-cell cap could excavate a narrow
+            // 62.5m slot per pass at 25m analysis spacing. Keep a modest
+            // channel seed for the later broad-valley evolution to amplify,
+            // rather than cutting a finished gorge into one grid cell.
+            Delta[Cell] = FMath::Min(
+                Data.CellSize * 0.32,
+                Strength * 180.0 * AreaFactor * SlopeFactor
+            ) *
                 (1.0 - LocalResistance) * D8Dominance;
         }
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
@@ -3743,6 +3755,172 @@ static void AddLevelLakeJunctionPads(
     }
 }
 
+struct FRiverEndpointReference
+{
+    int32 RiverIndex = INDEX_NONE;
+    bool bStart = false;
+};
+
+static void EnforceReachFromSharedNodes(
+    FRiverReach& River,
+    bool bFixStart,
+    double StartHeight,
+    bool bFixEnd,
+    double EndHeight
+)
+{
+    if (River.Points.Num() < 2)
+    {
+        return;
+    }
+    if (bFixStart)
+    {
+        River.Points[0].Z = StartHeight;
+        const int32 LastForward = bFixEnd
+            ? River.Points.Num() - 2 : River.Points.Num() - 1;
+        for (int32 Index = 1; Index <= LastForward; ++Index)
+        {
+            River.Points[Index].Z = FMath::Min(
+                River.Points[Index].Z, River.Points[Index - 1].Z
+            );
+        }
+    }
+    if (bFixEnd)
+    {
+        River.Points.Last().Z = EndHeight;
+        const int32 FirstBackward = bFixStart ? 1 : 0;
+        for (int32 Index = River.Points.Num() - 2;
+             Index >= FirstBackward; --Index)
+        {
+            River.Points[Index].Z = FMath::Max(
+                River.Points[Index].Z, River.Points[Index + 1].Z
+            );
+        }
+    }
+    if (bFixStart && bFixEnd)
+    {
+        // A valid receiver graph guarantees the upstream node is no lower
+        // than the downstream node. Re-cap after the backward pass so a
+        // corrected interior point cannot rise above its upstream neighbour.
+        for (int32 Index = 1; Index + 1 < River.Points.Num(); ++Index)
+        {
+            River.Points[Index].Z = FMath::Min(
+                River.Points[Index].Z, River.Points[Index - 1].Z
+            );
+        }
+    }
+    if (bFixStart)
+    {
+        River.Points[0].Z = StartHeight;
+    }
+    if (bFixEnd)
+    {
+        River.Points.Last().Z = EndHeight;
+    }
+}
+
+static void SynchronizeRiverJunctionHeights(FAvenorStripData& Data)
+{
+    TMap<int32, TArray<FRiverEndpointReference>> Nodes;
+    for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
+    {
+        const FRiverReach& River = Data.Rivers[RiverIndex];
+        if (Data.Height.IsValidIndex(River.StartCell)
+            && !Data.Lakes.IsValidIndex(River.StartLakeIndex))
+        {
+            FRiverEndpointReference Reference;
+            Reference.RiverIndex = RiverIndex;
+            Reference.bStart = true;
+            Nodes.FindOrAdd(River.StartCell).Add(Reference);
+        }
+        if (Data.Height.IsValidIndex(River.EndCell)
+            && !Data.Lakes.IsValidIndex(River.EndLakeIndex))
+        {
+            FRiverEndpointReference Reference;
+            Reference.RiverIndex = RiverIndex;
+            Reference.bStart = false;
+            Nodes.FindOrAdd(River.EndCell).Add(Reference);
+        }
+    }
+
+    TArray<bool> FixedStart;
+    TArray<bool> FixedEnd;
+    TArray<double> StartHeight;
+    TArray<double> EndHeight;
+    FixedStart.Init(false, Data.Rivers.Num());
+    FixedEnd.Init(false, Data.Rivers.Num());
+    StartHeight.Init(0.0, Data.Rivers.Num());
+    EndHeight.Init(0.0, Data.Rivers.Num());
+
+    for (const TPair<int32, TArray<FRiverEndpointReference>>& Pair : Nodes)
+    {
+        if (Pair.Value.Num() < 2)
+        {
+            continue;
+        }
+        // Choose one elevation that is compatible with the point immediately
+        // before every incoming reach and immediately after every outgoing
+        // reach. Merely sampling the terrain at the node can put the shared
+        // point above an incoming spline or below its downstream continuation
+        // after independent smoothing.
+        double MinimumHeight = -TNumericLimits<double>::Max();
+        double MaximumHeight = TNumericLimits<double>::Max();
+        for (const FRiverEndpointReference& Endpoint : Pair.Value)
+        {
+            const FRiverReach& River = Data.Rivers[Endpoint.RiverIndex];
+            if (River.Points.Num() < 2)
+            {
+                continue;
+            }
+            if (Endpoint.bStart)
+            {
+                MinimumHeight = FMath::Max(MinimumHeight, River.Points[1].Z);
+            }
+            else
+            {
+                MaximumHeight = FMath::Min(
+                    MaximumHeight, River.Points[River.Points.Num() - 2].Z
+                );
+            }
+        }
+        double NodeHeight = Data.Height[Pair.Key];
+        if (MinimumHeight <= MaximumHeight)
+        {
+            NodeHeight = FMath::Clamp(
+                NodeHeight, MinimumHeight, MaximumHeight
+            );
+        }
+        else if (Data.FilledHeight.IsValidIndex(Pair.Key))
+        {
+            // The routing surface is the authoritative hydraulic elevation
+            // when independently refined reaches leave incompatible bounds.
+            NodeHeight = Data.FilledHeight[Pair.Key];
+        }
+        for (const FRiverEndpointReference& Endpoint : Pair.Value)
+        {
+            if (Endpoint.bStart)
+            {
+                FixedStart[Endpoint.RiverIndex] = true;
+                StartHeight[Endpoint.RiverIndex] = NodeHeight;
+            }
+            else
+            {
+                FixedEnd[Endpoint.RiverIndex] = true;
+                EndHeight[Endpoint.RiverIndex] = NodeHeight;
+            }
+        }
+    }
+
+    for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
+    {
+        EnforceReachFromSharedNodes(
+            Data.Rivers[RiverIndex],
+            FixedStart[RiverIndex], StartHeight[RiverIndex],
+            FixedEnd[RiverIndex], EndHeight[RiverIndex]
+        );
+    }
+}
+
 static void ExtractRivers(
     FAvenorStripData& Data,
     const TArray<bool>& AuthoritativeChannel,
@@ -4061,6 +4239,8 @@ static void ExtractRivers(
         }
         FRiverReach River;
         River.Points = MoveTemp(Points);
+        River.StartCell = CandidateReach.Cells[0];
+        River.EndCell = CandidateReach.Cells.Last();
         River.DrainageArea = Area;
         River.StartLakeIndex = CandidateReach.StartLakeIndex;
         River.EndLakeIndex = CandidateReach.EndLakeIndex;
@@ -4142,6 +4322,16 @@ static void ExtractRivers(
         );
         CutOffSelfIntersections(River.Points);
         EnforceDownhill(River.Points);
+    }
+
+    // Reach fitting is deliberately local, but graph junctions are not. Give
+    // every confluence/breakpoint a single hydraulic Z before lake pads and
+    // final bounds are produced, then propagate that constraint into each
+    // adjoining reach.
+    SynchronizeRiverJunctionHeights(Data);
+
+    for (FRiverReach& River : Data.Rivers)
+    {
         AddLevelLakeJunctionPads(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
