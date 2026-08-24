@@ -645,7 +645,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 17;
+static constexpr int32 GeneratorAlgorithmVersion = 18;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -975,7 +975,7 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
     Masks.Lakeshore.Init(0.0, CellCount);
 
     const double EffectiveRiverBankWidth = FMath::Max(
-        Data.CellSize, RiverBankWidth
+        Data.CellSize * 0.35, RiverBankWidth
     );
     const double MaximumRiverBankWidth = EffectiveRiverBankWidth * 1.75;
     for (const FRiverReach& River : Data.Rivers)
@@ -990,7 +990,7 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
             Bounds += FVector2D(Point);
         }
         const double HalfWidth = FMath::Max(
-            Data.CellSize * 0.55,
+            Data.CellSize * 0.28,
             FMath::Max(100.0, River.Width * 0.5)
         );
         const FIntRect Cells = BoundsToCellRect(
@@ -1030,7 +1030,7 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
                     1.0
                 ));
                 const double LocalBankWidth = FMath::Max(
-                    Data.CellSize * 0.65,
+                    Data.CellSize * 0.30,
                     EffectiveRiverBankWidth
                         * FMath::Lerp(1.65, 0.32, SlopeAlpha)
                 );
@@ -1059,11 +1059,11 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
             Bounds += FVector2D(Point);
         }
         const double ShoreWidth = FMath::Max(
-            Data.CellSize, Lake.BankBlendWidth
+            Data.CellSize * 0.35, Lake.BankBlendWidth
         );
         const double MaximumShoreWidth = ShoreWidth * 1.8;
         const double BedRamp = FMath::Max(
-            Data.CellSize, Lake.DepthRampWidth
+            Data.CellSize * 0.35, Lake.DepthRampWidth
         );
         const FIntRect Cells = BoundsToCellRect(
             Data, Bounds.ExpandBy(MaximumShoreWidth)
@@ -1090,7 +1090,7 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
                     1.0
                 ));
                 const double LocalShoreWidth = FMath::Max(
-                    Data.CellSize * 0.65,
+                    Data.CellSize * 0.30,
                     ShoreWidth * FMath::Lerp(1.75, 0.28, SlopeAlpha)
                 );
                 if (EdgeDistance <= LocalShoreWidth)
@@ -2268,21 +2268,22 @@ static TArray<FVector> TraceComponentBoundary(
             FVector2D(Boundary[(Index + 1) % Boundary.Num()])
         );
     }
-    // A flat CellSize resample floor left a small lake (a handful of grid
-    // cells, a few hundred metres of shoreline) with only a few points to
-    // round through Chaikin, so its raw grid-aligned trace read as an
-    // unmistakably blocky, near-rectangular shape instead of an organic
-    // pond outline. Guarantee a reasonable minimum point count regardless
-    // of size, while still capping density (via the CellSize floor) so a
-    // large lake's shoreline doesn't balloon in point count.
+    // Retain enough of the sub-cell edge interpolation for smoothing to work
+    // with. The previous 28-point target followed by a very large Douglas-
+    // Peucker tolerance threw most of that information away and reduced
+    // small lakes back to rounded rectangles.
+    const double MinimumSpacing = FMath::Max(300.0, FinalPointSpacing * 0.55);
+    const double MaximumSpacing = FMath::Max(
+        MinimumSpacing, Data.CellSize * 0.55
+    );
     const double AdaptiveSpacing = FMath::Clamp(
-        Perimeter / 28.0, 800.0, FMath::Max(Data.CellSize, 3500.0)
+        Perimeter / 48.0, MinimumSpacing, MaximumSpacing
     );
     TArray<FVector> Reduced = ResamplePolyline(Boundary, AdaptiveSpacing, true);
-    Boundary = ChaikinSmooth(Reduced, true, 3);
-    const double SimplificationTolerance = FMath::Max(
-        FinalPointSpacing * 4.0,
-        Data.CellSize * 0.15
+    Boundary = ChaikinSmooth(Reduced, true, 2);
+    const double SimplificationTolerance = FMath::Min(
+        FMath::Max(150.0, FinalPointSpacing * 0.65),
+        Data.CellSize * 0.10
     );
     return SimplifyFeaturePolyline(Boundary, SimplificationTolerance, true);
 }
@@ -2566,42 +2567,11 @@ static void ExtractLakes(
             Candidate[Cell] = (Data.DepressionFillHeight[Cell] - Data.Height[Cell]) >= ShorelineFillThreshold;
         }
     }
-    // Two basins separated only by a narrow strip of ground - a cell or two -
-    // would, in reality, share a short strait or have that strip submerged
-    // once bank blending is applied. Treating them as unrelated components
-    // produces two separate, often visibly overlapping water bodies right
-    // next to each other instead of one merged lake. Bridge small gaps: a
-    // non-candidate cell within a short radius of a real candidate cell can
-    // still be traversed (and is absorbed into the merged lake's shape), but
-    // never seeds a basin on its own.
-    constexpr int32 BridgeRadius = 2;
-    TArray<bool> BridgeCandidate = Candidate;
-    for (int32 Y = 0; Y < Data.Rows; ++Y)
-    {
-        for (int32 X = 0; X < Data.Columns; ++X)
-        {
-            const int32 Cell = Data.Index(X, Y);
-            if (Candidate[Cell])
-            {
-                continue;
-            }
-            bool bNearCandidate = false;
-            for (int32 DY = -BridgeRadius; DY <= BridgeRadius && !bNearCandidate; ++DY)
-            {
-                for (int32 DX = -BridgeRadius; DX <= BridgeRadius; ++DX)
-                {
-                    const int32 NX = X + DX;
-                    const int32 NY = Y + DY;
-                    if (Data.IsValid(NX, NY) && Candidate[Data.Index(NX, NY)])
-                    {
-                        bNearCandidate = true;
-                        break;
-                    }
-                }
-            }
-            BridgeCandidate[Cell] = bNearCandidate;
-        }
-    }
+    // A basin is a connected component of genuinely filled depression cells.
+    // Do not dilate this mask to bridge nearby components: doing so joins
+    // hydraulically unrelated depressions solely because they are close on
+    // the analysis grid, absorbs the separating hillside, and then assigns
+    // the merged shape one (usually incorrect) minimum surface height.
     TArray<bool> Visited;
     Visited.Init(false, Data.Height.Num());
     TArray<FLakeCandidate> Basins;
@@ -2647,7 +2617,7 @@ static void ExtractLakes(
                     continue;
                 }
                 const int32 Neighbor = Data.Index(NX, NY);
-                if (BridgeCandidate[Neighbor])
+                if (Candidate[Neighbor])
                 {
                     if (!Visited[Neighbor])
                     {
@@ -2826,9 +2796,14 @@ static void ExtractLakes(
         }
         if (bWantOutflows && CandidateBasin.RimSpillCell != INDEX_NONE)
         {
-            const int32 OutflowStart = PrimaryReceiver(Data, CandidateBasin.RimSpillCell);
-            if (OutflowStart != INDEX_NONE &&
-                (!Data.LakeIndex.IsValidIndex(OutflowStart) || Data.LakeIndex[OutflowStart] == INDEX_NONE))
+            // Start at the first dry spill cell itself. Advancing immediately
+            // to its receiver could skip the short connector between perched
+            // basins or land directly inside the lower lake, so no visible
+            // outflow reach was emitted between two different water levels.
+            const int32 OutflowStart = CandidateBasin.RimSpillCell;
+            if (PrimaryReceiver(Data, OutflowStart) != INDEX_NONE &&
+                (!Data.LakeIndex.IsValidIndex(OutflowStart) ||
+                 Data.LakeIndex[OutflowStart] == INDEX_NONE))
             {
                 OutOutflowSeeds.Add(OutflowStart);
             }
@@ -3469,11 +3444,12 @@ static void ExtractRivers(
         // Hydrological receiver cells are the authoritative route. On steeper
         // reaches, smoothing is suppressed so the visual spline cannot cut
         // sideways across the valley wall.
-        // Always round the raw drainage-grid corners once. The valley
-        // constraint below remains authoritative and prevents the curve from
-        // escaping onto a hillside.
-        Points = ChaikinSmooth(Points, false, 1);
-        Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
+        // D8 supplies topology, not final spline geometry. Round its eight-
+        // direction staircase before adding meander; a single Chaikin pass
+        // left alternate grid steps visibly sawtoothing at analysis-cell
+        // scale on long reaches.
+        Points = ChaikinSmooth(Points, false, 2);
+        Points = ResamplePolyline(Points, Data.CellSize * 0.80, false);
         // A hard clamp to exactly 0 at a 12% grade gave every reach through
         // typically-mountainous terrain zero meander whatsoever - not just
         // reduced, mathematically zero, since Lowland multiplies straight
@@ -3511,20 +3487,53 @@ static void ExtractRivers(
             ? 1 : (MeanSlope > 0.018 ? 1 : 2);
         Points = ChaikinSmooth(Points, false, FinalSmoothIterations);
         // Chaikin changes the point count, so resample both lines to a common
-        // count before applying the same terrain-rise constraint used for
-        // meanders. This removes cell-grid sawteeth without reintroducing the
-        // old cross-slope/canal regression.
+        // count. Do not run the discrete lateral valley search again here:
+        // that point-by-point resnap was reintroducing the D8 staircase we
+        // had just smoothed. Instead, only pull a curved point back toward
+        // the proven valley route when it climbs materially above it.
         TArray<FVector> FinalConstraintBase = ResamplePolyline(
             PreFinalSmoothPoints, Data.CellSize * 0.70, false
         );
         Points = ResamplePolyline(Points, Data.CellSize * 0.70, false);
         if (FinalConstraintBase.Num() == Points.Num())
         {
-            ConstrainMeandersToValley(
-                Data, FinalConstraintBase, Points,
-                FMath::Clamp(LowlandFraction * 0.65, 0.0, 1.0)
+            const double AllowedRise = FMath::Max(
+                75.0, Data.CellSize * FMath::Lerp(0.018, 0.045, LowlandFraction)
             );
+            const double FullCorrectionRise = FMath::Max(
+                AllowedRise + 1.0, Data.CellSize * 0.16
+            );
+            for (int32 PointIndex = 1;
+                 PointIndex + 1 < Points.Num(); ++PointIndex)
+            {
+                const FVector2D CurvedPosition(Points[PointIndex]);
+                const FVector2D ValleyPosition(FinalConstraintBase[PointIndex]);
+                const double CurvedHeight = Data.SampleGrid(
+                    Data.Height, CurvedPosition
+                );
+                const double ValleyHeight = Data.SampleGrid(
+                    Data.Height, ValleyPosition
+                );
+                const double PullBack = Smooth01(FMath::Clamp(
+                    (CurvedHeight - ValleyHeight - AllowedRise)
+                        / (FullCorrectionRise - AllowedRise),
+                    0.0, 1.0
+                ));
+                Points[PointIndex].X = FMath::Lerp(
+                    Points[PointIndex].X,
+                    FinalConstraintBase[PointIndex].X,
+                    PullBack * 0.82
+                );
+                Points[PointIndex].Y = FMath::Lerp(
+                    Points[PointIndex].Y,
+                    FinalConstraintBase[PointIndex].Y,
+                    PullBack * 0.82
+                );
+            }
         }
+        // One light finishing pass blends any guarded points back into the
+        // curve without moving the route far enough to cross a valley wall.
+        Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(
             Points,
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
@@ -6099,7 +6108,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             const double BankTransition =
                 ComputeRiverBankTransitionWidth(Reach);
             double CarveDepth = FMath::Clamp(
-                Reach.Depth * 0.55, 100.0, 700.0
+                Reach.Depth * 0.35, 60.0, 450.0
             );
             double EdgeOffsetScale = 1.0;
             if (Reach.bIsCanyon)
