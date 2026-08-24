@@ -3661,6 +3661,24 @@ static double EvaluateLandform(
     const double Activity = FMath::Clamp(TectonicActivity, 0.0, 1.0);
     const double RiftAmount = FMath::Clamp(RiftStrength, 0.0, 1.0);
 
+    // Computed early (needs only the climate inputs, not any of the terrain
+    // fields below) so it can also shape mountain crest character further
+    // down, not just the desert/dune/mesa terms it originally only fed.
+    // Desert/mesa/canyon character belongs to genuinely hot-dry climate, not
+    // merely warm-dry (that reads as savannah/scrubland instead). Ramp this
+    // sharply through the warm->hot boundary rather than starting just above
+    // the cold/temperate line, so warm-dry areas stay savannah-like and only
+    // deep-hot-dry areas get full desert/resistant-cap/canyon treatment.
+    const double HotFraction = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.58) / 0.30, 0.0, 1.0
+        )) : 0.0;
+    const double Dryness = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
+        )) : 0.0;
+    const double Aridity = HotFraction * Dryness;
+
     const FVector2D SeedOffset(
         static_cast<double>((Seed * 92821) & 0x7ffff),
         static_cast<double>((Seed * 68917) & 0x7ffff)
@@ -3823,16 +3841,22 @@ static double EvaluateLandform(
     );
     // Cold, high terrain earns a sharper, more jagged alpine crest (freeze-
     // thaw and glacial carving keep ridgelines knife-edged); warm/moist
-    // mountains weather down to rounder, gentler summits instead. Otherwise
-    // every mountain range looked the same regardless of climate - only the
-    // biome colour changed, never the actual peak shape.
+    // mountains weather down to rounder, gentler summits instead. Arid
+    // terrain sharpens the same way for a different reason - thin soil and
+    // no vegetation expose bare, angular rock instead of the deep chemical
+    // weathering that rounds off a wet range. Combine both into one
+    // Harshness term rather than stacking two independent multipliers, so a
+    // cold-and-arid range doesn't get double-sharpened into something
+    // absurd. Otherwise every mountain range looked the same regardless of
+    // climate - only the biome colour changed, never the actual peak shape.
     const double Coldness = bClimateEnabled
         ? Smooth01(FMath::Clamp((0.45 - ClimateTemperature) / 0.42, 0.0, 1.0))
         : 0.0;
+    const double Harshness = FMath::Max(Coldness, Aridity);
     const double CrestShape = FMath::Clamp(
         0.88
-            + (CrestRidges - 0.50) * FMath::Lerp(0.11, 0.24, Coldness)
-            + (CrestVariation - 0.50) * FMath::Lerp(0.08, 0.18, Coldness),
+            + (CrestRidges - 0.50) * FMath::Lerp(0.11, 0.24, Harshness)
+            + (CrestVariation - 0.50) * FMath::Lerp(0.08, 0.18, Harshness),
         0.70, 1.10
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
@@ -3924,7 +3948,7 @@ static double EvaluateLandform(
     // A higher exponent concentrates that relief onto fewer, more isolated
     // summits (sharp alpine peaks); a lower one spreads it into broader,
     // more rounded massifs, matching the CrestShape climate split above.
-    const double MountainRelief = FMath::Pow(MountainHeight, FMath::Lerp(1.08, 1.34, Coldness));
+    const double MountainRelief = FMath::Pow(MountainHeight, FMath::Lerp(1.08, 1.34, Harshness));
     Height += MountainRelief * Relief
         * FMath::Lerp(0.72, 1.12, Activity)
         * FMath::Lerp(0.82, 1.72, MountainRelief)
@@ -3932,7 +3956,15 @@ static double EvaluateLandform(
 
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
-    Height += IndependentHills * Relief * (
+    // Wetter climates get a bit more small-scale bump amplitude (rolling,
+    // forest-covered hill country); drier-but-not-desert climates flatten
+    // out toward open prairie/grassland instead. Deserts are already
+    // handled separately above (dunes/mesas), and mountains keep their own
+    // Harshness-driven crest logic untouched by this.
+    const double HillHumidityScale = bClimateEnabled
+        ? FMath::Lerp(0.62, 1.28, ClimateMoisture)
+        : 1.0;
+    Height += IndependentHills * Relief * HillHumidityScale * (
         0.050
         + (0.5 + 0.5 * Rolling) * 0.052
         + UplandRidges * 0.040
@@ -3959,20 +3991,6 @@ static double EvaluateLandform(
         + (PlainRidges - 0.46) * 0.016
     );
 
-    // Desert/mesa/canyon character belongs to genuinely hot-dry climate, not
-    // merely warm-dry (that reads as savannah/scrubland instead). Ramp this
-    // sharply through the warm->hot boundary rather than starting just above
-    // the cold/temperate line, so warm-dry areas stay savannah-like and only
-    // deep-hot-dry areas get full desert/resistant-cap/canyon treatment.
-    const double HotFraction = bClimateEnabled
-        ? Smooth01(FMath::Clamp(
-            (ClimateTemperature - 0.58) / 0.30, 0.0, 1.0
-        )) : 0.0;
-    const double Dryness = bClimateEnabled
-        ? Smooth01(FMath::Clamp(
-            (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
-        )) : 0.0;
-    const double Aridity = HotFraction * Dryness;
     OutDesertMask = Aridity * FMath::Clamp(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
     );
@@ -3982,11 +4000,28 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(811.0, 397.0),
         4, 0.58, 2.0
     );
+    // Gating this to Hill/Foothill alone left arid true mountains with no
+    // shape distinction at all from any other mountain - they got the
+    // correct Desert biome label and colour, but the actual relief was
+    // identical to a wet temperate range, because the differential-
+    // weathering escarpment/mesa erosion this drives (EvolveTerrainFromDra
+    // inage's CanyonSuitability and residual-mesa terms already multiply in
+    // Mountain, but only ever saw it through OutResistance, which this was
+    // the only real source of on non-hill terrain) never had anywhere to
+    // engage on a mountain's main mass. Real hot deserts have canyon-cut,
+    // mesa-and-butte mountain terrain, not lush rounded ranges.
     const double ResistantCap = OutDesertMask
-        * FMath::Clamp(OutHillMask + FoothillEnvelope * 0.45, 0.0, 1.0)
+        * FMath::Clamp(
+            OutHillMask + FoothillEnvelope * 0.45 + OutMountainMask * 0.85,
+            0.0, 1.0
+        )
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
 
-    const double DuneSuitability = OutDesertMask * OutPlainsMask
+    // Real dune fields aren't confined to dead-flat basins - gentle desert
+    // hillslopes (ergs climbing a bajada, not just pan-flat sand seas) carry
+    // dune texture too, just fading out as slope/relief increases.
+    const double DuneSuitability = OutDesertMask
+        * FMath::Clamp(OutPlainsMask + OutHillMask * 0.35, 0.0, 1.0)
         * (1.0 - ResistantCap * 0.85)
         * (1.0 - RiftMask * 0.55);
     if (DuneSuitability > 0.03)
@@ -4012,7 +4047,7 @@ static double EvaluateLandform(
             2.0 * PI * WindCoordinate / DuneWavelength
         );
         Height += (FMath::Pow(DuneWave, 2.1) - 0.31)
-            * Relief * 0.010 * DuneSuitability;
+            * Relief * 0.018 * DuneSuitability;
     }
 
     OutResistance = FMath::Clamp(
