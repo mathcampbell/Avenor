@@ -470,12 +470,18 @@ static void AddBroadMeanders(
     // Loosened the length cap, dropped the extra Lowland exponent, and
     // raised the Discharge floor so a typical short stream keeps a real,
     // visible wiggle instead of vanishing under compounded multipliers.
-    const double Amplitude = FMath::Min(
+    const double RawAmplitude = FMath::Min(
         TotalLength * 0.16,
         CellSize * FMath::Lerp(2.4, 5.5, Discharge)
     ) * Strength * Lowland * FMath::Lerp(0.75, 1.0, Discharge) * Freedom;
     const double Wavelength = Random.FRandRange(0.88, 1.16)
         * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;
+    // The active channel can form a tight meander neck, but it must never
+    // curl into a synthetic full loop. An abandoned loop is an oxbow feature,
+    // not a self-crossing Water spline.
+    const double Amplitude = FMath::Min(
+        RawAmplitude, Wavelength * 0.18
+    );
     const double PhaseA = Random.FRandRange(-PI, PI);
     const double PhaseB = Random.FRandRange(-PI, PI);
     for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
@@ -645,7 +651,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 19;
+static constexpr int32 GeneratorAlgorithmVersion = 20;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2734,6 +2740,18 @@ static void ExtractLakes(
     }
     TSet<int32> MandatorySeedSet(MandatoryTerminusSeeds);
     const double WorldArea = Data.Height.Num() * Data.CellAreaSquareKilometres();
+    // MaximumLakeArea's historical 250 km2 ceiling was effectively irrelevant
+    // on the default strip; the 3% total-coverage allowance let one basin
+    // consume roughly 60 km2 and dominate an entire generated district.
+    // Keep exceptional large lakes possible on larger worlds, but scale the
+    // single-lake ceiling to the geography being generated.
+    const double SustainableMaximumLakeArea = FMath::Min(
+        MaximumArea,
+        FMath::Max(
+            Data.CellAreaSquareKilometres() * 16.0,
+            WorldArea * 0.0125
+        )
+    );
     TArray<bool> Candidate;
     Candidate.Init(false, Data.Height.Num());
     constexpr double ShorelineFillThreshold = 50.0;
@@ -2819,7 +2837,7 @@ static void ExtractLakes(
                 break;
             }
         }
-        const double SanityCap = FMath::Max(MaximumArea * 1.5, WorldArea * 0.01);
+        const double SanityCap = SustainableMaximumLakeArea * 1.5;
         if (Area >= Data.CellAreaSquareKilometres() * 2.0 && Area <= SanityCap)
         {
             Basins.Add(MoveTemp(Basin));
@@ -2894,12 +2912,12 @@ static void ExtractLakes(
         const double SupportedBasinArea = FMath::Max(
             Data.CellAreaSquareKilometres() * 4.0,
             CandidateBasin.CatchmentArea
-                * (CandidateBasin.bRiverTerminus ? 0.42 : 0.22)
+                * (CandidateBasin.bRiverTerminus ? 0.20 : 0.10)
                 * FMath::Lerp(1.0, 0.30, EvaporationStress)
         );
         if (AcceptedCount >= MaximumCount ||
             CandidateBasin.MaximumDepth < RequiredDepth ||
-            BasinArea > MaximumArea ||
+            BasinArea > SustainableMaximumLakeArea ||
             BasinArea > SupportedBasinArea ||
             AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
@@ -3011,7 +3029,10 @@ static void ExtractLakes(
 
 namespace UE::Avenor::Strip
 {
-static void EnforceDownhill(TArray<FVector>& Points)
+static void EnforceDownhill(
+    TArray<FVector>& Points,
+    double MaximumSurfaceUndercut = 200.0
+)
 {
     if (Points.Num() < 2)
     {
@@ -3020,7 +3041,20 @@ static void EnforceDownhill(TArray<FVector>& Points)
     for (int32 Index = 1; Index < Points.Num(); ++Index)
     {
         const double HorizontalDistance = FVector2D::Distance(FVector2D(Points[Index - 1]), FVector2D(Points[Index]));
-        Points[Index].Z = FMath::Min(Points[Index].Z, Points[Index - 1].Z - HorizontalDistance * 0.0006);
+        const double GroundHeight = Points[Index].Z;
+        const double DesiredHeight = FMath::Min(
+            GroundHeight,
+            Points[Index - 1].Z - HorizontalDistance * 0.00015
+        );
+        // Never solve a locally awkward spline by cumulatively driving the
+        // water surface far underground. If the route cannot remain downhill
+        // within this small allowance, preserve the near-ground datum; the
+        // geometry problem remains visible for diagnosis instead of becoming
+        // an artificial gorge hundreds of metres deep.
+        Points[Index].Z = FMath::Max(
+            DesiredHeight,
+            GroundHeight - FMath::Max(0.0, MaximumSurfaceUndercut)
+        );
     }
 }
 
@@ -3160,6 +3194,68 @@ static void ProjectRiverToLocalThalweg(
     }
 }
 
+static double Cross2D(
+    const FVector2D& A,
+    const FVector2D& B,
+    const FVector2D& C
+)
+{
+    const FVector2D AB = B - A;
+    const FVector2D AC = C - A;
+    return AB.X * AC.Y - AB.Y * AC.X;
+}
+
+static bool ProperSegmentsIntersect(
+    const FVector2D& A,
+    const FVector2D& B,
+    const FVector2D& C,
+    const FVector2D& D
+)
+{
+    const double AB_C = Cross2D(A, B, C);
+    const double AB_D = Cross2D(A, B, D);
+    const double CD_A = Cross2D(C, D, A);
+    const double CD_B = Cross2D(C, D, B);
+    return AB_C * AB_D < 0.0 && CD_A * CD_B < 0.0;
+}
+
+static void CutOffSelfIntersections(TArray<FVector>& Points)
+{
+    // Resolve the active channel the same way a natural neck cutoff does:
+    // retain the new short connection and discard the enclosed loop.
+    for (int32 Pass = 0; Pass < 16 && Points.Num() >= 4; ++Pass)
+    {
+        bool bCut = false;
+        for (int32 First = 0;
+             First + 1 < Points.Num() && !bCut; ++First)
+        {
+            for (int32 Second = First + 2;
+                 Second + 1 < Points.Num(); ++Second)
+            {
+                if (ProperSegmentsIntersect(
+                    FVector2D(Points[First]),
+                    FVector2D(Points[First + 1]),
+                    FVector2D(Points[Second]),
+                    FVector2D(Points[Second + 1])
+                ))
+                {
+                    Points.RemoveAt(
+                        First + 1,
+                        Second - First,
+                        EAllowShrinking::No
+                    );
+                    bCut = true;
+                    break;
+                }
+            }
+        }
+        if (!bCut)
+        {
+            break;
+        }
+    }
+}
+
 static void SuppressPathologicalMeanders(
     const TArray<FVector>& BasePoints,
     TArray<FVector>& Points,
@@ -3210,6 +3306,44 @@ static void SuppressPathologicalMeanders(
             const double Keep = FMath::Lerp(0.20, 0.75, SeparationAlpha);
             Points[Index].X = FMath::Lerp(BasePoints[Index].X, Points[Index].X, Keep);
             Points[Index].Y = FMath::Lerp(BasePoints[Index].Y, Points[Index].Y, Keep);
+        }
+    }
+
+    // Proximity and turn-angle damping above reduce tight necks but do not
+    // mathematically prohibit two non-adjacent segments from crossing. A
+    // live single-channel river cannot cross itself: a natural cutoff leaves
+    // an oxbow/abandoned channel. Revert the enclosed displaced span to the
+    // non-self-crossing drainage route whenever a proper crossing remains.
+    for (int32 Pass = 0; Pass < 4; ++Pass)
+    {
+        bool bRemovedCrossing = false;
+        for (int32 First = 0;
+             First + 1 < Points.Num() && !bRemovedCrossing; ++First)
+        {
+            for (int32 Second = First + 2;
+                 Second + 1 < Points.Num(); ++Second)
+            {
+                if (!ProperSegmentsIntersect(
+                    FVector2D(Points[First]),
+                    FVector2D(Points[First + 1]),
+                    FVector2D(Points[Second]),
+                    FVector2D(Points[Second + 1])
+                ))
+                {
+                    continue;
+                }
+                for (int32 Index = First + 1; Index <= Second; ++Index)
+                {
+                    Points[Index].X = BasePoints[Index].X;
+                    Points[Index].Y = BasePoints[Index].Y;
+                }
+                bRemovedCrossing = true;
+                break;
+            }
+        }
+        if (!bRemovedCrossing)
+        {
+            break;
         }
     }
 }
@@ -3735,6 +3869,7 @@ static void ExtractRivers(
             FMath::Clamp(FeaturePointSpacing, 100.0, Data.CellSize),
             false
         );
+        CutOffSelfIntersections(Points);
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
@@ -3847,6 +3982,7 @@ static void ExtractRivers(
         River.Points = SimplifyFeaturePolyline(
             River.Points, SimplificationTolerance, false
         );
+        CutOffSelfIntersections(River.Points);
         EnforceDownhill(River.Points);
         AddLevelLakeJunctionPads(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
@@ -6253,23 +6389,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     {
         return;
     }
-    const FName WaterPriorityLayer = PriorityLayers.Last();
-    UClass* RiverModifierClass = Hydrology.bRivers
-        ? FindWaterModifierClass(TEXT("RiverModifier"))
-        : nullptr;
-    if (Hydrology.bRivers && !RiverModifierClass)
-    {
-        FMessageDialog::Open(
-            EAppMsgType::Ok,
-            FText::FromString(TEXT(
-                "Unreal's MeshPartitionWater RiverModifier "
-                "Blueprint class could not be loaded. Check that the "
-                "MeshPartitionWater plugin is enabled and Show Plugin Content "
-                "reveals its modifier assets. No water actors were generated."
-            ))
-        );
-        return;
-    }
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     auto ToWorldPoints = [&](const TArray<FVector>& Source)
     {
@@ -6324,41 +6443,12 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
                 Reach.Width, Reach.Depth
             );
-            // The broad valley shape belongs to erosion - already baked into
-            // the base terrain height field. This carve is only meant to
-            // hold the water channel with a modest, proportionate bank
-            // blend ("a nice graduated shore"), not re-cut the whole valley
-            // a second time at the water curve's blunter resolution, which
-            // produced a uniform, harsh-walled trench regardless of whether
-            // the reach was a headwater trickle or a main river - and
-            // CrossSectionExponent dips low on any steep mountain slope, not
-            // just true canyons, so gating steep walls on it made ordinary
-            // mountain streams carve like cliffs too. Canyon reaches get a
-            // real, but still bounded, deeper and steeper-walled cut instead
-            // of the full ValleyDepth/ValleyHalfWidth; everything else gets
-            // a gentle bank blend scaled to its own actual water width.
-            const double BankTransition =
-                ComputeRiverBankTransitionWidth(Reach);
-            double CarveDepth = FMath::Clamp(
-                Reach.Depth * 0.35, 60.0, 450.0
-            );
-            double EdgeOffsetScale = 1.0;
-            if (Reach.bIsCanyon)
-            {
-                CarveDepth = FMath::Max(
-                    Reach.Depth,
-                    FMath::Min(Reach.ValleyDepth, Reach.Depth * 2.0)
-                );
-                EdgeOffsetScale = 0.3;
-            }
-            ConfigureWaterTerrainSettings(
-                *River, false, CarveDepth, BankTransition, WaterTerrain,
-                EdgeOffsetScale
-            );
-            AddNativeWaterModifier(
-                *River, *TargetMeshPartition, WaterPriorityLayer,
-                *RiverModifierClass
-            );
+            // Diagnostic mode: deliberately do not attach a native River
+            // Modifier or perform a second-stage channel carve. The base
+            // erosion pass owns the valley for now; the visible Water Body
+            // and its refinement spline let us validate routing, Z and width
+            // independently. A shallow bed modifier can be reintroduced once
+            // those source geometries are proven correct.
             River->PostEditChange();
         }
     }
