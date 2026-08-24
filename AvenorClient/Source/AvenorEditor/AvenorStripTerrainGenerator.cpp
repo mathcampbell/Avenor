@@ -3400,7 +3400,15 @@ static void ExtractRivers(
         // escaping onto a hillside.
         Points = ChaikinSmooth(Points, false, 1);
         Points = ResamplePolyline(Points, Data.CellSize * 1.35, false);
-        const double LowlandFraction = 1.0 - FMath::Clamp(MeanSlope / 0.12, 0.0, 1.0);
+        // A hard clamp to exactly 0 at a 12% grade gave every reach through
+        // typically-mountainous terrain zero meander whatsoever - not just
+        // reduced, mathematically zero, since Lowland multiplies straight
+        // into AddBroadMeanders' Amplitude. Widened and floored so a steep
+        // reach still gets a small residual wiggle instead of a perfectly
+        // straight line; genuinely torrential terrain still tapers hard.
+        const double LowlandFraction = FMath::Clamp(
+            1.0 - MeanSlope / 0.22, 0.12, 1.0
+        );
         const double ValleyFreedom = FMath::Clamp(
             (1.0 - MeanResistance * 0.72)
                 * (1.0 - MeanMountain * 0.62),
@@ -3536,9 +3544,21 @@ static void ExtractRivers(
         Data.Rivers.Add(MoveTemp(River));
     }
 
+    // This runs after all the meander/valley-following work above, on the
+    // final points that decide what the water spline actually looks like -
+    // at FeaturePointSpacing*4 (20m with the 5m default) it was routinely
+    // larger than the real curvature it was supposed to just be thinning.
+    // Douglas-Peucker keeps a bend's peak only if it deviates from the
+    // straight chord by more than the tolerance, so any valley bend or
+    // meander with under ~20m of perpendicular deflection - common for a
+    // moderate mountain reach even where the underlying terrain genuinely
+    // curves - was being flattened into dead-straight segments between
+    // widely-spaced points. Shrunk so it only removes truly redundant
+    // near-collinear points, not the curvature the rest of this function
+    // spent its effort building.
     const double SimplificationTolerance = FMath::Max(
-        FeaturePointSpacing * 4.0,
-        Data.CellSize * 0.15
+        FeaturePointSpacing * 1.2,
+        Data.CellSize * 0.035
     );
     for (FRiverReach& River : Data.Rivers)
     {
