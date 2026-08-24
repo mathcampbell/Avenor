@@ -436,14 +436,15 @@ static void AddBroadMeanders(
         );
     }
     const double TotalLength = Lengths.Last();
-    if (TotalLength < CellSize * 4.0)
+    // A dendritic network's short headwater tributaries vastly outnumber
+    // its main-stem reaches, so a 4-cell (400m) cutoff meant most of the
+    // visible network got literally zero meander, not just a small one.
+    if (TotalLength < CellSize * 2.0)
     {
         return;
     }
 
-    const double Lowland = FMath::Pow(
-        FMath::Clamp(LowlandFraction, 0.0, 1.0), 1.35
-    );
+    const double Lowland = FMath::Clamp(LowlandFraction, 0.0, 1.0);
     const double Discharge = FMath::Clamp(DischargeFraction, 0.0, 1.0);
     // Floor kept above the gate threshold below: a clamped-to-floor Freedom
     // used to land at exactly the same value the gate rejected, so any
@@ -457,10 +458,22 @@ static void AddBroadMeanders(
     }
 
     FRandomStream Random(Seed);
+    // This used to multiply five independent ~[0,1] factors together (the
+    // length cap, Strength, Lowland raised to a 1.35 exponent, a Discharge
+    // lerp bottoming out at 0.55, Freedom) - each looked reasonable in
+    // isolation, but compounded they routinely reduced a short, moderately
+    // steep headwater tributary's amplitude to 1-3m: "some" meander on
+    // paper, invisible in practice and well under any simplification
+    // tolerance, which is exactly why a dendritic network's many short
+    // branches (the majority of any river system by count) were rendering
+    // as straight lines even after the simplification-tolerance fix.
+    // Loosened the length cap, dropped the extra Lowland exponent, and
+    // raised the Discharge floor so a typical short stream keeps a real,
+    // visible wiggle instead of vanishing under compounded multipliers.
     const double Amplitude = FMath::Min(
-        TotalLength * 0.075,
-        CellSize * FMath::Lerp(2.2, 5.0, Discharge)
-    ) * Strength * Lowland * FMath::Lerp(0.55, 1.0, Discharge) * Freedom;
+        TotalLength * 0.16,
+        CellSize * FMath::Lerp(2.4, 5.5, Discharge)
+    ) * Strength * Lowland * FMath::Lerp(0.75, 1.0, Discharge) * Freedom;
     const double Wavelength = Random.FRandRange(0.88, 1.16)
         * FMath::Lerp(10.0, 34.0, Discharge) * CellSize;
     const double PhaseA = Random.FRandRange(-PI, PI);
