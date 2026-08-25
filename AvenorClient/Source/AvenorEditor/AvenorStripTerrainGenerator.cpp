@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 30;
+static constexpr int32 GeneratorAlgorithmVersion = 31;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2561,64 +2561,97 @@ static bool BuildSustainableLakeFootprint(
     }
     else
     {
-        TArray<int32> HeightOrder = Basin.Cells;
-        HeightOrder.Sort([&Data](int32 A, int32 B)
-        {
-            return Data.Height[A] < Data.Height[B];
-        });
-        // The depression is the maximum container.  Its sustainable water
-        // budget chooses a lower contour inside that container; it must not
-        // automatically inherit the fill-to-spill shoreline.
-        OutSurfaceHeight = FMath::Min(
-            Basin.SurfaceHeight,
-            Data.Height[HeightOrder[SupportedCellCount - 1]]
-                + FMath::Max(1.0, Data.CellSize * 0.001)
-        );
-
-        TSet<int32> BasinMembership(Basin.Cells);
-        TSet<int32> WetMembership;
-        WetMembership.Reserve(SupportedCellCount);
+        TArray<double> CandidateLevels;
+        CandidateLevels.Reserve(Basin.Cells.Num());
         for (int32 Cell : Basin.Cells)
         {
-            if (Data.Height[Cell] <= OutSurfaceHeight)
+            CandidateLevels.Add(FMath::Min(Data.Height[Cell], Basin.SurfaceHeight));
+        }
+        CandidateLevels.Sort();
+        for (int32 Index = CandidateLevels.Num() - 1; Index > 0; --Index)
+        {
+            if (FMath::IsNearlyEqual(
+                    CandidateLevels[Index], CandidateLevels[Index - 1], 0.5))
             {
-                WetMembership.Add(Cell);
+                CandidateLevels.RemoveAt(Index);
             }
         }
-        if (!WetMembership.Contains(Basin.HydrologySeedCell))
+
+        const TSet<int32> BasinMembership(Basin.Cells);
+        auto FloodConnectedToSeed = [&](double Surface, TArray<int32>& Flooded)
+        {
+            Flooded.Reset();
+            if (Data.Height[Basin.HydrologySeedCell] > Surface)
+            {
+                return;
+            }
+            constexpr int32 CardinalX[4] = {1, 0, -1, 0};
+            constexpr int32 CardinalY[4] = {0, 1, 0, -1};
+            TArray<int32> Queue;
+            TSet<int32> Visited;
+            Queue.Add(Basin.HydrologySeedCell);
+            Visited.Add(Basin.HydrologySeedCell);
+            for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+            {
+                const int32 Cell = Queue[QueueIndex];
+                Flooded.Add(Cell);
+                const int32 X = Cell % Data.Columns;
+                const int32 Y = Cell / Data.Columns;
+                for (int32 Direction = 0; Direction < 4; ++Direction)
+                {
+                    const int32 NX = X + CardinalX[Direction];
+                    const int32 NY = Y + CardinalY[Direction];
+                    if (!Data.IsValid(NX, NY))
+                    {
+                        continue;
+                    }
+                    const int32 Neighbor = Data.Index(NX, NY);
+                    if (BasinMembership.Contains(Neighbor)
+                        && Data.Height[Neighbor] <= Surface
+                        && !Visited.Contains(Neighbor))
+                    {
+                        Visited.Add(Neighbor);
+                        Queue.Add(Neighbor);
+                    }
+                }
+            }
+        };
+
+        // Search the actual connected flooded footprint, not the Nth-lowest
+        // cell height. A nearly level contour can add hundreds of cells at
+        // once, so an elevation percentile is not an area budget.
+        int32 Low = 0;
+        int32 High = CandidateLevels.Num() - 1;
+        int32 BestLevel = INDEX_NONE;
+        TArray<int32> TrialCells;
+        while (Low <= High)
+        {
+            const int32 Mid = Low + (High - Low) / 2;
+            FloodConnectedToSeed(CandidateLevels[Mid], TrialCells);
+            if (TrialCells.Num() <= SupportedCellCount)
+            {
+                if (TrialCells.Num() >= 9)
+                {
+                    BestLevel = Mid;
+                }
+                Low = Mid + 1;
+            }
+            else
+            {
+                High = Mid - 1;
+            }
+        }
+        if (BestLevel == INDEX_NONE)
         {
             return false;
         }
-
-        constexpr int32 CardinalX[4] = {1, 0, -1, 0};
-        constexpr int32 CardinalY[4] = {0, 1, 0, -1};
-        TArray<int32> Queue;
-        TSet<int32> Visited;
-        Queue.Add(Basin.HydrologySeedCell);
-        Visited.Add(Basin.HydrologySeedCell);
-        for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+        OutSurfaceHeight = FMath::Min(
+            Basin.SurfaceHeight, CandidateLevels[BestLevel]
+        );
+        FloodConnectedToSeed(OutSurfaceHeight, OutCells);
+        if (OutCells.Num() < 9 || OutCells.Num() > SupportedCellCount)
         {
-            const int32 Cell = Queue[QueueIndex];
-            OutCells.Add(Cell);
-            const int32 X = Cell % Data.Columns;
-            const int32 Y = Cell / Data.Columns;
-            for (int32 Direction = 0; Direction < 4; ++Direction)
-            {
-                const int32 NX = X + CardinalX[Direction];
-                const int32 NY = Y + CardinalY[Direction];
-                if (!Data.IsValid(NX, NY))
-                {
-                    continue;
-                }
-                const int32 Neighbor = Data.Index(NX, NY);
-                if (BasinMembership.Contains(Neighbor)
-                    && WetMembership.Contains(Neighbor)
-                    && !Visited.Contains(Neighbor))
-                {
-                    Visited.Add(Neighbor);
-                    Queue.Add(Neighbor);
-                }
-            }
+            return false;
         }
     }
 
@@ -3202,7 +3235,7 @@ static void ExtractLakes(
         MaximumArea,
         FMath::Max(
             Data.CellAreaSquareKilometres() * 16.0,
-            WorldArea * 0.0125
+            WorldArea * 0.004
         )
     );
     TArray<bool> Candidate;
@@ -3379,11 +3412,11 @@ static void ExtractLakes(
         // basin as hydrologically important, but no longer grants the entire
         // fill-to-spill depression for free.
         const double MoistureRetention = FMath::Lerp(
-            0.035, 0.17, Smooth01(MeanMoisture)
+            0.010, 0.055, Smooth01(MeanMoisture)
         );
         const double SupportedBasinArea = CandidateBasin.CatchmentArea
             * MoistureRetention
-            * FMath::Lerp(1.0, 0.48, EvaporationStress);
+            * FMath::Lerp(1.0, 0.35, EvaporationStress);
 
         TArray<int32> LakeCells;
         double SustainableSurfaceHeight = CandidateBasin.SurfaceHeight;
@@ -3405,6 +3438,8 @@ static void ExtractLakes(
             LakeCells.Num() * Data.CellAreaSquareKilometres();
         if (AcceptedCount >= MaximumCount
             || SustainableMaximumDepth < RequiredDepth
+            || BasinArea > SupportedBasinArea
+                + Data.CellAreaSquareKilometres()
             || BasinArea > SustainableMaximumLakeArea
             || AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
@@ -4687,18 +4722,31 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(211.0, 883.0),
         4, 0.54, 2.07
     );
-    // Reverted: this session tried a climate-linked crest sharpener here
-    // (Coldness, then Coldness+Aridity as "Harshness") plus a secondary
-    // ridge/peak-detail layer further down. Neither fixed the reported
-    // straight, flat-sided, geometric-looking peaks, and one attempt (a
-    // second ridged-noise layer) made it visibly worse. Reverted both back
-    // to the original fixed formula rather than keep layering unproven
-    // changes on top of a problem that predates this session's edits.
+    const double PeakProvinceA = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 0.82,
+        SeedOffset + FVector2D(2659.0, 1607.0),
+        4, 0.55, 2.03
+    );
+    const double PeakProvinceB = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 0.57,
+        SeedOffset + FVector2D(1237.0, 3011.0),
+        3, 0.53, 2.11
+    );
+    // A range is a continuous uplift belt, but its crest is not a continuous
+    // maximum-height rail. These two-dimensional peak provinces interrupt
+    // the belt with irregular saddles and concentrate its relief into peaks.
+    const double PeakStations = FMath::Pow(
+        Smooth01(FMath::Clamp(
+            (PeakProvinceA * 0.64 + PeakProvinceB * 0.36 - 0.34) / 0.58,
+            0.0, 1.0
+        )),
+        1.65
+    );
     const double CrestShape = FMath::Clamp(
-        0.88
-            + (CrestRidges - 0.50) * 0.16
-            + (CrestVariation - 0.50) * 0.12,
-        0.76, 1.03
+        0.72
+            + (CrestRidges - 0.50) * 0.32
+            + (CrestVariation - 0.50) * 0.28,
+        0.48, 1.14
     );
     OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
 
@@ -4801,18 +4849,14 @@ static double EvaluateLandform(
     const double SummitBreakup =
         FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
         * FMath::Lerp(0.78, 1.22, CrestVariation);
+    const double PeakAndSaddleHeight = FMath::Lerp(
+        0.30, 1.28, PeakStations
+    );
     const double ActivityScale = FMath::Lerp(0.62, 1.02, Activity);
     Height += Relief * ActivityScale * (
-        MountainEnvelope * 0.62 * CrestShape
-        + SummitCore * 0.38 * SummitBreakup
+        MountainEnvelope * 0.27 * (0.72 + CrestShape * 0.28)
+        + SummitCore * 0.62 * SummitBreakup * PeakAndSaddleHeight
     );
-
-    // Reverted: two attempts this session (a ridged secondary-ridge layer,
-    // then a plain-Fbm replacement) tried adding extra height detail here
-    // to break up the mountain belt's smooth cross-section. Neither was
-    // confirmed to fix the reported straight, flat-sided peaks, and the
-    // first made it visibly worse (a geometric "X" crease). Removed rather
-    // than keep stacking unproven changes on this code path.
 
     Height += FoothillEnvelope * Relief * 0.18
         * (0.72 + UplandRidges * 0.28);
@@ -5853,39 +5897,39 @@ static int32 ProjectRiverSplineToRenderedTerrain(
     TArray<FVector>& Points,
     bool bKeepStartDatum,
     bool bKeepEndDatum,
+    double InitialSearchHalfWidth,
     int32& OutMissedPoints,
-    int32& OutUphillSegments
+    int32& OutUphillSegments,
+    int32& OutReroutedPoints
 )
 {
     constexpr double SurfaceClearance = 35.0;
     constexpr double TraceHalfHeight = 5000000.0;
-    constexpr double UphillTolerance = 10.0;
-    int32 SnappedPoints = 0;
+    constexpr double UphillTolerance = 1.0;
     OutMissedPoints = 0;
     OutUphillSegments = 0;
+    OutReroutedPoints = 0;
+    if (Points.IsEmpty())
+    {
+        return 0;
+    }
 
     FCollisionObjectQueryParams ObjectQuery;
     ObjectQuery.AddObjectTypesToQuery(ECC_WorldStatic);
     FCollisionQueryParams QueryParams(
         SCENE_QUERY_STAT(AvenorRiverTerrainProjection), true
     );
-    TArray<FHitResult> Hits;
-    for (int32 Index = 0; Index < Points.Num(); ++Index)
+    auto TraceTerrain = [&](const FVector& SourcePoint, FVector& OutPoint)
     {
-        if ((Index == 0 && bKeepStartDatum)
-            || (Index + 1 == Points.Num() && bKeepEndDatum))
-        {
-            continue;
-        }
         const FVector Start(
-            Points[Index].X, Points[Index].Y,
-            Points[Index].Z + TraceHalfHeight
+            SourcePoint.X, SourcePoint.Y,
+            SourcePoint.Z + TraceHalfHeight
         );
         const FVector End(
-            Points[Index].X, Points[Index].Y,
-            Points[Index].Z - TraceHalfHeight
+            SourcePoint.X, SourcePoint.Y,
+            SourcePoint.Z - TraceHalfHeight
         );
-        Hits.Reset();
+        TArray<FHitResult> Hits;
         World.LineTraceMultiByObjectType(
             Hits, Start, End, ObjectQuery, QueryParams
         );
@@ -5899,11 +5943,243 @@ static int32 ProjectRiverSplineToRenderedTerrain(
         );
         if (!TerrainHit)
         {
-            ++OutMissedPoints;
-            continue;
+            return false;
         }
-        Points[Index].Z = TerrainHit->ImpactPoint.Z + SurfaceClearance;
-        ++SnappedPoints;
+        OutPoint = FVector(
+            SourcePoint.X,
+            SourcePoint.Y,
+            TerrainHit->ImpactPoint.Z + SurfaceClearance
+        );
+        return true;
+    };
+
+    struct FProjectionCandidate
+    {
+        FVector Point = FVector::ZeroVector;
+        double LateralOffset = 0.0;
+    };
+
+    const TArray<FVector> OriginalPoints = Points;
+    auto SolveWithinCorridor = [&](
+        double SearchHalfWidth,
+        int32 LateralSampleCount,
+        TArray<FVector>& OutSolution,
+        int32& OutMisses
+    )
+    {
+        TArray<TArray<FProjectionCandidate>> Candidates;
+        Candidates.SetNum(OriginalPoints.Num());
+        OutMisses = 0;
+        for (int32 Index = 0; Index < OriginalPoints.Num(); ++Index)
+        {
+            const bool bLockedDatum =
+                (Index == 0 && bKeepStartDatum)
+                || (Index + 1 == OriginalPoints.Num() && bKeepEndDatum);
+            if (bLockedDatum)
+            {
+                Candidates[Index].Add({OriginalPoints[Index], 0.0});
+                continue;
+            }
+
+            const int32 PreviousIndex = FMath::Max(0, Index - 1);
+            const int32 NextIndex = FMath::Min(
+                OriginalPoints.Num() - 1, Index + 1
+            );
+            FVector2D Tangent = FVector2D(
+                OriginalPoints[NextIndex] - OriginalPoints[PreviousIndex]
+            ).GetSafeNormal();
+            if (Tangent.IsNearlyZero())
+            {
+                Tangent = FVector2D(1.0, 0.0);
+            }
+            const FVector2D Normal = Rotate90(Tangent);
+            // Preserve exact graph/lake endpoint XY. Shared reach endpoints
+            // must remain one physical junction, while interior points may
+            // move laterally to the rendered thalweg.
+            const int32 Samples = (Index == 0 || Index + 1 == OriginalPoints.Num())
+                ? 1 : FMath::Max(3, LateralSampleCount | 1);
+            for (int32 Sample = 0; Sample < Samples; ++Sample)
+            {
+                const double Offset = Samples == 1
+                    ? 0.0
+                    : FMath::Lerp(
+                        -SearchHalfWidth,
+                        SearchHalfWidth,
+                        static_cast<double>(Sample) / (Samples - 1)
+                    );
+                FVector Probe = OriginalPoints[Index];
+                Probe.X += Normal.X * Offset;
+                Probe.Y += Normal.Y * Offset;
+                FVector Grounded;
+                if (TraceTerrain(Probe, Grounded))
+                {
+                    Candidates[Index].Add({Grounded, Offset});
+                }
+            }
+            if (Candidates[Index].IsEmpty())
+            {
+                ++OutMisses;
+                return false;
+            }
+        }
+
+        TArray<TArray<double>> Cost;
+        TArray<TArray<int32>> Previous;
+        Cost.SetNum(Candidates.Num());
+        Previous.SetNum(Candidates.Num());
+        const double CostScale = FMath::Max(1.0, SearchHalfWidth);
+        for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+        {
+            Cost[Index].Init(
+                TNumericLimits<double>::Max(), Candidates[Index].Num()
+            );
+            Previous[Index].Init(INDEX_NONE, Candidates[Index].Num());
+        }
+        for (int32 CandidateIndex = 0;
+             CandidateIndex < Candidates[0].Num(); ++CandidateIndex)
+        {
+            const double Offset =
+                Candidates[0][CandidateIndex].LateralOffset / CostScale;
+            Cost[0][CandidateIndex] = Offset * Offset;
+        }
+
+        for (int32 Index = 1; Index < Candidates.Num(); ++Index)
+        {
+            for (int32 CandidateIndex = 0;
+                 CandidateIndex < Candidates[Index].Num(); ++CandidateIndex)
+            {
+                const FProjectionCandidate& Candidate =
+                    Candidates[Index][CandidateIndex];
+                for (int32 PreviousIndex = 0;
+                     PreviousIndex < Candidates[Index - 1].Num();
+                     ++PreviousIndex)
+                {
+                    if (Cost[Index - 1][PreviousIndex]
+                            == TNumericLimits<double>::Max()
+                        || Candidate.Point.Z
+                            > Candidates[Index - 1][PreviousIndex].Point.Z
+                                + UphillTolerance)
+                    {
+                        continue;
+                    }
+                    const double Offset =
+                        Candidate.LateralOffset / CostScale;
+                    const double OffsetChange =
+                        (Candidate.LateralOffset
+                            - Candidates[Index - 1][PreviousIndex].LateralOffset)
+                        / CostScale;
+                    const double CandidateCost =
+                        Cost[Index - 1][PreviousIndex]
+                        + Offset * Offset * 0.18
+                        + OffsetChange * OffsetChange * 2.4;
+                    if (CandidateCost < Cost[Index][CandidateIndex])
+                    {
+                        Cost[Index][CandidateIndex] = CandidateCost;
+                        Previous[Index][CandidateIndex] = PreviousIndex;
+                    }
+                }
+            }
+        }
+
+        int32 BestCandidate = INDEX_NONE;
+        double BestCost = TNumericLimits<double>::Max();
+        const int32 LastIndex = Candidates.Num() - 1;
+        for (int32 CandidateIndex = 0;
+             CandidateIndex < Candidates[LastIndex].Num(); ++CandidateIndex)
+        {
+            if (Cost[LastIndex][CandidateIndex] < BestCost)
+            {
+                BestCost = Cost[LastIndex][CandidateIndex];
+                BestCandidate = CandidateIndex;
+            }
+        }
+        if (BestCandidate == INDEX_NONE)
+        {
+            return false;
+        }
+
+        OutSolution.SetNum(Candidates.Num());
+        for (int32 Index = LastIndex; Index >= 0; --Index)
+        {
+            OutSolution[Index] = Candidates[Index][BestCandidate].Point;
+            BestCandidate = Previous[Index][BestCandidate];
+            if (Index > 0 && BestCandidate == INDEX_NONE)
+            {
+                OutSolution.Reset();
+                return false;
+            }
+        }
+        return true;
+    };
+
+    TArray<FVector> Solution;
+    int32 AttemptMisses = 0;
+    const double BaseSearchWidth = FMath::Max(100.0, InitialSearchHalfWidth);
+    bool bSolved = SolveWithinCorridor(
+        BaseSearchWidth, 9, Solution, AttemptMisses
+    );
+    if (!bSolved)
+    {
+        bSolved = SolveWithinCorridor(
+            BaseSearchWidth * 2.0, 13, Solution, AttemptMisses
+        );
+    }
+    if (!bSolved)
+    {
+        bSolved = SolveWithinCorridor(
+            BaseSearchWidth * 3.0, 17, Solution, AttemptMisses
+        );
+    }
+
+    int32 SnappedPoints = 0;
+    if (bSolved)
+    {
+        Points = MoveTemp(Solution);
+        for (int32 Index = 0; Index < Points.Num(); ++Index)
+        {
+            const bool bLockedDatum =
+                (Index == 0 && bKeepStartDatum)
+                || (Index + 1 == Points.Num() && bKeepEndDatum);
+            if (!bLockedDatum)
+            {
+                ++SnappedPoints;
+            }
+            if (FVector2D::Distance(
+                    FVector2D(Points[Index]),
+                    FVector2D(OriginalPoints[Index])) > 1.0)
+            {
+                ++OutReroutedPoints;
+            }
+        }
+    }
+    else
+    {
+        // Never hide water underground as a fallback. If no descending
+        // rendered-surface course exists inside a three-cell corridor, leave
+        // every point visibly grounded and expose the reach as unresolved.
+        // That preserves evidence of a true routing failure instead of
+        // disguising it with a subterranean Z clamp.
+        OutMissedPoints = 0;
+        for (int32 Index = 0; Index < Points.Num(); ++Index)
+        {
+            const bool bLockedDatum =
+                (Index == 0 && bKeepStartDatum)
+                || (Index + 1 == Points.Num() && bKeepEndDatum);
+            if (bLockedDatum)
+            {
+                continue;
+            }
+            FVector Grounded;
+            if (TraceTerrain(OriginalPoints[Index], Grounded))
+            {
+                Points[Index] = Grounded;
+                ++SnappedPoints;
+            }
+            else
+            {
+                ++OutMissedPoints;
+            }
+        }
     }
 
     for (int32 Index = 1; Index < Points.Num(); ++Index)
@@ -7107,7 +7383,8 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     }
     int32 SnappedRiverPoints = 0;
     int32 MissedRiverPoints = 0;
-    int32 RawUphillRiverSegments = 0;
+    int32 UphillRiverSegments = 0;
+    int32 ReroutedRiverPoints = 0;
     TArray<TArray<FVector>> ProjectedRiverPoints;
     ProjectedRiverPoints.SetNum(Data->Rivers.Num());
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
@@ -7117,29 +7394,22 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         RiverPoints = ToWorldPoints(Reach.Points);
         int32 ReachMisses = 0;
         int32 ReachUphillSegments = 0;
+        int32 ReachReroutedPoints = 0;
         SnappedRiverPoints += ProjectRiverSplineToRenderedTerrain(
             *World,
             *TargetMeshPartition,
             RiverPoints,
             Data->Lakes.IsValidIndex(Reach.StartLakeIndex),
             Data->Lakes.IsValidIndex(Reach.EndLakeIndex),
+            FMath::Max(Data->CellSize * 0.50, Reach.Width * 1.5),
             ReachMisses,
-            ReachUphillSegments
+            ReachUphillSegments,
+            ReachReroutedPoints
         );
         MissedRiverPoints += ReachMisses;
-        RawUphillRiverSegments += ReachUphillSegments;
+        UphillRiverSegments += ReachUphillSegments;
+        ReroutedRiverPoints += ReachReroutedPoints;
     }
-
-    int32 CorrectedRiverSegments = 0;
-    int32 UphillRiverSegments = 0;
-    double MaximumRiverHeightCorrection = 0.0;
-    EnforceDownhillRiverNetwork(
-        *Data,
-        ProjectedRiverPoints,
-        CorrectedRiverSegments,
-        UphillRiverSegments,
-        MaximumRiverHeightCorrection
-    );
 
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
@@ -7166,20 +7436,18 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     if (UphillRiverSegments > 0 || MissedRiverPoints > 0)
     {
         LastRiverProjectionStatus = FString::Printf(
-            TEXT("%d snapped | %d corrected | %d misses | %d uphill"),
+            TEXT("%d snapped | %d rerouted | %d misses | %d uphill"),
             SnappedRiverPoints,
-            CorrectedRiverSegments,
+            ReroutedRiverPoints,
             MissedRiverPoints,
             UphillRiverSegments
         );
         UE_LOG(
             LogTemp,
             Warning,
-            TEXT("Avenor river terrain projection: %d points snapped, %d raw uphill segments, %d corrected (maximum %.1f cm), %d misses, %d uphill segments remain."),
+            TEXT("Avenor river terrain projection: %d points snapped to rendered terrain, %d moved laterally to a descending surface course, %d misses, %d uphill segments remain."),
             SnappedRiverPoints,
-            RawUphillRiverSegments,
-            CorrectedRiverSegments,
-            MaximumRiverHeightCorrection,
+            ReroutedRiverPoints,
             MissedRiverPoints,
             UphillRiverSegments
         );
@@ -7187,18 +7455,16 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     else
     {
         LastRiverProjectionStatus = FString::Printf(
-            TEXT("%d snapped | %d corrected | 0 misses | 0 uphill"),
+            TEXT("%d snapped | %d rerouted | 0 misses | 0 uphill"),
             SnappedRiverPoints,
-            CorrectedRiverSegments
+            ReroutedRiverPoints
         );
         UE_LOG(
             LogTemp,
             Display,
-            TEXT("Avenor river terrain projection: all %d points snapped; %d raw uphill segments, %d corrected (maximum %.1f cm), none remain."),
+            TEXT("Avenor river terrain projection: all %d points snapped to rendered terrain; %d moved laterally to a descending surface course; none rise downstream."),
             SnappedRiverPoints,
-            RawUphillRiverSegments,
-            CorrectedRiverSegments,
-            MaximumRiverHeightCorrection
+            ReroutedRiverPoints
         );
     }
 #endif
