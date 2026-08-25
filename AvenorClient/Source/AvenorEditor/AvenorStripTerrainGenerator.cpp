@@ -5028,11 +5028,20 @@ static FLandformHeightSource EvaluateMountainLandform(
 
 static FLandformHeightSource EvaluateFoothillLandform(
     double Relief,
-    double UplandRidges
+    double UplandRidges,
+    double MountainProximity
 )
 {
     FLandformHeightSource Source;
-    Source.HeightDelta = Relief * 0.22
+    // MountainProximity (BroadUpland) is 0 at the outer edge of the upland
+    // envelope and rises toward 1 approaching the mountain core. Without this
+    // term the foothill shelf was a fixed height regardless of proximity, so
+    // once mountain relief was corrected to a realistic scale it rose
+    // abruptly out of a flat plateau with nothing building up toward it.
+    // Ramping height with proximity gives the foothills a genuine climb into
+    // the massif instead of a lump dropped onto uniform ground.
+    const double Proximity = FMath::Clamp(MountainProximity, 0.0, 1.0);
+    Source.HeightDelta = Relief * FMath::Lerp(0.09, 0.30, Proximity)
         * (0.68 + UplandRidges * 0.32);
     Source.Resistance = 0.13;
     return Source;
@@ -5473,7 +5482,7 @@ static double EvaluateLandform(
         SummitCore, PeakRelief
     );
     const FLandformHeightSource FoothillSource = EvaluateFoothillLandform(
-        Relief, UplandRidges
+        Relief, UplandRidges, BroadUpland
     );
     FLandformHeightSource RollingHillSource =
         EvaluateRollingHillLandform(
