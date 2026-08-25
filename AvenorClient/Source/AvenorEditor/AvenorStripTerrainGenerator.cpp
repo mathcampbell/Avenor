@@ -34,6 +34,7 @@
 #include "WaterFalloffSettings.h"
 #include "Components/SplineComponent.h"
 #include "ProceduralMeshComponent.h"
+#include "StaticMeshCompiler.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
@@ -8105,6 +8106,14 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     {
         return;
     }
+    // The Mesh Partition's static mesh - the collision the river raycasts
+    // below depend on - rebuilds asynchronously through the engine's static
+    // mesh compiler. BindModifiersAndRefresh's ReregisterAllComponents() only
+    // queues that rebuild; it does not wait for it, so without this flush the
+    // raycasts below can run against a stale or still-building mesh and miss
+    // every point regardless of how long has elapsed since the terrain was
+    // generated. This was previously a silent 100% miss.
+    FStaticMeshCompilingManager::Get().FinishAllCompilation();
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     auto ToWorldPoints = [&](const TArray<FVector>& Source)
     {
