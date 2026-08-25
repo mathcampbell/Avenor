@@ -4974,16 +4974,20 @@ static FLandformHeightSource EvaluateMountainLandform(
     const double Peak = FMath::Clamp(
         (PeakRelief - 0.30) / (1.35 - 0.30), 0.0, 1.0
     );
-    // The broad uplift envelope supplies low connected shoulders, never a
-    // raised slab. The previous 0.24 constant made every saturated mountain
-    // cell share a high floor; erosion then roughened its walls while leaving
-    // a mesa-like crown. Most upper relief must instead come from irregular
-    // summit stations. Gaps between them remain genuine saddles, while the
-    // low shoulder term keeps the peaks part of one massif.
-    const double MassifShape = FMath::Pow(Massif, 1.18)
-        * (0.075 + Ridge * 0.115);
-    const double SummitShape = FMath::Pow(Massif * Summit, 1.32)
-        * (0.120 + Peak * 0.570);
+    // The massif itself must carry most of the relief budget - a real range
+    // is broadly elevated, with ridges and summit stations adding further
+    // height on top of it, not a low shoulder that depends on rare needles
+    // for all its height. Previous tuning raised these already-fractional
+    // masks (each in [0,1], from independent noise fields) through Pow(x,
+    // 1.18) and Pow(x, 1.32): raising a fraction to an exponent > 1 always
+    // shrinks it further, so those two stages compounded with Massif/Summit/
+    // Ridge/Peak all needing to be simultaneously high, capping real mountain
+    // relief at a few hundred metres almost everywhere regardless of
+    // classification. Plain multiplication keeps the same shape - Massif
+    // gates everything, Summit only matters inside the massif - without the
+    // repeated shrinkage.
+    const double MassifShape = Massif * (0.34 + Ridge * 0.26);
+    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60);
     const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
