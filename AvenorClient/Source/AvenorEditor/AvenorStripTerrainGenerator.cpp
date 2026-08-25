@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 36;
+static constexpr int32 GeneratorAlgorithmVersion = 37;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1532,6 +1532,66 @@ static void SmoothLowReliefTerrain(FAvenorStripData& Data, int32 Iterations)
     }
 }
 
+// Warm/hot wet plains should read as floodplain and wetland country, not as
+// the same small undulations used for dry grassland. This is a conservative
+// trend-preserving relaxation: it cannot create a flat datum or a closed
+// water basin, and it never touches mountains or dedicated hill regions.
+static void ShapeWetLowlands(FAvenorStripData& Data, int32 Iterations)
+{
+    const int32 CellCount = Data.Height.Num();
+    if (Iterations <= 0 || CellCount == 0
+        || Data.Temperature.Num() != CellCount
+        || Data.Moisture.Num() != CellCount
+        || Data.PlainsMask.Num() != CellCount)
+    {
+        return;
+    }
+
+    TArray<double> Shaped = Data.Height;
+    for (int32 Iteration = 0; Iteration < Iterations; ++Iteration)
+    {
+        Shaped = Data.Height;
+        for (int32 Y = 1; Y + 1 < Data.Rows; ++Y)
+        {
+            for (int32 X = 1; X + 1 < Data.Columns; ++X)
+            {
+                const int32 Cell = Data.Index(X, Y);
+                const double Warmth = Smooth01(FMath::Clamp(
+                    (Data.Temperature[Cell] - 0.44) / 0.42, 0.0, 1.0
+                ));
+                const double Wetness = Smooth01(FMath::Clamp(
+                    (Data.Moisture[Cell] - 0.56) / 0.34, 0.0, 1.0
+                ));
+                const double Support = FMath::Clamp(
+                    Data.PlainsMask[Cell] * Warmth * Wetness,
+                    0.0, 1.0
+                );
+                if (Support <= 0.03)
+                {
+                    continue;
+                }
+
+                double NeighborSum = 0.0;
+                for (int32 Direction = 0; Direction < 8; ++Direction)
+                {
+                    NeighborSum += Data.Height[Data.Index(
+                        X + NeighborX[Direction],
+                        Y + NeighborY[Direction]
+                    )];
+                }
+                const double LocalTrend = NeighborSum / 8.0;
+                const double Change = FMath::Clamp(
+                    (LocalTrend - Data.Height[Cell]) * Support * 0.46,
+                    -Data.CellSize * 0.08,
+                    Data.CellSize * 0.08
+                );
+                Shaped[Cell] = Data.Height[Cell] + Change;
+            }
+        }
+        Data.Height = Shaped;
+    }
+}
+
 static void ApplyThermalErosion(
     FAvenorStripData& Data,
     int32 Iterations,
@@ -2243,12 +2303,25 @@ static void ApplyMountainDrainageErosion(
                         / FMath::Max(0.01, Data.Accumulation[Cell]),
                     0.0, 1.0
                 ) : 1.0;
+            const double LocalTemperature = Data.Temperature.IsValidIndex(Cell)
+                ? FMath::Clamp(Data.Temperature[Cell], 0.0, 1.0) : 0.5;
+            const double LocalMoisture = Data.Moisture.IsValidIndex(Cell)
+                ? FMath::Clamp(Data.Moisture[Cell], 0.0, 1.0) : 0.5;
+            const double ColdMountain = Smooth01(FMath::Clamp(
+                (0.42 - LocalTemperature) / 0.30, 0.0, 1.0
+            ));
+            const double AlpineValley = ColdMountain
+                * Smooth01(FMath::Clamp(
+                    (LocalMoisture - 0.42) / 0.46, 0.0, 1.0
+                ))
+                * MountainSupport;
             const double Incision = FMath::Min(
                 Data.CellSize * 0.08,
                 Strength * Data.CellSize
                     * FMath::Lerp(0.032, 0.062, PassAlpha) * ChannelPower
                     * (0.35 + SlopePower * 0.65)
                     * MountainSupport * D8Dominance
+                    * FMath::Lerp(1.0, 1.28, AlpineValley)
             );
             Delta[Cell] = FMath::Max(Delta[Cell], Incision);
 
@@ -2258,22 +2331,40 @@ static void ApplyMountainDrainageErosion(
             // into a broad artificial excavation.
             const int32 X = Cell % Data.Columns;
             const int32 Y = Cell / Data.Columns;
-            for (int32 Direction = 0; Direction < 8; ++Direction)
+            const int32 ShoulderRadius = AlpineValley > 0.12 ? 2 : 1;
+            for (int32 DY = -ShoulderRadius; DY <= ShoulderRadius; ++DY)
             {
-                const int32 NX = X + NeighborX[Direction];
-                const int32 NY = Y + NeighborY[Direction];
-                if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY))
+                for (int32 DX = -ShoulderRadius; DX <= ShoulderRadius; ++DX)
                 {
-                    continue;
+                    if (DX == 0 && DY == 0)
+                    {
+                        continue;
+                    }
+                    const int32 NX = X + DX;
+                    const int32 NY = Y + DY;
+                    if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY))
+                    {
+                        continue;
+                    }
+                    const double Distance = FMath::Sqrt(
+                        static_cast<double>(DX * DX + DY * DY)
+                    );
+                    if (Distance > static_cast<double>(ShoulderRadius) + 0.15)
+                    {
+                        continue;
+                    }
+                    const int32 Neighbor = Data.Index(NX, NY);
+                    const double Falloff = 1.0 - Distance
+                        / (static_cast<double>(ShoulderRadius) + 0.75);
+                    const double ShoulderStrength = FMath::Lerp(
+                        0.18, 0.34, AlpineValley
+                    );
+                    Delta[Neighbor] = FMath::Max(
+                        Delta[Neighbor],
+                        Incision * ShoulderStrength * Falloff
+                            * Support[Neighbor]
+                    );
                 }
-                const int32 Neighbor = Data.Index(NX, NY);
-                const double DiagonalScale =
-                    NeighborX[Direction] != 0 && NeighborY[Direction] != 0
-                    ? 0.62 : 1.0;
-                Delta[Neighbor] = FMath::Max(
-                    Delta[Neighbor],
-                    Incision * 0.18 * DiagonalScale * Support[Neighbor]
-                );
             }
         }
 
@@ -4881,13 +4972,16 @@ static FLandformHeightSource EvaluateMountainLandform(
     const double Peak = FMath::Clamp(
         (PeakRelief - 0.30) / (1.35 - 0.30), 0.0, 1.0
     );
-    // The broad uplift envelope supplies the connected massif. Folded ridges
-    // and two-dimensional peak stations redistribute its upper relief into
-    // irregular shoulders, peaks and saddles. No term can become a uniform
-    // maximum-height cap, and the regional mountain weight still supplies the
-    // smooth fade into foothills around the entire source.
-    const double MassifShape = Massif * (0.24 + Ridge * 0.24);
-    const double SummitShape = Massif * Summit * (0.12 + Peak * 0.26);
+    // The broad uplift envelope supplies low connected shoulders, never a
+    // raised slab. The previous 0.24 constant made every saturated mountain
+    // cell share a high floor; erosion then roughened its walls while leaving
+    // a mesa-like crown. Most upper relief must instead come from irregular
+    // summit stations. Gaps between them remain genuine saddles, while the
+    // low shoulder term keeps the peaks part of one massif.
+    const double MassifShape = FMath::Pow(Massif, 1.18)
+        * (0.075 + Ridge * 0.115);
+    const double SummitShape = FMath::Pow(Massif * Summit, 1.32)
+        * (0.120 + Peak * 0.570);
     const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
@@ -4980,6 +5074,22 @@ static double EvaluateLandform(
             (0.58 - ClimateMoisture) / 0.48, 0.0, 1.0
         )) : 0.0;
     const double Aridity = HotFraction * Dryness;
+    const double Wetness = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateMoisture - 0.46) / 0.42, 0.0, 1.0
+        )) : 0.0;
+    const double TemperateFraction = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.16) / 0.20, 0.0, 1.0
+        )) * (1.0 - Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.52) / 0.18, 0.0, 1.0
+        ))) : 0.0;
+    const double WarmFraction = bClimateEnabled
+        ? Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.44) / 0.20, 0.0, 1.0
+        )) * (1.0 - Smooth01(FMath::Clamp(
+            (ClimateTemperature - 0.78) / 0.14, 0.0, 1.0
+        ))) : 0.0;
 
     const FVector2D SeedOffset(
         static_cast<double>((Seed * 92821) & 0x7ffff),
@@ -5321,10 +5431,27 @@ static double EvaluateLandform(
     const FLandformHeightSource FoothillSource = EvaluateFoothillLandform(
         Relief, UplandRidges
     );
-    const FLandformHeightSource RollingHillSource =
+    FLandformHeightSource RollingHillSource =
         EvaluateRollingHillLandform(
             Relief, Rolling, UplandRidges, HillDetail, HillDetailScale
         );
+    // Climate changes the character of a selected landform, not its regional
+    // ownership. Temperate wet hills stay broad and rounded; tropical wet
+    // uplands gain a little more erodible mass; wet warm lowlands become
+    // quieter floodplain candidates. None of these terms can leak into a
+    // mountain, dune or unrelated regional source.
+    const double TemperateCountry = TemperateFraction
+        * FMath::Lerp(0.82, 1.0, 1.0 - Wetness);
+    const double TropicalWet = HotFraction * Wetness;
+    const double WarmWet = WarmFraction * Wetness;
+    const double WetLowland = FMath::Clamp(
+        (WarmWet * 0.72 + TropicalWet)
+            * (LandformPlan.Plain + LandformPlan.RollingHill * 0.28),
+        0.0, 1.0
+    );
+    RollingHillSource.HeightDelta *= FMath::Lerp(
+        1.0, 0.78, WetLowland
+    );
     Height += LandformPlan.Mountain * MountainSource.HeightDelta;
     Height += LandformPlan.Foothill * FoothillSource.HeightDelta;
     Height += LandformPlan.RollingHill * RollingHillSource.HeightDelta;
@@ -5346,8 +5473,38 @@ static double EvaluateLandform(
     const FLandformHeightSource PlainSource = EvaluatePlainLandform(
         Relief, PlainRoll
     );
-    Height += LandformPlan.Plain * PlainSource.HeightDelta;
+    Height += LandformPlan.Plain * PlainSource.HeightDelta
+        * FMath::Lerp(1.0, 0.34, WetLowland);
     LandformResistance += LandformPlan.Plain * PlainSource.Resistance;
+
+    // Temperate country receives kilometre-scale rolling relief, not extra
+    // surface noise. In moist areas the amplitude falls slightly so erosion
+    // can form wide, softly shouldered valleys.
+    const double TemperateRoll = Fbm(
+        Warped, Scale * 0.92,
+        SeedOffset + FVector2D(2717.0, 941.0),
+        3, 0.54, 2.03
+    );
+    Height += Relief * 0.021 * TemperateCountry
+        * (LandformPlan.RollingHill + LandformPlan.Plain * 0.30)
+        * TemperateRoll;
+
+    // Hot-wet terrain is rounded, deeply weathered upland awaiting drainage
+    // dissection, rather than globally craggy jungle noise. This broad field
+    // is confined to foothills/rolling country and deliberately lowers rock
+    // resistance so the shared erosion pass can cut dense natural valleys.
+    const double TropicalMass = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 0.68,
+        SeedOffset + FVector2D(3527.0, 1861.0),
+        3, 0.56, 2.0
+    );
+    const double TropicalSupport = TropicalWet * FMath::Clamp(
+        LandformPlan.Foothill * 0.70 + LandformPlan.RollingHill,
+        0.0, 1.0
+    );
+    Height += Relief * 0.032 * TropicalSupport
+        * FMath::Pow(TropicalMass, 1.35);
+    LandformResistance *= FMath::Lerp(1.0, 0.62, TropicalSupport);
 
     OutDesertMask = Aridity * FMath::Clamp(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
@@ -5376,6 +5533,19 @@ static double EvaluateLandform(
             0.0, 1.0
         )
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
+
+    // Warm-dry country is savannah rather than a diluted hot desert. Keep
+    // most of it as long, quiet plains/rolling hills, but allow sparse broad
+    // resistant outcrops (kopje-like forms) without dunes, mesas or crags.
+    const double Savannah = WarmFraction * Dryness * FMath::Clamp(
+        LandformPlan.Plain + LandformPlan.RollingHill * 0.85,
+        0.0, 1.0
+    );
+    const double SavannahOutcrop = Savannah * FMath::Pow(
+        Smooth01(FMath::Clamp((Lithology - 0.70) / 0.26, 0.0, 1.0)),
+        2.2
+    );
+    Height += Relief * 0.018 * SavannahOutcrop;
 
     // Real dune fields aren't confined to dead-flat basins - gentle desert
     // hillslopes (ergs climbing a bajada, not just pan-flat sand seas) carry
@@ -5414,6 +5584,7 @@ static double EvaluateLandform(
         LandformResistance
             + OutDesertMask * 0.10
             + ResistantCap * 0.62
+            + SavannahOutcrop * 0.20
             + RiftShoulder * 0.10,
         0.0, 1.0
     );
@@ -6144,6 +6315,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     SmoothLowReliefTerrain(*Data, 3);
     ApplyTerrainClimate(*Data, Generator);
+    ShapeWetLowlands(*Data, 2);
 
     ApplyMountainDrainageErosion(
         *Data,
