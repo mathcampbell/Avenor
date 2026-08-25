@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 35;
+static constexpr int32 GeneratorAlgorithmVersion = 36;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2139,12 +2139,12 @@ static void ApplyMountainDrainageErosion(
         Support[Cell] = FMath::Clamp(Data.MountainMask[Cell], 0.0, 1.0);
     }
 
-    // Extend the erosional catchment through approximately the first 0.3 km
+    // Extend the erosional catchment through approximately the first 0.6 km
     // of attached foothills. A decaying max filter follows the regional
     // mountain edge without inventing erosion corridors in remote hill zones.
     const int32 ApronPasses = FMath::Clamp(
-        FMath::CeilToInt(30000.0 / FMath::Max(1.0, Data.CellSize)),
-        3, 12
+        FMath::CeilToInt(60000.0 / FMath::Max(1.0, Data.CellSize)),
+        3, 24
     );
     for (int32 Pass = 0; Pass < ApronPasses; ++Pass)
     {
@@ -2199,24 +2199,39 @@ static void ApplyMountainDrainageErosion(
         for (int32 Cell = 0; Cell < CellCount; ++Cell)
         {
             const double MountainSupport = Support[Cell];
-            if (MountainSupport <= 0.05 || Data.ReceiverA[Cell] == INDEX_NONE)
+            if (MountainSupport <= 0.05 ||
+                !Data.ReceiverD8.IsValidIndex(Cell) ||
+                Data.ReceiverD8[Cell] == INDEX_NONE)
             {
                 continue;
             }
 
-            // Closely spaced first-order gullies may begin high in the massif;
-            // the required contributing area increases towards its apron.
-            const double StartArea = MountainStartArea * FMath::Lerp(
-                0.42, 0.78, 1.0 - MountainSupport
-            );
-            const double AreaRatio = Data.Accumulation[Cell]
+            // Stack coarse-to-fine passes: establish the principal valleys
+            // first, then admit progressively smaller headwater catchments.
+            // Normalising by local runoff preserves old geomorphic drainage
+            // in cold/dry ranges instead of making their mountains uneroded.
+            const double PassAlpha = Passes > 1
+                ? static_cast<double>(Pass) / static_cast<double>(Passes - 1)
+                : 1.0;
+            const double MinimumFeatureArea =
+                Data.CellAreaSquareKilometres() * 8.0;
+            const double StartArea = FMath::Max(
+                MinimumFeatureArea,
+                MountainStartArea * FMath::Lerp(0.12, 0.045, PassAlpha)
+            ) * FMath::Lerp(0.72, 1.38, 1.0 - MountainSupport);
+            const double LocalRunoff = Data.Runoff.IsValidIndex(Cell)
+                ? FMath::Clamp(Data.Runoff[Cell], 0.15, 1.25) : 1.0;
+            const double GeomorphicArea = Data.AccumulationD8.IsValidIndex(Cell)
+                ? Data.AccumulationD8[Cell] / LocalRunoff
+                : Data.Accumulation[Cell];
+            const double AreaRatio = GeomorphicArea
                 / FMath::Max(0.01, StartArea);
             if (AreaRatio < 1.0)
             {
                 continue;
             }
             const double ChannelPower = Smooth01(FMath::Clamp(
-                FMath::Loge(1.0 + AreaRatio) / FMath::Loge(12.0),
+                FMath::Loge(1.0 + AreaRatio) / FMath::Loge(10.0),
                 0.0, 1.0
             ));
             const double SlopePower = Smooth01(FMath::Clamp(
@@ -2228,12 +2243,38 @@ static void ApplyMountainDrainageErosion(
                         / FMath::Max(0.01, Data.Accumulation[Cell]),
                     0.0, 1.0
                 ) : 1.0;
-            Delta[Cell] = FMath::Min(
-                Data.CellSize * 0.10,
-                Strength * Data.CellSize * 0.055 * ChannelPower
+            const double Incision = FMath::Min(
+                Data.CellSize * 0.08,
+                Strength * Data.CellSize
+                    * FMath::Lerp(0.032, 0.062, PassAlpha) * ChannelPower
                     * (0.35 + SlopePower * 0.65)
                     * MountainSupport * D8Dominance
             );
+            Delta[Cell] = FMath::Max(Delta[Cell], Incision);
+
+            // A one-cell thread reads as a cut trench rather than an eroded
+            // mountain valley. Give the channel a restrained shoulder while
+            // using max-composition so neighbouring tributaries cannot sum
+            // into a broad artificial excavation.
+            const int32 X = Cell % Data.Columns;
+            const int32 Y = Cell / Data.Columns;
+            for (int32 Direction = 0; Direction < 8; ++Direction)
+            {
+                const int32 NX = X + NeighborX[Direction];
+                const int32 NY = Y + NeighborY[Direction];
+                if (!Data.IsValid(NX, NY) || Data.IsBoundary(NX, NY))
+                {
+                    continue;
+                }
+                const int32 Neighbor = Data.Index(NX, NY);
+                const double DiagonalScale =
+                    NeighborX[Direction] != 0 && NeighborY[Direction] != 0
+                    ? 0.62 : 1.0;
+                Delta[Neighbor] = FMath::Max(
+                    Delta[Neighbor],
+                    Incision * 0.18 * DiagonalScale * Support[Neighbor]
+                );
+            }
         }
 
         for (int32 Cell = 0; Cell < CellCount; ++Cell)
@@ -4712,23 +4753,16 @@ static double EvaluateMountainPlacementPotential(
     );
     const FVector2D FoldedPosition =
         GeologicalWarped + FoldWarp * Scale * 0.30;
-    const double FoldRidges = RidgedFbm(
-        FoldedPosition,
-        Scale * 0.78,
-        SeedOffset + FVector2D(877.0, 149.0),
-        4
-    );
     const double FoldContinuity = 0.5 + 0.5 * Fbm(
         FoldedPosition, Scale * 1.65,
         SeedOffset + FVector2D(2851.0, 443.0),
         3, 0.55, 2.03
     );
-    const double BeltSignal = FMath::Clamp(
-        FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
-        0.0, 1.0
-    );
+    // Placement is a broad orogenic uplift envelope. The folded ridge field
+    // is evaluated later only to shape crests inside this envelope; using a
+    // thin ridge signal as the footprint produced isolated mesa-sized blobs.
     return FMath::Clamp(
-        BeltSignal * FMath::Lerp(0.08, 1.0, MountainProvince),
+        MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity),
         0.0, 1.0
     );
 }
@@ -4841,15 +4875,19 @@ static FLandformHeightSource EvaluateMountainLandform(
     FLandformHeightSource Source;
     const double Massif = FMath::Clamp(MountainMass, 0.0, 1.0);
     const double Summit = FMath::Clamp(SummitCore, 0.0, 1.0);
-    // The massif owns most of the elevation. Summit noise redistributes only
-    // the upper part of that relief into connected peaks and saddles; it does
-    // not add another entire mountain on top. CrestShape and PeakRelief remain
-    // unsaturated relative variations, so neighbouring summits do not meet a
-    // shared flat ceiling even though the overall relief budget is bounded.
-    const double MassifShape = Massif
-        * (0.40 + FMath::Clamp(CrestShape, 0.48, 1.14) * 0.13);
-    const double SummitShape = Massif * Summit
-        * FMath::Lerp(0.10, 0.34, FMath::Clamp(PeakRelief, 0.30, 1.35) / 1.35);
+    const double Ridge = FMath::Clamp(
+        (CrestShape - 0.48) / (1.14 - 0.48), 0.0, 1.0
+    );
+    const double Peak = FMath::Clamp(
+        (PeakRelief - 0.30) / (1.35 - 0.30), 0.0, 1.0
+    );
+    // The broad uplift envelope supplies the connected massif. Folded ridges
+    // and two-dimensional peak stations redistribute its upper relief into
+    // irregular shoulders, peaks and saddles. No term can become a uniform
+    // maximum-height cap, and the regional mountain weight still supplies the
+    // smooth fade into foothills around the entire source.
+    const double MassifShape = Massif * (0.24 + Ridge * 0.24);
+    const double SummitShape = Massif * Summit * (0.12 + Peak * 0.26);
     const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
@@ -5092,8 +5130,11 @@ static double EvaluateLandform(
         FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
         0.0, 1.0
     );
+    // Broad uplift decides where the mountain system exists. BeltSignal is
+    // deliberately absent from this placement mask and is used below only to
+    // make ridges and summit chains inside the accepted mountain province.
     const double MountainPotential = FMath::Clamp(
-        BeltSignal * FMath::Lerp(0.08, 1.0, MountainProvince),
+        MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity),
         0.0, 1.0
     );
     const double MountainSpan = FMath::Max(
@@ -5250,14 +5291,13 @@ static double EvaluateLandform(
         ),
         0.92
     ) * FMath::Lerp(0.78, 1.0, PositiveUplift);
-    const double SummitCore = FMath::Pow(
-        FMath::Clamp(
-            (MountainPotential - MountainCalibration.MountainThreshold)
-                / MountainSpan,
-            0.0, 1.0
-        ),
-        1.30
-    ) * FMath::Lerp(0.82, 1.0, PositiveUplift);
+    const double RidgeCore = FMath::Pow(
+        Smooth01(FMath::Clamp((BeltSignal - 0.34) / 0.58, 0.0, 1.0)),
+        1.25
+    );
+    const double SummitCore = RidgeCore
+        * FMath::Lerp(0.22, 1.0, PeakStations)
+        * FMath::Lerp(0.82, 1.0, PositiveUplift);
     const double SummitBreakup =
         FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
         * FMath::Lerp(0.78, 1.22, CrestVariation);
@@ -6107,8 +6147,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     ApplyMountainDrainageErosion(
         *Data,
-        FMath::Clamp(Generator.StreamPowerIterations / 2 + 1, 2, 3),
-        Generator.StreamPowerStrength * 0.70,
+        FMath::Clamp(Generator.StreamPowerIterations + 2, 5, 8),
+        Generator.StreamPowerStrength * 0.85,
         Generator.MountainStreamStartArea,
         Generator.DrainageEpsilon
     );
