@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 31;
+static constexpr int32 GeneratorAlgorithmVersion = 32;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2685,7 +2685,12 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
     for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
     {
         const double MountainFraction = FMath::Clamp(
-            Data.Slope[Cell] / 0.18, 0.0, 1.0
+            FMath::Max(
+                Data.Slope[Cell] / 0.18,
+                Data.MountainMask.IsValidIndex(Cell)
+                    ? Data.MountainMask[Cell] * 0.85 : 0.0
+            ),
+            0.0, 1.0
         );
         const double StartArea = FMath::Lerp(
             LowlandStartArea, MountainStartArea, MountainFraction
@@ -4576,13 +4581,10 @@ static double EvaluateLandform(
         PI
     );
     const double SeedAngleA = AvoidCardinalAlignment(RawSeedAngleA);
-    const double SeedAngleB = AvoidCardinalAlignment(RawSeedAngleB);
     const double SeedAngleC = AvoidCardinalAlignment(RawSeedAngleC);
     const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
-    const FVector2D AxisB(FMath::Cos(SeedAngleB), FMath::Sin(SeedAngleB));
     const FVector2D AxisC(FMath::Cos(SeedAngleC), FMath::Sin(SeedAngleC));
     const FVector2D AcrossA = Rotate90(AxisA);
-    const FVector2D AcrossB = Rotate90(AxisB);
     const FVector2D AcrossC = Rotate90(AxisC);
 
     auto Oriented = [](const FVector2D& P,
@@ -4666,41 +4668,42 @@ static double EvaluateLandform(
         (-Uplift + 0.10) / 0.88, 0.0, 1.0
     ));
 
-    // Bend each geological belt with a genuinely broad, restrained domain
-    // warp. A previous version used Scale*0.4 (a shorter wavelength) with an
-    // enormous 0.8*Scale displacement and consequently amplified local noise
-    // into corrugated relief rather than bending the range at macro scale.
-    const FVector2D BeltWarpedA = Warped + AcrossA * Fbm(
-        Warped, Scale * 3.8,
-        SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0
-    ) * Scale * 0.32;
-    const FVector2D BeltWarpedB = Warped + AcrossB * Fbm(
-        Warped, Scale * 3.4,
-        SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.0
-    ) * Scale * 0.30;
-    const double BeltA = RidgedFbm(
-        Oriented(BeltWarpedA, AxisA, AcrossA, 4.2, 0.82),
-        Scale * 0.95,
-        SeedOffset + FVector2D(421.0, 719.0),
-        3
+    // Geological folds must not expose a rotated Perlin lattice as parallel
+    // ruler lines. Previous versions stretched two noise fields along two
+    // global axes and blended them regionally; that produced the visible
+    // crosshatched stripe families. Instead, advect one isotropic ridge
+    // field through two broad, independent vector warps. Its local direction
+    // now bends continuously, branches and changes angle across the world.
+    const FVector2D GeologicalFlow(
+        Fbm(Warped, Scale * 2.9,
+            SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0),
+        Fbm(Warped, Scale * 2.7,
+            SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.03)
     );
-    const double BeltB = RidgedFbm(
-        Oriented(BeltWarpedB, AxisB, AcrossB, 3.4, 0.90),
-        Scale * 1.05,
+    const FVector2D GeologicalWarped =
+        Warped + GeologicalFlow * Scale * 0.58;
+    const FVector2D FoldWarp(
+        Fbm(GeologicalWarped, Scale * 1.45,
+            SeedOffset + FVector2D(3181.0, 1297.0), 3, 0.55, 2.07),
+        Fbm(GeologicalWarped, Scale * 1.30,
+            SeedOffset + FVector2D(421.0, 719.0), 3, 0.55, 1.97)
+    );
+    const FVector2D FoldedPosition =
+        GeologicalWarped + FoldWarp * Scale * 0.30;
+    const double FoldRidges = RidgedFbm(
+        FoldedPosition,
+        Scale * 0.78,
         SeedOffset + FVector2D(877.0, 149.0),
-        3
+        4
     );
-    // Select one dominant structural orientation regionally. Adding both
-    // ridged fields everywhere makes their crests visibly intersect as an X.
-    const double RawBeltSelector = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 3.6,
-        SeedOffset + FVector2D(3181.0, 1297.0), 3, 0.56, 2.0
+    const double FoldContinuity = 0.5 + 0.5 * Fbm(
+        FoldedPosition, Scale * 1.65,
+        SeedOffset + FVector2D(2851.0, 443.0),
+        3, 0.55, 2.03
     );
-    const double BeltSelector = Smooth01(FMath::Clamp(
-        (RawBeltSelector - 0.43) / 0.14, 0.0, 1.0
-    ));
     const double BeltSignal = FMath::Clamp(
-        FMath::Lerp(BeltA, BeltB, BeltSelector), 0.0, 1.0
+        FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
+        0.0, 1.0
     );
     double BroadRange = Smooth01(FMath::Clamp(
         (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
@@ -4780,17 +4783,17 @@ static double EvaluateLandform(
         0.0, 1.0
     );
 
-    const FVector2D RiftWarp = Warped + FVector2D(
-        Fbm(Warped, Scale * 1.2,
+    const FVector2D RiftWarp = GeologicalWarped + FVector2D(
+        Fbm(GeologicalWarped, Scale * 1.6,
             SeedOffset + FVector2D(509.0, 193.0), 3) * Scale * 0.16,
-        Fbm(Warped, Scale * 1.2,
+        Fbm(GeologicalWarped, Scale * 1.5,
             SeedOffset + FVector2D(827.0, 557.0), 3) * Scale * 0.16
     );
     const double RiftLine = RidgedFbm(
-        Oriented(RiftWarp, AxisB, AcrossB, 4.5, 0.72),
-        Scale * 0.72,
+        RiftWarp,
+        Scale * 0.82,
         SeedOffset + FVector2D(919.0, 1601.0),
-        5
+        4
     );
     const double RiftContinuity = 0.5 + 0.5 * Fbm(
         Warped, Scale * 1.8,
@@ -4831,19 +4834,17 @@ static double EvaluateLandform(
         + Uplift * Relief * 0.075
         + RegionalStructure * Relief * 0.025;
 
-    // The broad range mask deliberately saturates so it can describe one
-    // coherent mountain massif. It must not also be the summit height field:
-    // once BroadRange reached 1, unrelated crests all received effectively
-    // the same elevation and erosion could only round that artificial
-    // ceiling. Keep the envelope for the mountain mass, but derive summit
-    // relief from the unsaturated portion of BeltSignal. Only a BeltSignal of
-    // 1 reaches the summit field's maximum, rather than everything above the
-    // broad-mask threshold being flattened to the same value.
-    const double MountainEnvelope = FMath::Pow(
-        FMath::Clamp(OutMountainMask, 0.0, 1.0), 1.22
-    );
+    // The classification mask may saturate to describe one coherent massif,
+    // but elevation must remain tied to the unsaturated geological signal.
+    // Otherwise every accepted ridge receives the same summit height and
+    // becomes another flat-topped rail.
+    const double MountainMass = FMath::Pow(
+        FMath::Clamp((BeltSignal - 0.27) / 0.73, 0.0, 1.0),
+        1.45
+    ) * FMath::Lerp(0.52, 1.0, MountainProvince)
+      * FMath::Lerp(0.64, 1.0, PositiveUplift);
     const double SummitCore = FMath::Pow(
-        FMath::Clamp((BeltSignal - 0.38) / 0.62, 0.0, 1.0), 2.4
+        FMath::Clamp((BeltSignal - 0.33) / 0.67, 0.0, 1.0), 1.9
     ) * FMath::Lerp(0.45, 1.0, MountainProvince)
       * FMath::Lerp(0.60, 1.0, PositiveUplift);
     const double SummitBreakup =
@@ -4854,8 +4855,8 @@ static double EvaluateLandform(
     );
     const double ActivityScale = FMath::Lerp(0.62, 1.02, Activity);
     Height += Relief * ActivityScale * (
-        MountainEnvelope * 0.27 * (0.72 + CrestShape * 0.28)
-        + SummitCore * 0.62 * SummitBreakup * PeakAndSaddleHeight
+        MountainMass * 0.46 * (0.68 + CrestShape * 0.32)
+        + SummitCore * 0.44 * SummitBreakup * PeakAndSaddleHeight
     );
 
     Height += FoothillEnvelope * Relief * 0.18
