@@ -4814,13 +4814,45 @@ static double EvaluateMountainPlacementPotential(
             SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.03)
     );
     const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
+    // Real mountain systems are long, narrow orogenic belts, not round blobs -
+    // they form along linear tectonic boundaries. Without this, Province and
+    // Province2 are plain isotropic Fbm with no directional bias, so the
+    // mountain footprint comes out as round domes/clusters instead of a
+    // chain. A single mild elongation along one per-seed axis (not two
+    // crossing axes - that combination is what produced the earlier
+    // crosshatched-stripe artifact on the ridge/fold fields) keeps this a
+    // smooth, organic belt rather than a sharp geometric line: this is a
+    // coarse placement footprint, not a ridged signal, so it has no cusp to
+    // reveal a straight edge. Must match EvaluateLandform's AxisA exactly
+    // (Seed-only, no Position dependency) so calibration and per-cell
+    // evaluation see the same field.
+    const double RawSeedAngleA = FMath::Fmod(
+        FMath::Abs(static_cast<double>(Seed)) * 0.000913 + 0.37, PI
+    );
+    double SeedAngleAWrapped = FMath::Fmod(RawSeedAngleA, PI * 0.5);
+    if (SeedAngleAWrapped < 0.0)
+    {
+        SeedAngleAWrapped += PI * 0.5;
+    }
+    const double SeedAngleACardinalDistance = FMath::Min(
+        SeedAngleAWrapped, PI * 0.5 - SeedAngleAWrapped
+    );
+    const double SeedAngleA = FMath::Fmod(
+        RawSeedAngleA + (SeedAngleACardinalDistance < 0.14 ? 0.19 : 0.0), PI
+    );
+    const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
+    const FVector2D AcrossA = Rotate90(AxisA);
+    const FVector2D OrientedWarped(
+        FVector2D::DotProduct(Warped, AxisA) / 2.2,
+        FVector2D::DotProduct(Warped, AcrossA) / 1.0
+    );
     const double Province = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 1.55,
+        OrientedWarped, Scale * 1.55,
         SeedOffset + FVector2D(1901.0, 331.0),
         4, 0.57, 2.0
     );
     const double Province2 = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 1.15,
+        OrientedWarped, Scale * 1.15,
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
@@ -5153,13 +5185,17 @@ static double EvaluateLandform(
     );
     const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
 
+    // Elongated along the same per-seed AxisA as EvaluateMountainPlacementPotential
+    // (must match exactly - see the comment there) so the mountain/hill province
+    // forms a belt rather than a round dome cluster.
+    const FVector2D OrientedWarped = Oriented(Warped, AxisA, AcrossA, 2.2, 1.0);
     const double Province = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 1.55,
+        OrientedWarped, Scale * 1.55,
         SeedOffset + FVector2D(1901.0, 331.0),
         4, 0.57, 2.0
     );
     const double Province2 = 0.5 + 0.5 * Fbm(
-        Warped, Scale * 1.15,
+        OrientedWarped, Scale * 1.15,
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
