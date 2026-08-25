@@ -213,20 +213,13 @@ class AVENOREDITOR_API AAvenorStripTerrainGenerator : public AActor
 public:
     AAvenorStripTerrainGenerator();
 
-    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Generate and Bake Geography", ToolTip =
-        "Generates and bakes terrain, then rebuilds the Mesh Partition mesh. Does NOT create rivers/lakes - "
-        "press Regenerate Water from Baked Data afterwards, once the mesh rebuild has finished in the editor."))
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Generate and Bake Geography", ToolTip = "Generates and bakes terrain, then rebuilds the Mesh Partition mesh. Does NOT create rivers/lakes - press Regenerate Water from Baked Data afterwards, once the mesh rebuild has finished in the editor."))
     void GenerateCompleteWorld();
 
-    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Rebuild World from Baked Data", ToolTip =
-        "Rebuilds the terrain mesh from the already-baked data. Does NOT create rivers/lakes - "
-        "press Regenerate Water from Baked Data afterwards, once the mesh rebuild has finished in the editor."))
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Rebuild World from Baked Data", ToolTip = "Rebuilds the terrain mesh from the already-baked data. Does NOT create rivers/lakes - press Regenerate Water from Baked Data afterwards, once the mesh rebuild has finished in the editor."))
     void RebuildWorldFromBakedData();
 
-    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Regenerate Water from Baked Data", ToolTip =
-        "Creates rivers and lakes and projects them onto the current terrain mesh. Run this only after "
-        "Generate and Bake Geography (or Rebuild World from Baked Data) has finished rebuilding the mesh, "
-        "so rivers raycast against finished terrain rather than a stale or still-building mesh."))
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Regenerate Water from Baked Data", ToolTip = "Creates rivers and lakes and projects them onto the current terrain mesh. Run this only after Generate and Bake Geography (or Rebuild World from Baked Data) has finished rebuilding the mesh, so rivers raycast against finished terrain rather than a stale or still-building mesh."))
     void RegenerateWaterFromBakedData();
 
     UFUNCTION(CallInEditor, Category = "Avenor", meta = (DisplayName = "Generate Fast Preview"))
