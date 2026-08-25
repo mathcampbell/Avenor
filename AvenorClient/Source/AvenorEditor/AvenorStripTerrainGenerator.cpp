@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 33;
+static constexpr int32 GeneratorAlgorithmVersion = 34;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -4507,8 +4507,251 @@ float FAvenorStripData::SampleChannel(FName Channel, const FVector2D& Position) 
 
 namespace UE::Avenor::Strip
 {
+struct FMountainFieldCalibration
+{
+    double UplandThreshold = 0.25;
+    double MountainThreshold = 0.50;
+    double PeakReference = 0.80;
+};
+
+// Return the same broad warped geological potential used by EvaluateLandform.
+// This is sampled before terrain construction so thresholds are relative to
+// the current seed and world extent rather than fixed assumptions about the
+// numerical range of noise.
+static double EvaluateMountainPlacementPotential(
+    const FVector2D& Position,
+    int32 Seed,
+    double StructuralScale
+)
+{
+    const double Scale = FMath::Clamp(
+        StructuralScale, 100000.0, 5000000.0
+    );
+    const FVector2D SeedOffset(
+        static_cast<double>((Seed * 92821) & 0x7ffff),
+        static_cast<double>((Seed * 68917) & 0x7ffff)
+    );
+    const FVector2D MacroWarp(
+        Fbm(Position, Scale * 1.8,
+            SeedOffset + FVector2D(137.0, 911.0), 4, 0.56, 2.0),
+        Fbm(Position, Scale * 1.7,
+            SeedOffset + FVector2D(733.0, 271.0), 4, 0.56, 2.03)
+    );
+    const FVector2D Warped = Position + MacroWarp * Scale * 0.28;
+    const double Province = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.55,
+        SeedOffset + FVector2D(1901.0, 331.0),
+        4, 0.57, 2.0
+    );
+    const double Province2 = 0.5 + 0.5 * Fbm(
+        Warped, Scale * 1.15,
+        SeedOffset + FVector2D(433.0, 1777.0),
+        4, 0.55, 2.07
+    );
+    const double MountainProvince = Smooth01(FMath::Clamp(
+        (Province * 0.62 + Province2 * 0.38 - 0.55) / 0.31,
+        0.0, 1.0
+    ));
+    const FVector2D GeologicalFlow(
+        Fbm(Warped, Scale * 2.9,
+            SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0),
+        Fbm(Warped, Scale * 2.7,
+            SeedOffset + FVector2D(187.0, 2381.0), 3, 0.57, 2.03)
+    );
+    const FVector2D GeologicalWarped =
+        Warped + GeologicalFlow * Scale * 0.58;
+    const FVector2D FoldWarp(
+        Fbm(GeologicalWarped, Scale * 1.45,
+            SeedOffset + FVector2D(3181.0, 1297.0), 3, 0.55, 2.07),
+        Fbm(GeologicalWarped, Scale * 1.30,
+            SeedOffset + FVector2D(421.0, 719.0), 3, 0.55, 1.97)
+    );
+    const FVector2D FoldedPosition =
+        GeologicalWarped + FoldWarp * Scale * 0.30;
+    const double FoldRidges = RidgedFbm(
+        FoldedPosition,
+        Scale * 0.78,
+        SeedOffset + FVector2D(877.0, 149.0),
+        4
+    );
+    const double FoldContinuity = 0.5 + 0.5 * Fbm(
+        FoldedPosition, Scale * 1.65,
+        SeedOffset + FVector2D(2851.0, 443.0),
+        3, 0.55, 2.03
+    );
+    const double BeltSignal = FMath::Clamp(
+        FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
+        0.0, 1.0
+    );
+    return FMath::Clamp(
+        BeltSignal * FMath::Lerp(0.08, 1.0, MountainProvince),
+        0.0, 1.0
+    );
+}
+
+static FMountainFieldCalibration CalibrateMountainField(
+    const FBox& Bounds,
+    int32 Seed,
+    double StructuralScale
+)
+{
+    const bool bXIsLongAxis = Bounds.GetSize().X >= Bounds.GetSize().Y;
+    const int32 SamplesX = bXIsLongAxis ? 96 : 32;
+    const int32 SamplesY = bXIsLongAxis ? 32 : 96;
+    TArray<double> Samples;
+    Samples.Reserve(SamplesX * SamplesY);
+    for (int32 Y = 0; Y < SamplesY; ++Y)
+    {
+        for (int32 X = 0; X < SamplesX; ++X)
+        {
+            const FVector2D Position(
+                FMath::Lerp(
+                    Bounds.Min.X, Bounds.Max.X,
+                    (static_cast<double>(X) + 0.5) / SamplesX
+                ),
+                FMath::Lerp(
+                    Bounds.Min.Y, Bounds.Max.Y,
+                    (static_cast<double>(Y) + 0.5) / SamplesY
+                )
+            );
+            Samples.Add(EvaluateMountainPlacementPotential(
+                Position, Seed, StructuralScale
+            ));
+        }
+    }
+    Samples.Sort();
+    auto Quantile = [&Samples](double Fraction)
+    {
+        const double Position = FMath::Clamp(Fraction, 0.0, 1.0)
+            * static_cast<double>(Samples.Num() - 1);
+        const int32 Lower = FMath::FloorToInt(Position);
+        const int32 Upper = FMath::Min(Lower + 1, Samples.Num() - 1);
+        return FMath::Lerp(
+            Samples[Lower], Samples[Upper], Position - Lower
+        );
+    };
+
+    FMountainFieldCalibration Result;
+    // These are coverage controls, not elevation caps: approximately 45% of
+    // the world can form rolling upland/foothills, the strongest 16% can form
+    // mountain country, and the 98th percentile anchors full summit relief.
+    Result.UplandThreshold = Quantile(0.55);
+    Result.MountainThreshold = Quantile(0.84);
+    Result.PeakReference = FMath::Max(
+        Result.MountainThreshold + 0.02, Quantile(0.98)
+    );
+    return Result;
+}
+
+// Primary landform weights are mutually exclusive and always sum to one.
+// Each evaluator therefore owns its characteristic terrain instead of every
+// noise family being added everywhere. The broad weights also form the blend
+// envelope for future authored heightmap/PCG stamp sources.
+struct FLandformPlanWeights
+{
+    double Mountain = 0.0;
+    double Foothill = 0.0;
+    double RollingHill = 0.0;
+    double Plain = 1.0;
+};
+
+static FLandformPlanWeights BuildLandformPlan(
+    double MountainCore,
+    double UplandEnvelope,
+    double HillProvince
+)
+{
+    FLandformPlanWeights Plan;
+    Plan.Mountain = FMath::Clamp(MountainCore, 0.0, 1.0);
+    double Remaining = 1.0 - Plan.Mountain;
+    Plan.Foothill = Remaining * FMath::Clamp(UplandEnvelope, 0.0, 1.0);
+    Remaining -= Plan.Foothill;
+    Plan.RollingHill = Remaining * FMath::Clamp(HillProvince, 0.0, 1.0);
+    Remaining -= Plan.RollingHill;
+    Plan.Plain = FMath::Clamp(Remaining, 0.0, 1.0);
+    return Plan;
+}
+
+struct FLandformHeightSource
+{
+    double HeightDelta = 0.0;
+    double Resistance = 0.0;
+};
+
+// These evaluators intentionally return local deltas. An authored mountain,
+// dune or hill stamp can later be sampled, rotated/scaled and blended with the
+// corresponding source here without altering regional planning, erosion,
+// hydrology or any of the other landform generators.
+static FLandformHeightSource EvaluateMountainLandform(
+    double Relief,
+    double ActivityScale,
+    double MountainMass,
+    double CrestShape,
+    double SummitCore,
+    double PeakRelief
+)
+{
+    FLandformHeightSource Source;
+    const double RawMountainShape =
+        MountainMass * 0.44 * (0.68 + CrestShape * 0.32)
+        + SummitCore * 0.46 * PeakRelief;
+    // Preserve ordering above the normal summit range without either a hard
+    // ceiling or an explosive handful of multi-relief spikes. The logarithmic
+    // shoulder is strictly increasing, so an exceptional geological value is
+    // still higher than its neighbours and remains a genuine peak.
+    const double MountainShape = RawMountainShape <= 1.10
+        ? RawMountainShape
+        : 1.10 + FMath::Loge(1.0 + (RawMountainShape - 1.10) * 1.8) / 1.8;
+    Source.HeightDelta = Relief * ActivityScale * MountainShape;
+    Source.Resistance = 0.24;
+    return Source;
+}
+
+static FLandformHeightSource EvaluateFoothillLandform(
+    double Relief,
+    double UplandRidges
+)
+{
+    FLandformHeightSource Source;
+    Source.HeightDelta = Relief * 0.22
+        * (0.68 + UplandRidges * 0.32);
+    Source.Resistance = 0.13;
+    return Source;
+}
+
+static FLandformHeightSource EvaluateRollingHillLandform(
+    double Relief,
+    double Rolling,
+    double UplandRidges,
+    double HillDetail,
+    double HillDetailScale
+)
+{
+    FLandformHeightSource Source;
+    Source.HeightDelta = Relief * (
+        0.060
+        + (0.5 + 0.5 * Rolling) * 0.090
+        + UplandRidges * 0.030
+        + HillDetail * 0.008 * HillDetailScale
+    );
+    Source.Resistance = 0.08;
+    return Source;
+}
+
+static FLandformHeightSource EvaluatePlainLandform(
+    double Relief,
+    double PlainRoll
+)
+{
+    FLandformHeightSource Source;
+    Source.HeightDelta = Relief * PlainRoll * 0.014;
+    Source.Resistance = 0.015;
+    return Source;
+}
+
 static double EvaluateLandform(
     const FVector2D& Position,
+    const FMountainFieldCalibration& MountainCalibration,
     int32 Seed,
     double ReliefHeight,
     double StructuralScale,
@@ -4625,11 +4868,6 @@ static double EvaluateLandform(
         (Province * 0.42 + Province2 * 0.58 - 0.35) / 0.44,
         0.0, 1.0
     )) * (1.0 - MountainProvince * 0.46);
-    const double QuietProvince = FMath::Clamp(
-        1.0 - MountainProvince * 0.70 - HillProvince * 0.46,
-        0.0, 1.0
-    );
-
     const double PlateField = Fbm(
         Warped, Scale * 2.6,
         SeedOffset + FVector2D(1201.0, 331.0),
@@ -4705,24 +4943,30 @@ static double EvaluateLandform(
         FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
         0.0, 1.0
     );
-    // The geological ridge field describes shape, not universal terrain
-    // roughness. Give it a broad but genuine geographic on/off domain so
-    // folded/craggy relief cannot leak into plains, savannah or ordinary
-    // rolling-hill provinces. The low threshold and wide ramp retain broad
-    // mountain systems without returning to the old all-or-nothing gating.
-    const double MountainProvinceGate = Smooth01(FMath::Clamp(
-        (MountainProvince - 0.08) / 0.78, 0.0, 1.0
-    ));
-    const double MountainDomain = MountainProvinceGate * FMath::Lerp(
-        0.52, 1.0,
-        Smooth01(FMath::Clamp(
-            (PositiveUplift - 0.12) / 0.80, 0.0, 1.0
-        ))
-    );
-    double BroadRange = Smooth01(FMath::Clamp(
-        (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
+    const double MountainPotential = FMath::Clamp(
+        BeltSignal * FMath::Lerp(0.08, 1.0, MountainProvince),
         0.0, 1.0
-    )) * MountainDomain;
+    );
+    const double MountainSpan = FMath::Max(
+        0.02,
+        MountainCalibration.PeakReference
+            - MountainCalibration.MountainThreshold
+    );
+    const double UplandSpan = FMath::Max(
+        0.035,
+        MountainCalibration.PeakReference
+            - MountainCalibration.UplandThreshold
+    );
+    const double BroadRange = Smooth01(FMath::Clamp(
+        (MountainPotential - MountainCalibration.MountainThreshold)
+            / MountainSpan,
+        0.0, 1.0
+    ));
+    const double BroadUpland = Smooth01(FMath::Clamp(
+        (MountainPotential - MountainCalibration.UplandThreshold)
+            / UplandSpan,
+        0.0, 1.0
+    ));
 
     // Deliberately no strip-centre or spine term here. Geology is generated
     // independent of the monorail corridor; keeping the corridor buildable
@@ -4764,8 +5008,6 @@ static double EvaluateLandform(
             + (CrestVariation - 0.50) * 0.28,
         0.48, 1.14
     );
-    OutMountainMask = FMath::Clamp(BroadRange, 0.0, 1.0);
-
     const double UplandRidges = RidgedFbm(
         Warped, Scale * 0.62,
         SeedOffset + FVector2D(347.0, 1039.0),
@@ -4781,18 +5023,18 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(163.0, 1429.0),
         2, 0.52, 2.1
     );
-    const double FoothillEnvelope = Smooth01(FMath::Clamp(
-        (BeltSignal - 0.38) / 0.38, 0.0, 1.0
-    )) * MountainProvince * (1.0 - OutMountainMask * 0.52);
     const double IndependentHills = HillProvince * Smooth01(FMath::Clamp(
         (0.40 * UplandRidges
             + 0.40 * (0.5 + 0.5 * Rolling)
             + 0.20 * Province2 - 0.38) / 0.44,
         0.0, 1.0
     ));
+    const FLandformPlanWeights LandformPlan = BuildLandformPlan(
+        BroadRange, BroadUpland, IndependentHills
+    );
+    OutMountainMask = LandformPlan.Mountain;
     OutHillMask = FMath::Clamp(
-        FMath::Max(FoothillEnvelope * 0.82, IndependentHills)
-            * (1.0 - OutMountainMask * 0.62),
+        LandformPlan.Foothill + LandformPlan.RollingHill,
         0.0, 1.0
     );
 
@@ -4832,8 +5074,7 @@ static double EvaluateLandform(
         * (1.0 - OutMountainMask * 0.72);
 
     OutPlainsMask = FMath::Clamp(
-        FMath::Max(QuietProvince, 1.0 - OutMountainMask * 0.96
-            - OutHillMask * 0.72 - RiftMask * 0.42),
+        LandformPlan.Plain * (1.0 - RiftMask * 0.35),
         0.0, 1.0
     );
 
@@ -4851,39 +5092,59 @@ static double EvaluateLandform(
     // but elevation must remain tied to the unsaturated geological signal.
     // Otherwise every accepted ridge receives the same summit height and
     // becomes another flat-topped rail.
+    // PeakReference is a scale anchor, not a ceiling. Values above the 98th
+    // percentile retain headroom so exceptional summits remain higher than
+    // neighbouring crests instead of flattening into one clipped plateau.
     const double MountainMass = FMath::Pow(
-        FMath::Clamp((BeltSignal - 0.27) / 0.73, 0.0, 1.0),
-        1.45
-    ) * MountainDomain;
+        FMath::Clamp(
+            (MountainPotential - MountainCalibration.UplandThreshold)
+                / UplandSpan,
+            0.0, 1.35
+        ),
+        1.35
+    ) * FMath::Lerp(0.78, 1.0, PositiveUplift);
     const double SummitCore = FMath::Pow(
-        FMath::Clamp((BeltSignal - 0.33) / 0.67, 0.0, 1.0), 1.9
-    ) * FMath::Pow(MountainDomain, 1.15);
+        FMath::Clamp(
+            (MountainPotential - MountainCalibration.MountainThreshold)
+                / MountainSpan,
+            0.0, 1.50
+        ),
+        1.70
+    ) * FMath::Lerp(0.82, 1.0, PositiveUplift);
     const double SummitBreakup =
         FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
         * FMath::Lerp(0.78, 1.22, CrestVariation);
     const double PeakAndSaddleHeight = FMath::Lerp(
         0.30, 1.28, PeakStations
     );
-    const double ActivityScale = FMath::Lerp(0.62, 1.02, Activity);
-    Height += Relief * ActivityScale * (
-        MountainMass * 0.46 * (0.68 + CrestShape * 0.32)
-        + SummitCore * 0.44 * SummitBreakup * PeakAndSaddleHeight
+    const double PeakRelief = FMath::Clamp(
+        SummitBreakup * PeakAndSaddleHeight, 0.30, 1.35
     );
-
-    Height += FoothillEnvelope * Relief * 0.18
-        * (0.72 + UplandRidges * 0.28);
+    const double ActivityScale = FMath::Lerp(0.62, 1.02, Activity);
     // Humid hill country should be broad and rounded, not globally rougher.
     // Rolling controls the macro undulation; short detail is deliberately
     // small and fades further in moist climates.
     const double HillDetailScale = bClimateEnabled
         ? FMath::Lerp(1.0, 0.45, ClimateMoisture)
         : 0.70;
-    Height += IndependentHills * Relief * (
-        0.060
-        + (0.5 + 0.5 * Rolling) * 0.075
-        + UplandRidges * 0.025
-        + HillDetail * 0.008 * HillDetailScale
+    const FLandformHeightSource MountainSource = EvaluateMountainLandform(
+        Relief, ActivityScale, MountainMass, CrestShape,
+        SummitCore, PeakRelief
     );
+    const FLandformHeightSource FoothillSource = EvaluateFoothillLandform(
+        Relief, UplandRidges
+    );
+    const FLandformHeightSource RollingHillSource =
+        EvaluateRollingHillLandform(
+            Relief, Rolling, UplandRidges, HillDetail, HillDetailScale
+        );
+    Height += LandformPlan.Mountain * MountainSource.HeightDelta;
+    Height += LandformPlan.Foothill * FoothillSource.HeightDelta;
+    Height += LandformPlan.RollingHill * RollingHillSource.HeightDelta;
+    double LandformResistance =
+        LandformPlan.Mountain * MountainSource.Resistance
+        + LandformPlan.Foothill * FoothillSource.Resistance
+        + LandformPlan.RollingHill * RollingHillSource.Resistance;
 
     Height -= RiftMask * Relief * FMath::Lerp(0.12, 0.30, RiftAmount)
         * FMath::Lerp(0.86, 1.08, RiftLine);
@@ -4895,7 +5156,11 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(101.0, 43.0),
         3, 0.56, 2.0
     );
-    Height += OutPlainsMask * Relief * PlainRoll * 0.014;
+    const FLandformHeightSource PlainSource = EvaluatePlainLandform(
+        Relief, PlainRoll
+    );
+    Height += LandformPlan.Plain * PlainSource.HeightDelta;
+    LandformResistance += LandformPlan.Plain * PlainSource.Resistance;
 
     OutDesertMask = Aridity * FMath::Clamp(
         1.0 - OutMountainMask * 0.38, 0.0, 1.0
@@ -4918,7 +5183,9 @@ static double EvaluateLandform(
     // mesa-and-butte mountain terrain, not lush rounded ranges.
     const double ResistantCap = OutDesertMask
         * FMath::Clamp(
-            OutHillMask + FoothillEnvelope * 0.45 + OutMountainMask * 0.85,
+            LandformPlan.RollingHill
+                + LandformPlan.Foothill * 0.45
+                + LandformPlan.Mountain * 0.85,
             0.0, 1.0
         )
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
@@ -4957,8 +5224,7 @@ static double EvaluateLandform(
     }
 
     OutResistance = FMath::Clamp(
-        OutMountainMask * 0.24
-            + OutHillMask * 0.09
+        LandformResistance
             + OutDesertMask * 0.10
             + ResistantCap * 0.62
             + RiftShoulder * 0.10,
@@ -5367,6 +5633,52 @@ static void ReclassifyFinalLandforms(FAvenorStripData& Data)
     Data.PlainsMask = MoveTemp(NewPlains);
 }
 
+static void LogLandformStatistics(
+    const FAvenorStripData& Data,
+    const TCHAR* Stage
+)
+{
+    if (Data.Height.Num() == 0)
+    {
+        return;
+    }
+    double MinimumHeight = TNumericLimits<double>::Max();
+    double MaximumHeight = -TNumericLimits<double>::Max();
+    int32 MountainCells = 0;
+    int32 HillCells = 0;
+    int32 PlainCells = 0;
+    for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
+    {
+        MinimumHeight = FMath::Min(MinimumHeight, Data.Height[Cell]);
+        MaximumHeight = FMath::Max(MaximumHeight, Data.Height[Cell]);
+        MountainCells += (
+            Data.MountainMask.IsValidIndex(Cell)
+            && Data.MountainMask[Cell] >= 0.50
+        ) ? 1 : 0;
+        HillCells += (
+            Data.HillMask.IsValidIndex(Cell)
+            && Data.HillMask[Cell] >= 0.35
+        ) ? 1 : 0;
+        PlainCells += (
+            Data.PlainsMask.IsValidIndex(Cell)
+            && Data.PlainsMask[Cell] >= 0.50
+        ) ? 1 : 0;
+    }
+    const double CellCount = static_cast<double>(Data.Height.Num());
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor landforms %s: %.0f-%.0f m (%.0f m relief), mountain %.1f%%, hill/upland %.1f%%, plain %.1f%%"),
+        Stage,
+        MinimumHeight / 100.0,
+        MaximumHeight / 100.0,
+        (MaximumHeight - MinimumHeight) / 100.0,
+        static_cast<double>(MountainCells) * 100.0 / CellCount,
+        static_cast<double>(HillCells) * 100.0 / CellCount,
+        static_cast<double>(PlainCells) * 100.0 / CellCount
+    );
+}
+
 static void RefineClimateFromHydrology(
     FAvenorStripData& Data,
     const TArray<bool>& RiverNetwork,
@@ -5605,6 +5917,18 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     Data->RequestedMountainRanges = 0;
     Data->PlacedMountainRanges = 0;
+    const FMountainFieldCalibration MountainCalibration =
+        CalibrateMountainField(
+            Bounds, Generator.Seed, Generator.StructuralScale
+        );
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor landform plan: upland %.4f, mountain %.4f, peak %.4f"),
+        MountainCalibration.UplandThreshold,
+        MountainCalibration.MountainThreshold,
+        MountainCalibration.PeakReference
+    );
 
     for (int32 Cell = 0; Cell < CellCount; ++Cell)
     {
@@ -5614,7 +5938,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         double CellDesertMask = 0.0;
         double CellPlainsMask = 0.0;
         Data->Height[Cell] = EvaluateLandform(
-            Data->CellPosition(Cell), Generator.Seed,
+            Data->CellPosition(Cell), MountainCalibration, Generator.Seed,
             Generator.StructuralRelief, Generator.StructuralScale,
             Generator.TectonicActivity, Generator.RiftStrength,
             Generator.bGenerateClimate,
@@ -5628,6 +5952,8 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
         Data->DesertMask[Cell] = CellDesertMask;
         Data->PlainsMask[Cell] = CellPlainsMask;
     }
+
+    LogLandformStatistics(*Data, TEXT("planned"));
 
     SmoothLowReliefTerrain(*Data, 3);
     ApplyTerrainClimate(*Data, Generator);
@@ -5673,6 +5999,7 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     // mountain/hill/plains masks from the surviving surface, then reapply the
     // regional climate so altitude and final relief drive alpine transitions.
     ReclassifyFinalLandforms(*Data);
+    LogLandformStatistics(*Data, TEXT("after erosion"));
     ApplyTerrainClimate(*Data, Generator);
     ComputeDepressionFillHeight(*Data);
 
