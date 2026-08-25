@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 29;
+static constexpr int32 GeneratorAlgorithmVersion = 30;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2518,9 +2518,119 @@ struct FLakeCandidate
     double MinY = TNumericLimits<double>::Max();
     double MaxY = -TNumericLimits<double>::Max();
     bool bRiverTerminus = false;
+    int32 HydrologySeedCell = INDEX_NONE;
     int32 RimSpillCell = INDEX_NONE;
     double RimSpillHeight = TNumericLimits<double>::Max();
 };
+
+static bool BuildSustainableLakeFootprint(
+    const FAvenorStripData& Data,
+    const FLakeCandidate& Basin,
+    double SupportedArea,
+    TArray<int32>& OutCells,
+    double& OutSurfaceHeight,
+    double& OutMaximumDepth,
+    bool& bOutReachesSpill
+)
+{
+    OutCells.Reset();
+    OutSurfaceHeight = Basin.SurfaceHeight;
+    OutMaximumDepth = 0.0;
+    bOutReachesSpill = false;
+    if (Basin.Cells.IsEmpty() || Basin.HydrologySeedCell == INDEX_NONE)
+    {
+        return false;
+    }
+
+    const double CellArea = Data.CellAreaSquareKilometres();
+    const int32 MinimumPersistentCells = Basin.bRiverTerminus ? 9 : 0;
+    const int32 SupportedCellCount = FMath::Clamp(
+        FMath::FloorToInt(SupportedArea / FMath::Max(UE_DOUBLE_SMALL_NUMBER, CellArea)),
+        MinimumPersistentCells,
+        Basin.Cells.Num()
+    );
+    if (SupportedCellCount < 9)
+    {
+        return false;
+    }
+
+    if (SupportedCellCount >= Basin.Cells.Num())
+    {
+        OutCells = Basin.Cells;
+        bOutReachesSpill = true;
+    }
+    else
+    {
+        TArray<int32> HeightOrder = Basin.Cells;
+        HeightOrder.Sort([&Data](int32 A, int32 B)
+        {
+            return Data.Height[A] < Data.Height[B];
+        });
+        // The depression is the maximum container.  Its sustainable water
+        // budget chooses a lower contour inside that container; it must not
+        // automatically inherit the fill-to-spill shoreline.
+        OutSurfaceHeight = FMath::Min(
+            Basin.SurfaceHeight,
+            Data.Height[HeightOrder[SupportedCellCount - 1]]
+                + FMath::Max(1.0, Data.CellSize * 0.001)
+        );
+
+        TSet<int32> BasinMembership(Basin.Cells);
+        TSet<int32> WetMembership;
+        WetMembership.Reserve(SupportedCellCount);
+        for (int32 Cell : Basin.Cells)
+        {
+            if (Data.Height[Cell] <= OutSurfaceHeight)
+            {
+                WetMembership.Add(Cell);
+            }
+        }
+        if (!WetMembership.Contains(Basin.HydrologySeedCell))
+        {
+            return false;
+        }
+
+        constexpr int32 CardinalX[4] = {1, 0, -1, 0};
+        constexpr int32 CardinalY[4] = {0, 1, 0, -1};
+        TArray<int32> Queue;
+        TSet<int32> Visited;
+        Queue.Add(Basin.HydrologySeedCell);
+        Visited.Add(Basin.HydrologySeedCell);
+        for (int32 QueueIndex = 0; QueueIndex < Queue.Num(); ++QueueIndex)
+        {
+            const int32 Cell = Queue[QueueIndex];
+            OutCells.Add(Cell);
+            const int32 X = Cell % Data.Columns;
+            const int32 Y = Cell / Data.Columns;
+            for (int32 Direction = 0; Direction < 4; ++Direction)
+            {
+                const int32 NX = X + CardinalX[Direction];
+                const int32 NY = Y + CardinalY[Direction];
+                if (!Data.IsValid(NX, NY))
+                {
+                    continue;
+                }
+                const int32 Neighbor = Data.Index(NX, NY);
+                if (BasinMembership.Contains(Neighbor)
+                    && WetMembership.Contains(Neighbor)
+                    && !Visited.Contains(Neighbor))
+                {
+                    Visited.Add(Neighbor);
+                    Queue.Add(Neighbor);
+                }
+            }
+        }
+    }
+
+    for (int32 Cell : OutCells)
+    {
+        OutMaximumDepth = FMath::Max(
+            OutMaximumDepth,
+            OutSurfaceHeight - Data.Height[Cell]
+        );
+    }
+    return OutCells.Num() >= 9 && OutMaximumDepth > 0.0;
+}
 
 static TArray<bool> BuildAuthoritativeRiverNetwork(
     const FAvenorStripData& Data,
@@ -3177,11 +3287,20 @@ static void ExtractLakes(
             if (MandatorySeedSet.Contains(Cell))
             {
                 Basin.bRiverTerminus = true;
-                break;
             }
         }
-        const double SanityCap = SustainableMaximumLakeArea * 1.5;
-        if (Area >= Data.CellAreaSquareKilometres() * 2.0 && Area <= SanityCap)
+        if (!Basin.Cells.IsEmpty())
+        {
+            Basin.HydrologySeedCell = Basin.Cells[0];
+            for (int32 Cell : Basin.Cells)
+            {
+                if (Data.Height[Cell] < Data.Height[Basin.HydrologySeedCell])
+                {
+                    Basin.HydrologySeedCell = Cell;
+                }
+            }
+        }
+        if (Area >= Data.CellAreaSquareKilometres() * 2.0)
         {
             Basins.Add(MoveTemp(Basin));
         }
@@ -3208,14 +3327,15 @@ static void ExtractLakes(
     Data.RiverTerminusLakeCandidates = MandatoryBasins.Num();
     for (const FLakeCandidate& CandidateBasin : OrderedBasins)
     {
-        const double BasinArea = CandidateBasin.Cells.Num() * Data.CellAreaSquareKilometres();
+        const double FullBasinArea =
+            CandidateBasin.Cells.Num() * Data.CellAreaSquareKilometres();
         // A basin only a handful of cells across has no boundary detail for
         // the shoreline smoothing pipeline to work with - it traces as a
         // blocky, unmistakably grid-aligned near-rectangle no matter how
         // much smoothing runs afterward. Below this size it can never read
         // as a natural pond outline, so reject it as a lake outright rather
         // than spawn something that looks like a rendering bug.
-        if (BasinArea <= 0.0 || CandidateBasin.Cells.Num() < 9)
+        if (FullBasinArea <= 0.0 || CandidateBasin.Cells.Num() < 9)
         {
             continue;
         }
@@ -3250,36 +3370,68 @@ static void ExtractLakes(
             (0.58 - MeanMoisture) / 0.43, 0.0, 1.0
         ));
         const double EvaporationStress = HeatStress * DrynessStress;
-        // A closed basin carrying an authoritative river cannot simply be
-        // ignored because the climate is arid: doing so leaves the river to
-        // climb the spill rim. River-fed basins retain the base hydrological
-        // depth test; evaporation still limits optional lakes and should
-        // later influence their equilibrium shoreline, not invalidate the
-        // drainage topology.
         const double RequiredDepth = BaseRequiredDepth
-            * (CandidateBasin.bRiverTerminus
-                ? 1.0
-                : FMath::Lerp(1.0, 2.1, EvaporationStress));
-        const double SupportedBasinArea = FMath::Max(
-            Data.CellAreaSquareKilometres() * 4.0,
-            CandidateBasin.CatchmentArea
-                * (CandidateBasin.bRiverTerminus ? 0.20 : 0.10)
-                * FMath::Lerp(1.0, 0.30, EvaporationStress)
+            * FMath::Lerp(1.0, 1.8, EvaporationStress);
+        // AccumulationD8 already sums climate-derived runoff rather than raw
+        // catchment area.  Convert that effective inflow into a sustainable
+        // open-water footprint.  Moist climates retain a larger fraction;
+        // hot/dry climates lose much more to evaporation.  A river marks the
+        // basin as hydrologically important, but no longer grants the entire
+        // fill-to-spill depression for free.
+        const double MoistureRetention = FMath::Lerp(
+            0.035, 0.17, Smooth01(MeanMoisture)
         );
-        if (AcceptedCount >= MaximumCount ||
-            CandidateBasin.MaximumDepth < RequiredDepth ||
-            BasinArea > SustainableMaximumLakeArea ||
-            (!CandidateBasin.bRiverTerminus
-                && BasinArea > SupportedBasinArea) ||
-            AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
+        const double SupportedBasinArea = CandidateBasin.CatchmentArea
+            * MoistureRetention
+            * FMath::Lerp(1.0, 0.48, EvaporationStress);
+
+        TArray<int32> LakeCells;
+        double SustainableSurfaceHeight = CandidateBasin.SurfaceHeight;
+        double SustainableMaximumDepth = 0.0;
+        bool bReachesSpill = false;
+        if (!BuildSustainableLakeFootprint(
+                Data,
+                CandidateBasin,
+                SupportedBasinArea,
+                LakeCells,
+                SustainableSurfaceHeight,
+                SustainableMaximumDepth,
+                bReachesSpill
+            ))
         {
             continue;
         }
+        const double BasinArea =
+            LakeCells.Num() * Data.CellAreaSquareKilometres();
+        if (AcceptedCount >= MaximumCount
+            || SustainableMaximumDepth < RequiredDepth
+            || BasinArea > SustainableMaximumLakeArea
+            || AcceptedLakeArea + BasinArea > MaximumTotalLakeArea)
         {
-            const double BoundingWidth = FMath::Max(1.0, CandidateBasin.MaxX - CandidateBasin.MinX);
-            const double BoundingHeight = FMath::Max(1.0, CandidateBasin.MaxY - CandidateBasin.MinY);
-            const double FillRatio = BasinArea / FMath::Max(0.0001, (BoundingWidth * BoundingHeight) / 10000000000.0);
-            const double MinimumFillRatio = CandidateBasin.bRiverTerminus ? 0.12 : 0.18;
+            continue;
+        }
+
+        double LakeMinX = TNumericLimits<double>::Max();
+        double LakeMaxX = -TNumericLimits<double>::Max();
+        double LakeMinY = TNumericLimits<double>::Max();
+        double LakeMaxY = -TNumericLimits<double>::Max();
+        for (int32 Cell : LakeCells)
+        {
+            const FVector2D CellPosition = Data.CellPosition(Cell);
+            LakeMinX = FMath::Min(LakeMinX, CellPosition.X);
+            LakeMaxX = FMath::Max(LakeMaxX, CellPosition.X);
+            LakeMinY = FMath::Min(LakeMinY, CellPosition.Y);
+            LakeMaxY = FMath::Max(LakeMaxY, CellPosition.Y);
+        }
+        {
+            const double BoundingWidth = FMath::Max(1.0, LakeMaxX - LakeMinX);
+            const double BoundingHeight = FMath::Max(1.0, LakeMaxY - LakeMinY);
+            const double FillRatio = BasinArea / FMath::Max(
+                0.0001,
+                (BoundingWidth * BoundingHeight) / 10000000000.0
+            );
+            const double MinimumFillRatio = CandidateBasin.bRiverTerminus
+                ? 0.12 : 0.18;
             const double AspectRatio = FMath::Max(BoundingWidth, BoundingHeight)
                 / FMath::Max(1.0, FMath::Min(BoundingWidth, BoundingHeight));
             if (FillRatio < MinimumFillRatio
@@ -3300,9 +3452,9 @@ static void ExtractLakes(
             }
         }
         FLakeBasin Lake;
-        Lake.SurfaceHeight = CandidateBasin.SurfaceHeight;
+        Lake.SurfaceHeight = SustainableSurfaceHeight;
         Lake.MaximumDepth = FMath::Clamp(
-            FMath::Max(CandidateBasin.MaximumDepth, MinimumBedDepth),
+            FMath::Max(SustainableMaximumDepth, MinimumBedDepth),
             MinimumBedDepth, FMath::Max(MinimumBedDepth, MaximumBedDepth)
         );
         // The actual ground-carve depth for this specific basin, not floored
@@ -3310,26 +3462,28 @@ static void ExtractLakes(
         // basin should carve a shallow bed, not the same fixed depth as
         // every other lake in the world.
         Lake.ModifierBedDepth = FMath::Clamp(
-            CandidateBasin.MaximumDepth, 100.0, FMath::Max(100.0, MaximumBedDepth)
+            SustainableMaximumDepth,
+            100.0,
+            FMath::Max(100.0, MaximumBedDepth)
         );
         Lake.BankBlendWidth = BankBlendWidth;
         Lake.DepthRampWidth = DepthRampWidth;
         Lake.Shoreline = TraceComponentBoundary(
-            Data, CandidateBasin.Cells, Lake.SurfaceHeight, FeaturePointSpacing
+            Data, LakeCells, Lake.SurfaceHeight, FeaturePointSpacing
         );
         if (Lake.Shoreline.Num() < 4)
         {
             continue;
         }
-        Lake.ShorelineHeight = CandidateBasin.SurfaceHeight;
-        Lake.SurfaceHeight = CandidateBasin.SurfaceHeight
+        Lake.ShorelineHeight = SustainableSurfaceHeight;
+        Lake.SurfaceHeight = SustainableSurfaceHeight
             - FMath::Max(0.0, SurfaceInset);
         for (FVector& Point : Lake.Shoreline)
         {
             Point.Z = Lake.SurfaceHeight;
         }
         double BasinInradius = 0.0;
-        for (int32 Cell : CandidateBasin.Cells)
+        for (int32 Cell : LakeCells)
         {
             double EdgeDistance = 0.0;
             if (IsInsidePolygon(Data.CellPosition(Cell), Lake.Shoreline, &EdgeDistance))
@@ -3346,7 +3500,7 @@ static void ExtractLakes(
         }
         Lake.Bounds = Lake.Bounds.ExpandBy(BankBlendWidth);
         const int32 NewLakeIndex = Data.Lakes.Num();
-        for (int32 Cell : CandidateBasin.Cells)
+        for (int32 Cell : LakeCells)
         {
             Data.LakeIndex[Cell] = NewLakeIndex;
         }
@@ -3360,7 +3514,20 @@ static void ExtractLakes(
         {
             ++Data.AcceptedOptionalLakes;
         }
-        if (bWantOutflows && CandidateBasin.RimSpillCell != INDEX_NONE)
+        UE_LOG(
+            LogTemp,
+            Display,
+            TEXT("Avenor lake %d: runoff catchment %.2f km2 supports %.2f km2; accepted %.2f km2 of %.2f km2 depression at %.0f cm (%s)."),
+            Data.Lakes.Num() + 1,
+            CandidateBasin.CatchmentArea,
+            SupportedBasinArea,
+            BasinArea,
+            FullBasinArea,
+            Lake.SurfaceHeight,
+            bReachesSpill ? TEXT("spill-level/outflow") : TEXT("closed below spill")
+        );
+        if (bWantOutflows && bReachesSpill
+            && CandidateBasin.RimSpillCell != INDEX_NONE)
         {
             // Start at the first dry spill cell itself. Advancing immediately
             // to its receiver could skip the short connector between perched
@@ -5749,6 +5916,187 @@ static int32 ProjectRiverSplineToRenderedTerrain(
     return SnappedPoints;
 }
 
+static FIntPoint RiverEndpointKey(const FVector& Point)
+{
+    // Reach endpoints originate on common drainage cells, but lake pads and
+    // floating-point spline work can leave sub-centimetre differences.
+    constexpr double JunctionQuantization = 100.0;
+    return FIntPoint(
+        FMath::RoundToInt(Point.X / JunctionQuantization),
+        FMath::RoundToInt(Point.Y / JunctionQuantization)
+    );
+}
+
+static void EnforceDownhillRiverNetwork(
+    const FAvenorStripData& Data,
+    TArray<TArray<FVector>>& RiverPoints,
+    int32& OutCorrectedSegments,
+    int32& OutRemainingUphillSegments,
+    double& OutMaximumCorrection
+)
+{
+    constexpr double UphillTolerance = 10.0;
+    OutCorrectedSegments = 0;
+    OutRemainingUphillSegments = 0;
+    OutMaximumCorrection = 0.0;
+
+    TMap<FIntPoint, TArray<int32>> ReachesEndingAt;
+    for (int32 ReachIndex = 0; ReachIndex < RiverPoints.Num(); ++ReachIndex)
+    {
+        if (!RiverPoints[ReachIndex].IsEmpty())
+        {
+            ReachesEndingAt.FindOrAdd(
+                RiverEndpointKey(RiverPoints[ReachIndex].Last())
+            ).Add(ReachIndex);
+        }
+    }
+
+    TArray<bool> Processed;
+    Processed.Init(false, RiverPoints.Num());
+    int32 ProcessedCount = 0;
+    auto FinalizeReach = [&](int32 ReachIndex)
+    {
+        TArray<FVector>& Points = RiverPoints[ReachIndex];
+        if (Points.Num() < 2)
+        {
+            Processed[ReachIndex] = true;
+            ++ProcessedCount;
+            return;
+        }
+
+        const FRiverReach& Reach = Data.Rivers[ReachIndex];
+        const bool bLockedStart = Data.Lakes.IsValidIndex(Reach.StartLakeIndex);
+        const bool bLockedEnd = Data.Lakes.IsValidIndex(Reach.EndLakeIndex);
+        const TArray<int32>* Incoming = ReachesEndingAt.Find(
+            RiverEndpointKey(Points[0])
+        );
+        if (!bLockedStart && Incoming && !Incoming->IsEmpty())
+        {
+            double JunctionHeight = TNumericLimits<double>::Max();
+            for (int32 IncomingReach : *Incoming)
+            {
+                if (IncomingReach != ReachIndex
+                    && RiverPoints.IsValidIndex(IncomingReach)
+                    && !RiverPoints[IncomingReach].IsEmpty())
+                {
+                    JunctionHeight = FMath::Min(
+                        JunctionHeight,
+                        RiverPoints[IncomingReach].Last().Z
+                    );
+                }
+            }
+            if (JunctionHeight < TNumericLimits<double>::Max())
+            {
+                Points[0].Z = JunctionHeight;
+                for (int32 IncomingReach : *Incoming)
+                {
+                    if (IncomingReach != ReachIndex
+                        && RiverPoints.IsValidIndex(IncomingReach)
+                        && !RiverPoints[IncomingReach].IsEmpty())
+                    {
+                        FVector& IncomingEnd = RiverPoints[IncomingReach].Last();
+                        const double Correction = IncomingEnd.Z - JunctionHeight;
+                        if (Correction > UphillTolerance)
+                        {
+                            ++OutCorrectedSegments;
+                            OutMaximumCorrection = FMath::Max(
+                                OutMaximumCorrection, Correction
+                            );
+                        }
+                        IncomingEnd.Z = JunctionHeight;
+                    }
+                }
+            }
+        }
+
+        for (int32 PointIndex = 1; PointIndex < Points.Num(); ++PointIndex)
+        {
+            if (bLockedEnd && PointIndex + 1 == Points.Num())
+            {
+                continue;
+            }
+            if (Points[PointIndex].Z > Points[PointIndex - 1].Z)
+            {
+                const double Correction =
+                    Points[PointIndex].Z - Points[PointIndex - 1].Z;
+                if (Correction > UphillTolerance)
+                {
+                    ++OutCorrectedSegments;
+                }
+                OutMaximumCorrection = FMath::Max(
+                    OutMaximumCorrection, Correction
+                );
+                Points[PointIndex].Z = Points[PointIndex - 1].Z;
+            }
+        }
+        Processed[ReachIndex] = true;
+        ++ProcessedCount;
+    };
+
+    // A downstream reach inherits the finalized elevation of every reach
+    // entering its junction.  Reaches are stored by visual score, not graph
+    // order, so explicitly walk the directed network instead of trusting the
+    // array order.
+    for (int32 Pass = 0; Pass < RiverPoints.Num() && ProcessedCount < RiverPoints.Num(); ++Pass)
+    {
+        bool bMadeProgress = false;
+        for (int32 ReachIndex = 0; ReachIndex < RiverPoints.Num(); ++ReachIndex)
+        {
+            if (Processed[ReachIndex] || RiverPoints[ReachIndex].IsEmpty())
+            {
+                continue;
+            }
+            const TArray<int32>* Incoming = ReachesEndingAt.Find(
+                RiverEndpointKey(RiverPoints[ReachIndex][0])
+            );
+            bool bReady = true;
+            if (Incoming)
+            {
+                for (int32 IncomingReach : *Incoming)
+                {
+                    if (IncomingReach != ReachIndex && !Processed[IncomingReach])
+                    {
+                        bReady = false;
+                        break;
+                    }
+                }
+            }
+            if (bReady)
+            {
+                FinalizeReach(ReachIndex);
+                bMadeProgress = true;
+            }
+        }
+        if (!bMadeProgress)
+        {
+            break;
+        }
+    }
+
+    // Defensive fallback for malformed/cyclic endpoint metadata.  The D8
+    // drainage graph should be acyclic, but no reach is allowed to escape the
+    // local monotonic guarantee merely because endpoint matching failed.
+    for (int32 ReachIndex = 0; ReachIndex < RiverPoints.Num(); ++ReachIndex)
+    {
+        if (!Processed[ReachIndex])
+        {
+            FinalizeReach(ReachIndex);
+        }
+    }
+
+    for (const TArray<FVector>& Points : RiverPoints)
+    {
+        for (int32 PointIndex = 1; PointIndex < Points.Num(); ++PointIndex)
+        {
+            if (Points[PointIndex].Z
+                > Points[PointIndex - 1].Z + UphillTolerance)
+            {
+                ++OutRemainingUphillSegments;
+            }
+        }
+    }
+}
+
 static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
 {
     ConfigureWaterSpline(Spline, Points, false);
@@ -6759,11 +7107,14 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     }
     int32 SnappedRiverPoints = 0;
     int32 MissedRiverPoints = 0;
-    int32 UphillRiverSegments = 0;
+    int32 RawUphillRiverSegments = 0;
+    TArray<TArray<FVector>> ProjectedRiverPoints;
+    ProjectedRiverPoints.SetNum(Data->Rivers.Num());
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
         const FRiverReach& Reach = Data->Rivers[Index];
-        TArray<FVector> RiverPoints = ToWorldPoints(Reach.Points);
+        TArray<FVector>& RiverPoints = ProjectedRiverPoints[Index];
+        RiverPoints = ToWorldPoints(Reach.Points);
         int32 ReachMisses = 0;
         int32 ReachUphillSegments = 0;
         SnappedRiverPoints += ProjectRiverSplineToRenderedTerrain(
@@ -6776,7 +7127,24 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ReachUphillSegments
         );
         MissedRiverPoints += ReachMisses;
-        UphillRiverSegments += ReachUphillSegments;
+        RawUphillRiverSegments += ReachUphillSegments;
+    }
+
+    int32 CorrectedRiverSegments = 0;
+    int32 UphillRiverSegments = 0;
+    double MaximumRiverHeightCorrection = 0.0;
+    EnforceDownhillRiverNetwork(
+        *Data,
+        ProjectedRiverPoints,
+        CorrectedRiverSegments,
+        UphillRiverSegments,
+        MaximumRiverHeightCorrection
+    );
+
+    for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
+    {
+        const FRiverReach& Reach = Data->Rivers[Index];
+        const TArray<FVector>& RiverPoints = ProjectedRiverPoints[Index];
         if (AWaterBodyRiver* River = SpawnWaterActor<AWaterBodyRiver>(
             *World,
             FString::Printf(TEXT("Avenor_Strip_River_%03d"), Index + 1),
@@ -6798,16 +7166,20 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     if (UphillRiverSegments > 0 || MissedRiverPoints > 0)
     {
         LastRiverProjectionStatus = FString::Printf(
-            TEXT("%d snapped | %d misses | %d uphill"),
+            TEXT("%d snapped | %d corrected | %d misses | %d uphill"),
             SnappedRiverPoints,
+            CorrectedRiverSegments,
             MissedRiverPoints,
             UphillRiverSegments
         );
         UE_LOG(
             LogTemp,
             Warning,
-            TEXT("Avenor river terrain projection: %d points snapped to rendered Mesh Partition, %d misses, %d uphill segments exposed."),
+            TEXT("Avenor river terrain projection: %d points snapped, %d raw uphill segments, %d corrected (maximum %.1f cm), %d misses, %d uphill segments remain."),
             SnappedRiverPoints,
+            RawUphillRiverSegments,
+            CorrectedRiverSegments,
+            MaximumRiverHeightCorrection,
             MissedRiverPoints,
             UphillRiverSegments
         );
@@ -6815,14 +7187,18 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     else
     {
         LastRiverProjectionStatus = FString::Printf(
-            TEXT("%d snapped | 0 misses | 0 uphill"),
-            SnappedRiverPoints
+            TEXT("%d snapped | %d corrected | 0 misses | 0 uphill"),
+            SnappedRiverPoints,
+            CorrectedRiverSegments
         );
         UE_LOG(
             LogTemp,
             Display,
-            TEXT("Avenor river terrain projection: all %d points snapped to rendered Mesh Partition; no uphill segments."),
-            SnappedRiverPoints
+            TEXT("Avenor river terrain projection: all %d points snapped; %d raw uphill segments, %d corrected (maximum %.1f cm), none remain."),
+            SnappedRiverPoints,
+            RawUphillRiverSegments,
+            CorrectedRiverSegments,
+            MaximumRiverHeightCorrection
         );
     }
 #endif
