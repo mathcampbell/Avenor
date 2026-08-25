@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 34;
+static constexpr int32 GeneratorAlgorithmVersion = 35;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -2109,6 +2109,150 @@ static double ErosionDrainageSourceMultiplier(
         FMath::Min(Active, 1.85),
         FMath::Min(Active, 1.20),
         Desert
+    );
+}
+
+// Give newly planned mountain massifs their first drainage structure before
+// the general terrain erosion runs. This is deliberately not another global
+// erosion pass: the support mask begins with the regional mountain plan and
+// can spread only a short distance into its own foothills. Plains, rolling
+// country, deserts and dunes therefore retain their specialised profiles.
+static void ApplyMountainDrainageErosion(
+    FAvenorStripData& Data,
+    int32 Passes,
+    double Strength,
+    double MountainStartArea,
+    double Epsilon
+)
+{
+    const int32 CellCount = Data.Height.Num();
+    if (Passes <= 0 || Strength <= 0.0 || CellCount == 0 ||
+        Data.MountainMask.Num() != CellCount)
+    {
+        return;
+    }
+
+    TArray<double> Support;
+    Support.SetNumUninitialized(CellCount);
+    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    {
+        Support[Cell] = FMath::Clamp(Data.MountainMask[Cell], 0.0, 1.0);
+    }
+
+    // Extend the erosional catchment through approximately the first 0.3 km
+    // of attached foothills. A decaying max filter follows the regional
+    // mountain edge without inventing erosion corridors in remote hill zones.
+    const int32 ApronPasses = FMath::Clamp(
+        FMath::CeilToInt(30000.0 / FMath::Max(1.0, Data.CellSize)),
+        3, 12
+    );
+    for (int32 Pass = 0; Pass < ApronPasses; ++Pass)
+    {
+        TArray<double> Expanded = Support;
+        for (int32 Y = 1; Y < Data.Rows - 1; ++Y)
+        {
+            for (int32 X = 1; X < Data.Columns - 1; ++X)
+            {
+                const int32 Cell = Data.Index(X, Y);
+                double NeighborSupport = 0.0;
+                for (int32 DY = -1; DY <= 1; ++DY)
+                {
+                    for (int32 DX = -1; DX <= 1; ++DX)
+                    {
+                        if (DX == 0 && DY == 0)
+                        {
+                            continue;
+                        }
+                        NeighborSupport = FMath::Max(
+                            NeighborSupport,
+                            Support[Data.Index(X + DX, Y + DY)]
+                        );
+                    }
+                }
+                const double AttachedFoothill = FMath::Clamp(
+                    Data.MountainMask[Cell]
+                        + (Data.HillMask.IsValidIndex(Cell)
+                            ? Data.HillMask[Cell] * 0.85 : 0.0),
+                    0.0, 1.0
+                );
+                Expanded[Cell] = FMath::Max(
+                    Expanded[Cell], NeighborSupport * 0.86 * AttachedFoothill
+                );
+            }
+        }
+        Support = MoveTemp(Expanded);
+    }
+
+    int32 SupportedCells = 0;
+    for (double Value : Support)
+    {
+        SupportedCells += Value > 0.05 ? 1 : 0;
+    }
+
+    for (int32 Pass = 0; Pass < Passes; ++Pass)
+    {
+        PriorityFlood(Data, Epsilon);
+        BuildContinuousFlow(Data);
+        TArray<double> Delta;
+        Delta.Init(0.0, CellCount);
+
+        for (int32 Cell = 0; Cell < CellCount; ++Cell)
+        {
+            const double MountainSupport = Support[Cell];
+            if (MountainSupport <= 0.05 || Data.ReceiverA[Cell] == INDEX_NONE)
+            {
+                continue;
+            }
+
+            // Closely spaced first-order gullies may begin high in the massif;
+            // the required contributing area increases towards its apron.
+            const double StartArea = MountainStartArea * FMath::Lerp(
+                0.42, 0.78, 1.0 - MountainSupport
+            );
+            const double AreaRatio = Data.Accumulation[Cell]
+                / FMath::Max(0.01, StartArea);
+            if (AreaRatio < 1.0)
+            {
+                continue;
+            }
+            const double ChannelPower = Smooth01(FMath::Clamp(
+                FMath::Loge(1.0 + AreaRatio) / FMath::Loge(12.0),
+                0.0, 1.0
+            ));
+            const double SlopePower = Smooth01(FMath::Clamp(
+                Data.Slope[Cell] / 0.16, 0.0, 1.0
+            ));
+            const double D8Dominance = Data.AccumulationD8.IsValidIndex(Cell)
+                ? FMath::Clamp(
+                    Data.AccumulationD8[Cell]
+                        / FMath::Max(0.01, Data.Accumulation[Cell]),
+                    0.0, 1.0
+                ) : 1.0;
+            Delta[Cell] = FMath::Min(
+                Data.CellSize * 0.10,
+                Strength * Data.CellSize * 0.055 * ChannelPower
+                    * (0.35 + SlopePower * 0.65)
+                    * MountainSupport * D8Dominance
+            );
+        }
+
+        for (int32 Cell = 0; Cell < CellCount; ++Cell)
+        {
+            Data.Height[Cell] -= Delta[Cell];
+        }
+    }
+
+    PriorityFlood(Data, Epsilon);
+    BuildContinuousFlow(Data);
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor mountain shaping: %d drainage passes across %.1f%% mountain/foothill support."),
+        Passes,
+        CellCount > 0
+            ? 100.0 * static_cast<double>(SupportedCells)
+                / static_cast<double>(CellCount)
+            : 0.0
     );
 }
 
@@ -4633,10 +4777,13 @@ static FMountainFieldCalibration CalibrateMountainField(
 
     FMountainFieldCalibration Result;
     // These are coverage controls, not elevation caps: approximately 45% of
-    // the world can form rolling upland/foothills, the strongest 16% can form
-    // mountain country, and the 98th percentile anchors full summit relief.
+    // the world can form rolling upland/foothills, the strongest 22% can form
+    // mountain country, and the 98th percentile anchors the summit cores.
+    // Starting the mountain transition below the extreme tail gives every
+    // summit several kilometres of supporting massif instead of promoting
+    // isolated top-percentile analysis cells into needles.
     Result.UplandThreshold = Quantile(0.55);
-    Result.MountainThreshold = Quantile(0.84);
+    Result.MountainThreshold = Quantile(0.78);
     Result.PeakReference = FMath::Max(
         Result.MountainThreshold + 0.02, Quantile(0.98)
     );
@@ -4692,16 +4839,18 @@ static FLandformHeightSource EvaluateMountainLandform(
 )
 {
     FLandformHeightSource Source;
-    const double RawMountainShape =
-        MountainMass * 0.44 * (0.68 + CrestShape * 0.32)
-        + SummitCore * 0.46 * PeakRelief;
-    // Preserve ordering above the normal summit range without either a hard
-    // ceiling or an explosive handful of multi-relief spikes. The logarithmic
-    // shoulder is strictly increasing, so an exceptional geological value is
-    // still higher than its neighbours and remains a genuine peak.
-    const double MountainShape = RawMountainShape <= 1.10
-        ? RawMountainShape
-        : 1.10 + FMath::Loge(1.0 + (RawMountainShape - 1.10) * 1.8) / 1.8;
+    const double Massif = FMath::Clamp(MountainMass, 0.0, 1.0);
+    const double Summit = FMath::Clamp(SummitCore, 0.0, 1.0);
+    // The massif owns most of the elevation. Summit noise redistributes only
+    // the upper part of that relief into connected peaks and saddles; it does
+    // not add another entire mountain on top. CrestShape and PeakRelief remain
+    // unsaturated relative variations, so neighbouring summits do not meet a
+    // shared flat ceiling even though the overall relief budget is bounded.
+    const double MassifShape = Massif
+        * (0.40 + FMath::Clamp(CrestShape, 0.48, 1.14) * 0.13);
+    const double SummitShape = Massif * Summit
+        * FMath::Lerp(0.10, 0.34, FMath::Clamp(PeakRelief, 0.30, 1.35) / 1.35);
+    const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
     return Source;
@@ -5089,27 +5238,25 @@ static double EvaluateLandform(
         + RegionalStructure * Relief * 0.025;
 
     // The classification mask may saturate to describe one coherent massif,
-    // but elevation must remain tied to the unsaturated geological signal.
-    // Otherwise every accepted ridge receives the same summit height and
-    // becomes another flat-topped rail.
-    // PeakReference is a scale anchor, not a ceiling. Values above the 98th
-    // percentile retain headroom so exceptional summits remain higher than
-    // neighbouring crests instead of flattening into one clipped plateau.
+    // while medium-scale crest fields redistribute its upper relief into
+    // peaks and saddles. Both geological terms remain bounded: exceptional
+    // peaks come from their local crest variation, not from promoting one
+    // extreme analysis-grid sample into a multi-kilometre needle.
     const double MountainMass = FMath::Pow(
         FMath::Clamp(
             (MountainPotential - MountainCalibration.UplandThreshold)
                 / UplandSpan,
-            0.0, 1.35
+            0.0, 1.0
         ),
-        1.35
+        0.92
     ) * FMath::Lerp(0.78, 1.0, PositiveUplift);
     const double SummitCore = FMath::Pow(
         FMath::Clamp(
             (MountainPotential - MountainCalibration.MountainThreshold)
                 / MountainSpan,
-            0.0, 1.50
+            0.0, 1.0
         ),
-        1.70
+        1.30
     ) * FMath::Lerp(0.82, 1.0, PositiveUplift);
     const double SummitBreakup =
         FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
@@ -5957,6 +6104,14 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
 
     SmoothLowReliefTerrain(*Data, 3);
     ApplyTerrainClimate(*Data, Generator);
+
+    ApplyMountainDrainageErosion(
+        *Data,
+        FMath::Clamp(Generator.StreamPowerIterations / 2 + 1, 2, 3),
+        Generator.StreamPowerStrength * 0.70,
+        Generator.MountainStreamStartArea,
+        Generator.DrainageEpsilon
+    );
 
     ApplyThermalErosion(
         *Data, Generator.ThermalErosionIterations, Generator.ThermalErosionStrength,
