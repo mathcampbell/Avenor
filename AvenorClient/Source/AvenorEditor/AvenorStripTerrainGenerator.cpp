@@ -6591,7 +6591,13 @@ public:
         const UAvenorTerrainData* Data = TerrainData.Get();
         return !Data || !Data->HasValidData();
     }
-    static FGuid Version() { return FGuid(TEXT("849c98b2-52c1-48dd-9431-9864e17fc8b2")); }
+    // Bump this GUID whenever the terrain-generation algorithm changes.
+    // Mesh Partition's derived-data cache uses it to decide whether a
+    // previously baked result is still valid for unchanged input data; if
+    // this stays fixed across an algorithm change, the cache has no way to
+    // know the code is different and can keep serving a stale mesh built
+    // under the old code no matter how many times generation is re-run.
+    static FGuid Version() { return FGuid(TEXT("3b1d2d7f-e115-43ea-8ecc-e3052c6ff420")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
