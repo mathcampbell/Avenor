@@ -219,8 +219,11 @@ public:
     UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Rebuild World from Baked Data", ToolTip = "Rebuilds the terrain mesh from the already-baked data. Does NOT create rivers/lakes - press Regenerate Water from Baked Data afterwards, once the mesh rebuild has finished in the editor."))
     void RebuildWorldFromBakedData();
 
-    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Regenerate Water from Baked Data", ToolTip = "Creates rivers and lakes and projects them onto the current terrain mesh. Run this only after Generate and Bake Geography (or Rebuild World from Baked Data) has finished rebuilding the mesh, so rivers raycast against finished terrain rather than a stale or still-building mesh."))
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Regenerate Water from Baked Data", ToolTip = "Prepares rivers/lakes and queues a Mesh Partition mesh rebuild for them, but does NOT raycast or spawn water yet. Once the mesh rebuild has finished in the editor, press Project Water Onto Terrain."))
     void RegenerateWaterFromBakedData();
+
+    UFUNCTION(CallInEditor, Category = "Avenor|Bake", meta = (DisplayName = "Project Water Onto Terrain", ToolTip = "Raycasts the prepared rivers/lakes onto the current terrain mesh and spawns the water actors. Press this only after Regenerate Water from Baked Data has run AND the Mesh Partition mesh rebuild it queued has finished in the editor - pressing it too early will raycast against a stale or still-building mesh and miss every point."))
+    void ProjectWaterOntoTerrain();
 
     UFUNCTION(CallInEditor, Category = "Avenor", meta = (DisplayName = "Generate Fast Preview"))
     void GenerateFastPreview();
@@ -309,6 +312,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
     bool bRefinementPlanReadyForWater = false;
+
+    UPROPERTY(VisibleAnywhere, Transient, Category = "Avenor|Status")
+    bool bWaterProjectionPending = false;
 
     // Internal resolved constants. These are deliberately not UPROPERTYs:
     // they are implementation detail, not a second user-facing settings UI.
@@ -399,13 +405,10 @@ private:
     FString BuildSettingsHash() const;
     void CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data);
     bool BindModifiersAndRefresh(bool bShowFailureDialog);
-    void CreateWaterActorsWhenMeshReady(
-        const TSharedPtr<const FAvenorStripData>& Data,
-        TFunction<void()> OnComplete
-    );
 
     mutable FCriticalSection DataMutex;
     mutable TSharedPtr<const FAvenorStripData> CachedData;
+    TSharedPtr<const FAvenorStripData> PendingWaterData;
     bool bDeferMeshRefresh = false;
     mutable bool bGeneratingGeography = false;
 };
