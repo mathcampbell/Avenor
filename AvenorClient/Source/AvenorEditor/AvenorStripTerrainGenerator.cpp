@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 32;
+static constexpr int32 GeneratorAlgorithmVersion = 33;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -4705,11 +4705,24 @@ static double EvaluateLandform(
         FoldRidges * FMath::Lerp(0.78, 1.12, FoldContinuity),
         0.0, 1.0
     );
+    // The geological ridge field describes shape, not universal terrain
+    // roughness. Give it a broad but genuine geographic on/off domain so
+    // folded/craggy relief cannot leak into plains, savannah or ordinary
+    // rolling-hill provinces. The low threshold and wide ramp retain broad
+    // mountain systems without returning to the old all-or-nothing gating.
+    const double MountainProvinceGate = Smooth01(FMath::Clamp(
+        (MountainProvince - 0.08) / 0.78, 0.0, 1.0
+    ));
+    const double MountainDomain = MountainProvinceGate * FMath::Lerp(
+        0.52, 1.0,
+        Smooth01(FMath::Clamp(
+            (PositiveUplift - 0.12) / 0.80, 0.0, 1.0
+        ))
+    );
     double BroadRange = Smooth01(FMath::Clamp(
         (BeltSignal - FMath::Lerp(0.45, 0.35, Activity)) / 0.41,
         0.0, 1.0
-    )) * FMath::Lerp(0.50, 1.0, MountainProvince)
-       * FMath::Lerp(0.68, 1.0, PositiveUplift);
+    )) * MountainDomain;
 
     // Deliberately no strip-centre or spine term here. Geology is generated
     // independent of the monorail corridor; keeping the corridor buildable
@@ -4841,12 +4854,10 @@ static double EvaluateLandform(
     const double MountainMass = FMath::Pow(
         FMath::Clamp((BeltSignal - 0.27) / 0.73, 0.0, 1.0),
         1.45
-    ) * FMath::Lerp(0.52, 1.0, MountainProvince)
-      * FMath::Lerp(0.64, 1.0, PositiveUplift);
+    ) * MountainDomain;
     const double SummitCore = FMath::Pow(
         FMath::Clamp((BeltSignal - 0.33) / 0.67, 0.0, 1.0), 1.9
-    ) * FMath::Lerp(0.45, 1.0, MountainProvince)
-      * FMath::Lerp(0.60, 1.0, PositiveUplift);
+    ) * FMath::Pow(MountainDomain, 1.15);
     const double SummitBreakup =
         FMath::Lerp(0.58, 1.36, FMath::Pow(CrestRidges, 1.8))
         * FMath::Lerp(0.78, 1.22, CrestVariation);
