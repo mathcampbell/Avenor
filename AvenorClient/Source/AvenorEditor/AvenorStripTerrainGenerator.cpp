@@ -35,6 +35,7 @@
 #include "Components/SplineComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "StaticMeshCompiler.h"
+#include "Containers/Ticker.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
 #include "UObject/UnrealType.h"
@@ -8091,6 +8092,59 @@ static double ComputeRiverBankTransitionWidth(const FRiverReach& Reach)
     return FMath::Clamp(Reach.Width * 0.08, 100.0, 400.0);
 }
 
+void AAvenorStripTerrainGenerator::CreateWaterActorsWhenMeshReady(
+    const TSharedPtr<const FAvenorStripData>& Data,
+    TFunction<void()> OnComplete
+)
+{
+#if WITH_EDITOR
+    // The Mesh Partition's static mesh - the collision the river raycasts in
+    // CreateWaterActors depend on - rebuilds asynchronously after
+    // ReregisterAllComponents() queues it; it does not wait for that rebuild
+    // to finish. A direct FStaticMeshCompilingManager::FinishAllCompilation()
+    // flush was tried and proven ineffective by log timestamp analysis: the
+    // rebuild is often not even queued yet at the moment the flush runs, so
+    // the flush sees nothing pending and returns immediately while the real
+    // rebuild only starts (and finishes) 17-21 real-world seconds later.
+    // Instead, wait out a minimum settle window (long enough for the rebuild
+    // to actually get queued), then poll the compiling manager as a
+    // best-effort early-out, bounded by a hard ceiling above the worst
+    // observed real-world completion time so this always makes forward
+    // progress even if Mesh Partition's rebuild never registers with it.
+    TWeakObjectPtr<AAvenorStripTerrainGenerator> WeakThis(this);
+    TSharedRef<double> ElapsedSeconds = MakeShared<double>(0.0);
+    TSharedRef<FTSTicker::FDelegateHandle> TickerHandle = MakeShared<FTSTicker::FDelegateHandle>();
+    *TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateLambda(
+            [WeakThis, Data, OnComplete, ElapsedSeconds, TickerHandle](float DeltaTime) -> bool
+            {
+                *ElapsedSeconds += static_cast<double>(DeltaTime);
+                AAvenorStripTerrainGenerator* Generator = WeakThis.Get();
+                if (!Generator)
+                {
+                    return false;
+                }
+                constexpr double MinimumSettleSeconds = 6.0;
+                constexpr double MaximumWaitSeconds = 32.0;
+                const bool bCompilerIdle = FStaticMeshCompilingManager::Get().GetNumRemainingMeshes() == 0;
+                if (*ElapsedSeconds < MinimumSettleSeconds)
+                {
+                    return true;
+                }
+                if (!bCompilerIdle && *ElapsedSeconds < MaximumWaitSeconds)
+                {
+                    return true;
+                }
+                Generator->CreateWaterActors(Data);
+                OnComplete();
+                return false;
+            }
+        ),
+        0.5f
+    );
+#endif
+}
+
 void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data)
 {
 #if WITH_EDITOR
@@ -8106,14 +8160,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
     {
         return;
     }
-    // The Mesh Partition's static mesh - the collision the river raycasts
-    // below depend on - rebuilds asynchronously through the engine's static
-    // mesh compiler. BindModifiersAndRefresh's ReregisterAllComponents() only
-    // queues that rebuild; it does not wait for it, so without this flush the
-    // raycasts below can run against a stale or still-building mesh and miss
-    // every point regardless of how long has elapsed since the terrain was
-    // generated. This was previously a silent 100% miss.
-    FStaticMeshCompilingManager::Get().FinishAllCompilation();
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     auto ToWorldPoints = [&](const TArray<FVector>& Source)
     {
@@ -8766,17 +8812,33 @@ void AAvenorStripTerrainGenerator::RegenerateWaterFromBakedData()
     }
     if (bRefinementPlanReadyForWater)
     {
-        CreateWaterActors(Data);
-        bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
+        TWeakObjectPtr<AAvenorStripTerrainGenerator> WeakThis(this);
+        CreateWaterActorsWhenMeshReady(Data, [WeakThis, Data]()
+        {
+            AAvenorStripTerrainGenerator* Generator = WeakThis.Get();
+            if (!Generator)
+            {
+                return;
+            }
+            Generator->bRefinementPlanReadyForWater = Generator->BindModifiersAndRefresh(true);
+            Generator->LastBuildStamp = FString::Printf(
+                TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes | projection %s"),
+                *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+                Data ? Data->Rivers.Num() : 0,
+                Data ? Data->Lakes.Num() : 0,
+                *Generator->LastRiverProjectionStatus
+            );
+            Generator->ReleaseCachedData();
+        });
     }
-    LastBuildStamp = FString::Printf(
-        TEXT("Water regenerated from baked geography %s | %d rivers | %d lakes | projection %s"),
-        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
-        Data ? Data->Rivers.Num() : 0,
-        Data ? Data->Lakes.Num() : 0,
-        *LastRiverProjectionStatus
-    );
-    ReleaseCachedData();
+    else
+    {
+        LastBuildStamp = FString::Printf(
+            TEXT("Water regeneration skipped %s | refinement plan was not ready"),
+            *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"))
+        );
+        ReleaseCachedData();
+    }
 #endif
 }
 
@@ -8991,18 +9053,25 @@ void AAvenorStripTerrainGenerator::GenerateWater()
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Replacing this generator's water")));
     ClearGeneratedWater();
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Creating lakes and rivers")));
-    CreateWaterActors(Data);
-    BindModifiersAndRefresh(true);
-
-    LastBuildStamp = FString::Printf(
-        TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes | projection %s"),
-        *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
-        *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
-        Seed, Data->Rivers.Num(), Data->Lakes.Num(),
-        *LastRiverProjectionStatus
-    );
-    UE_LOG(LogTemp, Display, TEXT("Avenor strip water generated: %s"), *LastBuildStamp);
-    ReleaseCachedData();
+    TWeakObjectPtr<AAvenorStripTerrainGenerator> WeakThis(this);
+    CreateWaterActorsWhenMeshReady(Data, [WeakThis, Data]()
+    {
+        AAvenorStripTerrainGenerator* Generator = WeakThis.Get();
+        if (!Generator)
+        {
+            return;
+        }
+        Generator->BindModifiersAndRefresh(true);
+        Generator->LastBuildStamp = FString::Printf(
+            TEXT("Native water created %s | code %s | seed %d | %d rivers | %d lakes | projection %s"),
+            *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
+            *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
+            Generator->Seed, Data->Rivers.Num(), Data->Lakes.Num(),
+            *Generator->LastRiverProjectionStatus
+        );
+        UE_LOG(LogTemp, Display, TEXT("Avenor strip water generated: %s"), *Generator->LastBuildStamp);
+        Generator->ReleaseCachedData();
+    });
 #endif
 }
 

@@ -399,6 +399,10 @@ private:
     FString BuildSettingsHash() const;
     void CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data);
     bool BindModifiersAndRefresh(bool bShowFailureDialog);
+    void CreateWaterActorsWhenMeshReady(
+        const TSharedPtr<const FAvenorStripData>& Data,
+        TFunction<void()> OnComplete
+    );
 
     mutable FCriticalSection DataMutex;
     mutable TSharedPtr<const FAvenorStripData> CachedData;
