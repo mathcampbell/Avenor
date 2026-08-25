@@ -4824,10 +4824,15 @@ static double EvaluateMountainPlacementPotential(
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
-    const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.55) / 0.31,
-        0.0, 1.0
-    ));
+    // Deliberately not smoothstepped or clamped to a guessed [0.55, 0.86]
+    // window here: this raw composite is exactly what CalibrateMountainField
+    // samples and sorts below. The old pre-clamp assumed the weighted Province
+    // blend would spread widely above 0.55; in practice multi-octave Fbm
+    // concentrates tightly around 0.5, so that clamp pinned the vast majority
+    // of the world to a literal 0.0, collapsing every calibrated percentile
+    // threshold to zero as well. Leaving it continuous lets the percentiles
+    // below be the sole thresholding mechanism.
+    const double MountainProvince = Province * 0.62 + Province2 * 0.38;
     const FVector2D GeologicalFlow(
         Fbm(Warped, Scale * 2.9,
             SeedOffset + FVector2D(743.0, 2117.0), 3, 0.57, 2.0),
@@ -4852,10 +4857,7 @@ static double EvaluateMountainPlacementPotential(
     // Placement is a broad orogenic uplift envelope. The folded ridge field
     // is evaluated later only to shape crests inside this envelope; using a
     // thin ridge signal as the footprint produced isolated mesa-sized blobs.
-    return FMath::Clamp(
-        MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity),
-        0.0, 1.0
-    );
+    return MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity);
 }
 
 static FMountainFieldCalibration CalibrateMountainField(
@@ -5157,14 +5159,15 @@ static double EvaluateLandform(
         SeedOffset + FVector2D(433.0, 1777.0),
         4, 0.55, 2.07
     );
-    const double MountainProvince = Smooth01(FMath::Clamp(
-        (Province * 0.62 + Province2 * 0.38 - 0.55) / 0.31,
-        0.0, 1.0
-    ));
+    // Kept continuous and unclamped, matching EvaluateMountainPlacementPotential:
+    // BroadRange/BroadUpland/MountainMass below already normalise this against
+    // CalibrateMountainField's percentile thresholds, so a fixed pre-clamp here
+    // would only reintroduce the degenerate-zero collapse described there.
+    const double MountainProvince = Province * 0.62 + Province2 * 0.38;
     const double HillProvince = Smooth01(FMath::Clamp(
         (Province * 0.42 + Province2 * 0.58 - 0.35) / 0.44,
         0.0, 1.0
-    )) * (1.0 - MountainProvince * 0.46);
+    )) * (1.0 - FMath::Clamp(MountainProvince, 0.0, 1.0) * 0.46);
     const double PlateField = Fbm(
         Warped, Scale * 2.6,
         SeedOffset + FVector2D(1201.0, 331.0),
@@ -5243,10 +5246,11 @@ static double EvaluateLandform(
     // Broad uplift decides where the mountain system exists. BeltSignal is
     // deliberately absent from this placement mask and is used below only to
     // make ridges and summit chains inside the accepted mountain province.
-    const double MountainPotential = FMath::Clamp(
-        MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity),
-        0.0, 1.0
-    );
+    // Left unclamped, matching EvaluateMountainPlacementPotential: every use
+    // below already clamps (MountainPotential - CalibratedThreshold) / Span,
+    // so calibrated percentiles remain the sole thresholding mechanism.
+    const double MountainPotential =
+        MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity);
     const double MountainSpan = FMath::Max(
         0.02,
         MountainCalibration.PeakReference
@@ -8571,15 +8575,17 @@ void AAvenorStripTerrainGenerator::GenerateCompleteWorld()
     const int32 GeneratedRiverCount = GeneratedData->Rivers.Num();
     const int32 GeneratedLakeCount = GeneratedData->Lakes.Num();
     BuildCompleteWorldFromCurrentData();
+    // Water is deliberately not created here - see BuildCompleteWorldFromCurrentData.
+    // Press "Regenerate Water from Baked Data" once the terrain mesh rebuild above
+    // has finished in the editor.
     LastBuildStamp = FString::Printf(
-        TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes | projection %s"),
+        TEXT("Geography generated and baked %s | asset %s | hash %s | %d compressed chunks | %d rivers | %d lakes queued | NEXT: Regenerate Water from Baked Data"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *BakedTerrainData.ToSoftObjectPath().ToString(),
         *BuildSettingsHash(),
         BakedTerrainData.LoadSynchronous() ? BakedTerrainData.LoadSynchronous()->Chunks.Num() : 0,
         GeneratedRiverCount,
-        GeneratedLakeCount,
-        *LastRiverProjectionStatus
+        GeneratedLakeCount
     );
     ReleaseCachedData();
 #endif
@@ -8606,26 +8612,24 @@ void AAvenorStripTerrainGenerator::BuildCompleteWorldFromCurrentData()
     {
         return;
     }
-    // First build the final terrain/refinement mesh. River water is projected
-    // against this rendered result, so creating it before this refresh would
-    // raycast against stale geometry from the previous generation.
-    bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
-    if (!bRefinementPlanReadyForWater)
-    {
-        return;
-    }
-    CreateWaterActors(CachedData);
-    // A second refresh binds lake modifiers created with the water actors.
-    // Rivers themselves remain modifier-free diagnostic surfaces.
+    // Build the final terrain/refinement mesh and stop. Water/river creation
+    // is deliberately NOT triggered from here: it used to run immediately
+    // after this refresh, in the same call, which meant its raycast onto the
+    // Mesh Partition could fire before that partition's Nanite/collision
+    // rebuild (kicked off by ReregisterAllComponents just above) had actually
+    // finished on the background job that builds it - a race that showed up
+    // as a 100% miss rate in practice. Press "Regenerate Water from Baked
+    // Data" once this rebuild has visibly finished in the editor; that is a
+    // separate button press with real editor frames in between, so the
+    // partition's mesh is guaranteed to be done by the time it raycasts.
     bRefinementPlanReadyForWater = BindModifiersAndRefresh(true);
     LastBuildStamp = FString::Printf(
-        TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes | projection %s | native water modifiers bound"),
+        TEXT("World rebuilt from baked geography %s | code %s | seed %d | %d rivers | %d lakes queued | NEXT: Regenerate Water from Baked Data"),
         *FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S")),
         *FStripTerrainOp::Version().ToString(EGuidFormats::Short),
         Seed,
         CachedData ? CachedData->Rivers.Num() : 0,
-        CachedData ? CachedData->Lakes.Num() : 0,
-        *LastRiverProjectionStatus
+        CachedData ? CachedData->Lakes.Num() : 0
     );
 #endif
 }
