@@ -4994,7 +4994,8 @@ static FLandformHeightSource EvaluateMountainLandform(
     double MountainMass,
     double CrestShape,
     double SummitCore,
-    double PeakRelief
+    double PeakRelief,
+    double MassifDetail
 )
 {
     FLandformHeightSource Source;
@@ -5018,8 +5019,21 @@ static FLandformHeightSource EvaluateMountainLandform(
     // classification. Plain multiplication keeps the same shape - Massif
     // gates everything, Summit only matters inside the massif - without the
     // repeated shrinkage.
-    const double MassifShape = Massif * (0.34 + Ridge * 0.26);
-    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60);
+    // Every term above (Massif, Ridge, Summit, Peak) varies over multi-
+    // kilometre wavelengths, so a whole massif could only ever come out as
+    // one smooth dome no matter how tall it got - "peaks" only appeared where
+    // several such broad fields happened to overlap. MassifDetail is a
+    // genuinely short-wavelength (few-hundred-metre) ridged field layered on
+    // top so the interior of the massif actually breaks into distinct
+    // summits, shoulders and low points instead of reading as a single
+    // table. It is blended, not added, so flat ground bordering the massif
+    // doesn't pick up energy it shouldn't, and it also gives the erosion
+    // passes that run after this some real local roughness to carve gullies
+    // into rather than a perfectly smooth dome with nothing to seed drainage
+    // divergence.
+    const double Detail = FMath::Clamp(MassifDetail, 0.0, 1.0);
+    const double MassifShape = Massif * (0.34 + Ridge * 0.26) * FMath::Lerp(0.70, 1.20, Detail);
+    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.50, 1.60, Detail);
     const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
@@ -5477,9 +5491,22 @@ static double EvaluateLandform(
     const double HillDetailScale = bClimateEnabled
         ? FMath::Lerp(1.0, 0.45, ClimateMoisture)
         : 0.70;
+    // Deliberately much shorter wavelength than every other term feeding the
+    // massif (all of which sit at multi-kilometre wavelengths derived from
+    // Scale): this is what actually breaks a mountain's interior into
+    // individual peaks and low points instead of one smooth uplifted dome.
+    // Clamped in absolute terms rather than scaled purely off Scale so it
+    // stays close to the analysis grid's actual resolution regardless of
+    // world size.
+    const double MassifDetailScale = FMath::Clamp(Scale * 0.08, 40000.0, 300000.0);
+    const double MassifDetail = RidgedFbm(
+        Warped, MassifDetailScale,
+        SeedOffset + FVector2D(3389.0, 2003.0),
+        4
+    );
     const FLandformHeightSource MountainSource = EvaluateMountainLandform(
         Relief, ActivityScale, MountainMass, CrestShape,
-        SummitCore, PeakRelief
+        SummitCore, PeakRelief, MassifDetail
     );
     const FLandformHeightSource FoothillSource = EvaluateFoothillLandform(
         Relief, UplandRidges, BroadUpland
