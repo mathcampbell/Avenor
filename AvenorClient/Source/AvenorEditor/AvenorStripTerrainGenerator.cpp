@@ -5159,9 +5159,20 @@ static FLandformHeightSource EvaluateMountainLandform(
     // passes that run after this some real local roughness to carve gullies
     // into rather than a perfectly smooth dome with nothing to seed drainage
     // divergence.
+    // The 0.70-1.20 / 0.50-1.60 ranges below only ever modulated the shape by
+    // a shallow +-30-50%, which reads as surface texture (the "cauliflower"
+    // look) rather than genuine separate summits with real cols between
+    // them - a true low point needs to drop most of the way back toward the
+    // surrounding shoulder height, not just dip a third. RidgedFbm's own
+    // distribution justifies a much deeper floor here without carving the
+    // massif into swiss cheese: it is mostly high plateau/ridge by
+    // construction (1-|noise|, then squared), with troughs (Detail near 0)
+    // that are comparatively narrow and sparse, so driving them close to
+    // zero mainly affects a minority of the area - real cols and saddles -
+    // not the bulk of the massif.
     const double Detail = FMath::Clamp(MassifDetail, 0.0, 1.0);
-    const double MassifShape = Massif * (0.34 + Ridge * 0.26) * FMath::Lerp(0.70, 1.20, Detail);
-    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.50, 1.60, Detail);
+    const double MassifShape = Massif * (0.34 + Ridge * 0.26) * FMath::Lerp(0.28, 1.28, Detail);
+    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.05, 1.85, Detail);
     const double MountainShape = MassifShape + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     Source.Resistance = 0.24;
