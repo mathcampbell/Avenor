@@ -2440,10 +2440,16 @@ static void ApplyMountainDrainageErosion(
                     (LocalMoisture - 0.42) / 0.46, 0.0, 1.0
                 ))
                 * MountainSupport;
+            // Raised from a 0.08-cell-size cap and a 0.032-0.062 base
+            // coefficient: at typical channel/slope/support factors well
+            // under 1, that only ever carved a few tens of metres total
+            // across all passes - negligible next to the mountain shape's
+            // own noise-driven relief, so what should read as genuine
+            // eroded channels was invisible under it instead.
             const double Incision = FMath::Min(
-                Data.CellSize * 0.08,
+                Data.CellSize * 0.16,
                 Strength * Data.CellSize
-                    * FMath::Lerp(0.032, 0.062, PassAlpha) * ChannelPower
+                    * FMath::Lerp(0.055, 0.105, PassAlpha) * ChannelPower
                     * (0.35 + SlopePower * 0.65)
                     * MountainSupport * D8Dominance
                     * FMath::Lerp(1.0, 1.28, AlpineValley)
@@ -2663,8 +2669,13 @@ static void EvolveTerrainFromDrainage(
                 ? FMath::Clamp(
                     Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
                 ) : 1.0;
+            // Raised from a 0.022-0.065 base coefficient: this is the pass
+            // that turns ApplyStreamPowerErosion's deliberately modest
+            // channel seed into a real carved valley, so it needs enough
+            // range to actually read as erosion against the mountain
+            // shape's own relief, not just a faint scratch under it.
             const double Incision = Strength * Data.CellSize
-                * FMath::Lerp(0.022, 0.065, CanyonSuitability)
+                * FMath::Lerp(0.038, 0.105, CanyonSuitability)
                 * ChannelPower
                 * (0.45 + FMath::Clamp(Slope / 0.09, 0.0, 1.0) * 0.55)
                 * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability)
@@ -2718,7 +2729,7 @@ static void EvolveTerrainFromDrainage(
             }
         }
 
-        const double MaximumPassChange = Data.CellSize * 0.12;
+        const double MaximumPassChange = Data.CellSize * 0.22;
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
             Data.Height[Cell] += FMath::Clamp(
@@ -5147,35 +5158,36 @@ static FLandformHeightSource EvaluateMountainLandform(
     // classification. Plain multiplication keeps the same shape - Massif
     // gates everything, Summit only matters inside the massif - without the
     // repeated shrinkage.
-    // Every term above (Massif, Ridge, Summit, Peak) varies over multi-
-    // kilometre wavelengths, so a whole massif could only ever come out as
-    // one smooth dome no matter how tall it got - "peaks" only appeared where
-    // several such broad fields happened to overlap. MassifDetail is a
-    // genuinely short-wavelength (few-hundred-metre) ridged field layered on
-    // top so the interior of the massif actually breaks into distinct
-    // summits, shoulders and low points instead of reading as a single
-    // table. It is blended, not added, so flat ground bordering the massif
-    // doesn't pick up energy it shouldn't, and it also gives the erosion
-    // passes that run after this some real local roughness to carve gullies
-    // into rather than a perfectly smooth dome with nothing to seed drainage
-    // divergence.
-    // The 0.70-1.20 / 0.50-1.60 ranges below only ever modulated the shape by
-    // a shallow +-30-50%, which reads as surface texture (the "cauliflower"
-    // look) rather than genuine separate summits with real cols between
-    // them - a true low point needs to drop most of the way back toward the
-    // surrounding shoulder height, not just dip a third. RidgedFbm's own
-    // distribution justifies a much deeper floor here without carving the
-    // massif into swiss cheese: it is mostly high plateau/ridge by
-    // construction (1-|noise|, then squared), with troughs (Detail near 0)
-    // that are comparatively narrow and sparse, so driving them close to
-    // zero mainly affects a minority of the area - real cols and saddles -
-    // not the bulk of the massif.
+    // Ridge (from CrestShape, a few-km-wavelength field - a proper "which
+    // ridgeline within the range is this" scale, distinct from MassifDetail's
+    // few-hundred-metre texture) only ever modulated MassifShape between 0.34
+    // and 0.60 - a shallow +-30% that could never produce actual valley floor
+    // between separate ridgelines. Between ridges (Ridge near 0) now drops to
+    // roughly a sixth of a ridge crest's contribution instead of over half,
+    // so what was one contiguous massif now reads as several distinct
+    // ridgelines with real low ground between them - an actual mountainous
+    // region, not a single mass with a bumpy skin. The peak-case value at
+    // Ridge=1 is unchanged (0.60), so this doesn't touch the already-tuned
+    // height at a ridge crest, only what happens between crests.
+    const double MassifShape = Massif * (0.10 + Ridge * 0.50);
+    // MassifDetail (few-hundred-metre ridged noise) still gives individual
+    // peaks/cols their shape, but its amplitude here is deliberately more
+    // moderate than an earlier attempt: it was drowning out the genuine
+    // flow-accumulation-driven erosion passes that run after this (their
+    // channel incision is only tens of metres, versus the noise being able
+    // to swing height by hundreds), so what should have read as real
+    // eroded rivulets was really just noise. Toning this down hands more of
+    // the visible fine detail back to actual erosion.
     const double Detail = FMath::Clamp(MassifDetail, 0.0, 1.0);
-    const double MassifShape = Massif * (0.34 + Ridge * 0.26) * FMath::Lerp(0.28, 1.28, Detail);
-    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.05, 1.85, Detail);
-    const double MountainShape = MassifShape + SummitShape;
+    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.45, 1.35, Detail);
+    const double MountainShape = (MassifShape * FMath::Lerp(0.75, 1.10, Detail)) + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
-    Source.Resistance = 0.24;
+    // Valley floors between ridgelines (low Ridge) are also softer rock than
+    // the crests themselves (high Ridge) - this lets the erosion passes that
+    // run after this carve those valleys out further and keep them clear,
+    // reinforcing the same structure from the drainage side rather than
+    // fighting a uniformly resistant massif.
+    Source.Resistance = FMath::Lerp(0.10, 0.24, Ridge);
     return Source;
 }
 
