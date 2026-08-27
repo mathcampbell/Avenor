@@ -4967,9 +4967,12 @@ static double EvaluateMountainPlacementPotential(
     );
     const FVector2D AxisA(FMath::Cos(SeedAngleA), FMath::Sin(SeedAngleA));
     const FVector2D AcrossA = Rotate90(AxisA);
+    // AcrossStretch must match EvaluateLandform's Oriented(...) call exactly
+    // (2.2, 1.6) - this function only calibrates percentile thresholds
+    // against the same field, so the two must sample identical geometry.
     const FVector2D OrientedWarped(
         FVector2D::DotProduct(Warped, AxisA) / 2.2,
-        FVector2D::DotProduct(Warped, AcrossA) / 1.0
+        FVector2D::DotProduct(Warped, AcrossA) / 1.6
     );
     const double Province = 0.5 + 0.5 * Fbm(
         OrientedWarped, Scale * 1.55,
@@ -5335,8 +5338,16 @@ static double EvaluateLandform(
 
     // Elongated along the same per-seed AxisA as EvaluateMountainPlacementPotential
     // (must match exactly - see the comment there) so the mountain/hill province
-    // forms a belt rather than a round dome cluster.
-    const FVector2D OrientedWarped = Oriented(Warped, AxisA, AcrossA, 2.2, 1.0);
+    // forms a belt rather than a round dome cluster. AcrossStretch was 1.0
+    // (no widening at all across the belt), which is the real reason the
+    // flank from foothill to summit was a sheer wall: the field's spatial
+    // wavelength across the belt was just short. 1.6 slows the field's
+    // cross-belt variation without touching the value-space thresholds that
+    // decide how much of the map is upland/mountain at all (an earlier,
+    // wrong attempt at this changed those thresholds instead and flattened
+    // the whole world), and keeps the belt still visibly elongated rather
+    // than reverting to a round dome (2.2:1.6 vs the previous 2.2:1.0).
+    const FVector2D OrientedWarped = Oriented(Warped, AxisA, AcrossA, 2.2, 1.6);
     const double Province = 0.5 + 0.5 * Fbm(
         OrientedWarped, Scale * 1.55,
         SeedOffset + FVector2D(1901.0, 331.0),
@@ -5439,28 +5450,26 @@ static double EvaluateLandform(
     // so calibrated percentiles remain the sole thresholding mechanism.
     const double MountainPotential =
         MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity);
-    // Widened 3x (and the floor raised well past its old 0.02/0.035): a
-    // multi-octave Fbm field's useful value range is typically only a few
-    // tenths wide, so a span this narrow made BroadRange/BroadUpland cross
-    // from 0 to 1 within a sliver of that range - which, given how smoothly
-    // the underlying noise itself actually varies in world space, collapsed
-    // to a near step-function on the ground: hill terrain at Mountain 0.02
-    // sitting directly against a sheer wall at Mountain 0.4+, no foothill or
-    // valley in between, regardless of how well the height *formula* blends
-    // by proximity (EvaluateFoothillLandform) - proximity itself was jumping
-    // from 0 to 1 over a couple of analysis cells. This only widens the
-    // transition band; a cell whose MountainPotential is genuinely far out
-    // in the tail (a true summit) still saturates to BroadRange/BroadUpland
-    // = 1 same as before.
+    // NOTE: an earlier attempt "fixed" the sheer-cliff problem by multiplying
+    // these spans 3x. That was wrong: multiplying the *value-space* span
+    // doesn't just widen a transition that was already centred somewhere
+    // reasonable - Smooth01(excess/Span) is roughly linear in excess for a
+    // fixed Span, so tripling Span roughly divides the resulting mask value
+    // by 3 at every partially-qualified cell, everywhere on the map, not
+    // just at the boundary. That pushes Foothill/Mountain weight down and
+    // Plain weight up almost everywhere, which is why the world went flat.
+    // Restored to the original, narrower spans; the actual fix for the
+    // sheer transition belongs in the noise's spatial wavelength (see the
+    // Oriented(...) call below), not in these value-space thresholds.
     const double MountainSpan = FMath::Max(
-        0.10,
-        (MountainCalibration.PeakReference
-            - MountainCalibration.MountainThreshold) * 3.0
+        0.02,
+        MountainCalibration.PeakReference
+            - MountainCalibration.MountainThreshold
     );
     const double UplandSpan = FMath::Max(
-        0.18,
-        (MountainCalibration.PeakReference
-            - MountainCalibration.UplandThreshold) * 3.0
+        0.035,
+        MountainCalibration.PeakReference
+            - MountainCalibration.UplandThreshold
     );
     const double BroadRange = Smooth01(FMath::Clamp(
         (MountainPotential - MountainCalibration.MountainThreshold)
