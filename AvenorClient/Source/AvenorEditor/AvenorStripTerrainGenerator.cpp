@@ -929,6 +929,132 @@ struct FClimateSurfaceMasks
     TArray<double> Lakeshore;
 };
 
+// Biome is a discrete per-cell classification (an enum index), not a
+// continuous quantity, so it cannot be bilinearly sampled like the other
+// fields below - interpolating between two enum values is meaningless.
+// Nearest-cell lookup is the correct way to read it at a position that may
+// not land exactly on an analysis cell.
+static int32 NearestAnalysisCell(
+    const FAvenorStripData& Data,
+    const FVector2D& Position
+)
+{
+    const int32 X = FMath::Clamp(
+        FMath::RoundToInt((Position.X - Data.Bounds.Min.X) / Data.CellSize - 0.5),
+        0, Data.Columns - 1
+    );
+    const int32 Y = FMath::Clamp(
+        FMath::RoundToInt((Position.Y - Data.Bounds.Min.Y) / Data.CellSize - 0.5),
+        0, Data.Rows - 1
+    );
+    return Data.Index(X, Y);
+}
+
+// Rasterizes one output texel of the baked climate/biome/terrain-filter/
+// water-surface maps at an arbitrary world position, independent of the
+// analysis grid's own resolution. Every continuous field (temperature,
+// moisture, height, slope, flow, the mountain/desert masks and the water
+// surface masks) is bilinearly resampled from the analysis grid via
+// Data.SampleGrid - cheap, and correct because these are all smooth,
+// low-frequency fields to begin with. Only the discrete Biome classification
+// uses a nearest-cell lookup, for the reason given above. This lets output
+// texture resolution be chosen independently of (and much finer than) the
+// analysis grid without re-running erosion/drainage at that resolution.
+static void RasterizeClimatePixel(
+    const FAvenorStripData& Data,
+    const FClimateSurfaceMasks& SurfaceMasks,
+    const FVector2D& Position,
+    double MinimumHeight,
+    double HeightRange,
+    double FlowLogRange,
+    FColor& OutBaseBiome,
+    FColor& OutLocalBiome,
+    FColor& OutClimate,
+    FColor& OutTerrain,
+    FColor& OutWater
+)
+{
+    const double MacroTemperature = Data.SampleGrid(Data.MacroTemperature, Position);
+    const double MacroMoisture = Data.SampleGrid(Data.MacroMoisture, Position);
+    OutBaseBiome = UAvenorTerrainData::GetBiomeColour(
+        ClassifyBaseBiome(MacroTemperature, MacroMoisture)
+    );
+
+    const double Riverbed = Data.SampleGrid(SurfaceMasks.Riverbed, Position);
+    const double Riverbank = Data.SampleGrid(SurfaceMasks.Riverbank, Position);
+    const double Lakebed = Data.SampleGrid(SurfaceMasks.Lakebed, Position);
+    const double Lakeshore = Data.SampleGrid(SurfaceMasks.Lakeshore, Position);
+
+    EAvenorBiomeClass LocalBiome = static_cast<EAvenorBiomeClass>(
+        Data.Biome[NearestAnalysisCell(Data, Position)]
+    );
+    bool bHasLocalBiome = LocalBiome == EAvenorBiomeClass::SnowIce
+        || LocalBiome == EAvenorBiomeClass::AlpineTundra
+        || LocalBiome == EAvenorBiomeClass::Wetland
+        || LocalBiome == EAvenorBiomeClass::Oasis;
+    if (Lakebed >= 0.5)
+    {
+        LocalBiome = EAvenorBiomeClass::Lakebed;
+        bHasLocalBiome = true;
+    }
+    else if (Riverbed >= 0.5)
+    {
+        LocalBiome = EAvenorBiomeClass::Riverbed;
+        bHasLocalBiome = true;
+    }
+    else if (LocalBiome != EAvenorBiomeClass::SnowIce
+        && LocalBiome != EAvenorBiomeClass::AlpineTundra
+        && Lakeshore >= 0.25)
+    {
+        LocalBiome = EAvenorBiomeClass::Lakeshore;
+        bHasLocalBiome = true;
+    }
+    else if (LocalBiome != EAvenorBiomeClass::SnowIce
+        && LocalBiome != EAvenorBiomeClass::AlpineTundra
+        && Riverbank >= 0.25)
+    {
+        LocalBiome = EAvenorBiomeClass::Riverbank;
+        bHasLocalBiome = true;
+    }
+    OutLocalBiome = bHasLocalBiome
+        ? UAvenorTerrainData::GetBiomeColour(LocalBiome)
+        : FColor(0, 0, 0, 0);
+
+    const double Temperature = Data.SampleGrid(Data.Temperature, Position);
+    const double Moisture = Data.SampleGrid(Data.Moisture, Position);
+    OutClimate = FColor(
+        UnitToByte(MacroTemperature),
+        UnitToByte(MacroMoisture),
+        UnitToByte(Temperature),
+        UnitToByte(Moisture)
+    );
+
+    const double Height = Data.SampleGrid(Data.Height, Position);
+    const double Slope = Data.SampleGrid(Data.Slope, Position);
+    const double Accumulation = Data.SampleGrid(Data.Accumulation, Position);
+    const double MountainMask = Data.SampleGrid(Data.MountainMask, Position);
+    const double DesertMask = Data.SampleGrid(Data.DesertMask, Position);
+    const double NormalizedSlope = FMath::Clamp(Slope / 0.35, 0.0, 1.0);
+    const double ExposedRock = FMath::Clamp(
+        FMath::Max(NormalizedSlope, MountainMask * 0.68) * (1.0 - Moisture * 0.42)
+            + DesertMask * 0.24,
+        0.0, 1.0
+    );
+    OutTerrain = FColor(
+        UnitToByte((Height - MinimumHeight) / HeightRange),
+        UnitToByte(NormalizedSlope),
+        UnitToByte(FMath::Loge(1.0 + FMath::Max(0.0, Accumulation)) / FlowLogRange),
+        UnitToByte(ExposedRock)
+    );
+
+    OutWater = FColor(
+        UnitToByte(Riverbed),
+        UnitToByte(Riverbank),
+        UnitToByte(Lakebed),
+        UnitToByte(Lakeshore)
+    );
+}
+
 static FIntRect BoundsToCellRect(
     const FAvenorStripData& Data,
     const FBox2D& Bounds
@@ -1103,7 +1229,8 @@ static bool BuildClimateTextureTiles(
     const FString& OwnerName,
     EAvenorStripLongAxis LongAxis,
     double TileLength,
-    double RiverBankWidth
+    double RiverBankWidth,
+    double RequestedTexelSize
 )
 {
     Asset.ClimateTiles.Reset();
@@ -1130,17 +1257,6 @@ static bool BuildClimateTextureTiles(
         return false;
     }
 
-    const bool bLongX = LongAxis == EAvenorStripLongAxis::X;
-    const int32 LongCellCount = bLongX ? Data.Columns : Data.Rows;
-    const int32 CellsPerTile = FMath::Max(
-        1, FMath::RoundToInt(FMath::Max(Data.CellSize, TileLength)
-            / Data.CellSize)
-    );
-    const int32 TileCount = FMath::DivideAndRoundUp(
-        LongCellCount, CellsPerTile
-    );
-    Asset.ClimateTiles.Reserve(TileCount);
-
     const FClimateSurfaceMasks SurfaceMasks = BuildClimateSurfaceMasks(
         Data, RiverBankWidth
     );
@@ -1156,100 +1272,70 @@ static bool BuildClimateTextureTiles(
     const double HeightRange = FMath::Max(1.0, MaximumHeight - MinimumHeight);
     const double FlowLogRange = FMath::Max(1.0, FMath::Loge(1.0 + MaximumFlow));
 
-    TArray<FColor> WorldBaseBiomePixels;
-    TArray<FColor> WorldLocalBiomePixels;
-    TArray<FColor> WorldClimatePixels;
-    TArray<FColor> WorldTerrainPixels;
-    TArray<FColor> WorldWaterPixels;
-    WorldBaseBiomePixels.SetNumUninitialized(CellCount);
-    WorldLocalBiomePixels.SetNumUninitialized(CellCount);
-    WorldClimatePixels.SetNumUninitialized(CellCount);
-    WorldTerrainPixels.SetNumUninitialized(CellCount);
-    WorldWaterPixels.SetNumUninitialized(CellCount);
-    for (int32 Cell = 0; Cell < CellCount; ++Cell)
+    // Output texture resolution is chosen independently of the analysis
+    // grid: RasterizeClimatePixel resamples the analysis grid at whatever
+    // world position each output texel lands on, so texel density here is
+    // only bounded by texture memory/dimension limits, not by the cost of
+    // re-running erosion at that resolution. Per-region tiles can afford a
+    // much finer texel size than the single whole-world overview map below,
+    // since each tile only has to cover a fraction of the world within the
+    // same maximum texture dimension.
+    constexpr int32 MaxTileTextureDimension = 8192;
+    constexpr int32 MaxWorldOverviewTextureDimension = 4096;
+    const double SafeRequestedTexelSize = FMath::Max(1.0, RequestedTexelSize);
+    auto TexelSizeForExtent = [SafeRequestedTexelSize](double Extent, int32 MaxDimension) -> double
     {
-        WorldBaseBiomePixels[Cell] = UAvenorTerrainData::GetBiomeColour(
-            ClassifyBaseBiome(
-                Data.MacroTemperature[Cell],
-                Data.MacroMoisture[Cell]
-            )
-        );
-        EAvenorBiomeClass LocalBiome =
-            static_cast<EAvenorBiomeClass>(Data.Biome[Cell]);
-        bool bHasLocalBiome = LocalBiome == EAvenorBiomeClass::SnowIce
-            || LocalBiome == EAvenorBiomeClass::AlpineTundra
-            || LocalBiome == EAvenorBiomeClass::Wetland
-            || LocalBiome == EAvenorBiomeClass::Oasis;
-        if (SurfaceMasks.Lakebed[Cell] >= 0.5)
-        {
-            LocalBiome = EAvenorBiomeClass::Lakebed;
-            bHasLocalBiome = true;
-        }
-        else if (SurfaceMasks.Riverbed[Cell] >= 0.5)
-        {
-            LocalBiome = EAvenorBiomeClass::Riverbed;
-            bHasLocalBiome = true;
-        }
-        else if (LocalBiome != EAvenorBiomeClass::SnowIce
-            && LocalBiome != EAvenorBiomeClass::AlpineTundra
-            && SurfaceMasks.Lakeshore[Cell] >= 0.25)
-        {
-            LocalBiome = EAvenorBiomeClass::Lakeshore;
-            bHasLocalBiome = true;
-        }
-        else if (LocalBiome != EAvenorBiomeClass::SnowIce
-            && LocalBiome != EAvenorBiomeClass::AlpineTundra
-            && SurfaceMasks.Riverbank[Cell] >= 0.25)
-        {
-            LocalBiome = EAvenorBiomeClass::Riverbank;
-            bHasLocalBiome = true;
-        }
-        WorldLocalBiomePixels[Cell] = bHasLocalBiome
-            ? UAvenorTerrainData::GetBiomeColour(LocalBiome)
-            : FColor(0, 0, 0, 0);
-        WorldClimatePixels[Cell] = FColor(
-            UnitToByte(Data.MacroTemperature[Cell]),
-            UnitToByte(Data.MacroMoisture[Cell]),
-            UnitToByte(Data.Temperature[Cell]),
-            UnitToByte(Data.Moisture[Cell])
-        );
-        const double NormalizedSlope = FMath::Clamp(
-            Data.Slope[Cell] / 0.35, 0.0, 1.0
-        );
-        const double ExposedRock = FMath::Clamp(
-            FMath::Max(
-                NormalizedSlope,
-                Data.MountainMask[Cell] * 0.68
-            ) * (1.0 - Data.Moisture[Cell] * 0.42)
-                + Data.DesertMask[Cell] * 0.24,
-            0.0, 1.0
-        );
-        WorldTerrainPixels[Cell] = FColor(
-            UnitToByte((Data.Height[Cell] - MinimumHeight) / HeightRange),
-            UnitToByte(NormalizedSlope),
-            UnitToByte(FMath::Loge(1.0 + FMath::Max(
-                0.0, Data.Accumulation[Cell]
-            )) / FlowLogRange),
-            UnitToByte(ExposedRock)
-        );
-        WorldWaterPixels[Cell] = FColor(
-            UnitToByte(SurfaceMasks.Riverbed[Cell]),
-            UnitToByte(SurfaceMasks.Riverbank[Cell]),
-            UnitToByte(SurfaceMasks.Lakebed[Cell]),
-            UnitToByte(SurfaceMasks.Lakeshore[Cell])
-        );
-    }
+        const int32 RequestedPixels = FMath::Max(2, FMath::CeilToInt(Extent / SafeRequestedTexelSize));
+        return RequestedPixels <= MaxDimension
+            ? SafeRequestedTexelSize
+            : Extent / static_cast<double>(MaxDimension);
+    };
+
+    const bool bLongX = LongAxis == EAvenorStripLongAxis::X;
+    const FVector WorldSize3D = Data.Bounds.GetSize();
+    const double WorldLongLength = bLongX ? WorldSize3D.X : WorldSize3D.Y;
+    const double WorldCrossLength = bLongX ? WorldSize3D.Y : WorldSize3D.X;
+
+    // Tile boundaries are kept at the same nominal length as before (most
+    // tiles exactly EffectiveTileLength long, with a shorter final
+    // remainder tile) rather than evenly redistributing the world across a
+    // rounded tile count, since something outside this file may depend on
+    // tile boundaries landing at multiples of this length.
+    const double EffectiveTileLength = FMath::Max(Data.CellSize, TileLength);
+    const int32 TileCount = FMath::Max(
+        1, FMath::CeilToInt(WorldLongLength / EffectiveTileLength)
+    );
+    Asset.ClimateTiles.Reserve(TileCount);
+
+    // Both axes of a tile share one texel size (rather than letting the long
+    // and cross axes diverge) so texels stay square - whichever axis needs
+    // coarsening to fit the texture dimension cap sets the size for both.
+    const double TileTexelSize = FMath::Max(
+        TexelSizeForExtent(EffectiveTileLength, MaxTileTextureDimension),
+        TexelSizeForExtent(WorldCrossLength, MaxTileTextureDimension)
+    );
+    const int32 NominalTilePixelsLong = FMath::Max(
+        2, FMath::RoundToInt(EffectiveTileLength / TileTexelSize)
+    );
+    const int32 TilePixelsCross = FMath::Max(
+        2, FMath::RoundToInt(WorldCrossLength / TileTexelSize)
+    );
 
     for (int32 TileIndex = 0; TileIndex < TileCount; ++TileIndex)
     {
-        const int32 LongStart = TileIndex * CellsPerTile;
-        const int32 LongCount = FMath::Min(
-            CellsPerTile, LongCellCount - LongStart
+        const double TileLongStart = TileIndex * EffectiveTileLength;
+        const double TileLongExtent = FMath::Min(
+            EffectiveTileLength, WorldLongLength - TileLongStart
         );
-        const int32 StartX = bLongX ? LongStart : 0;
-        const int32 StartY = bLongX ? 0 : LongStart;
-        const int32 CountX = bLongX ? LongCount : Data.Columns;
-        const int32 CountY = bLongX ? Data.Rows : LongCount;
+        const int32 TilePixelsLong = FMath::Max(
+            2, FMath::RoundToInt(TileLongExtent / TileTexelSize)
+        );
+        const int32 CountX = bLongX ? TilePixelsLong : TilePixelsCross;
+        const int32 CountY = bLongX ? TilePixelsCross : TilePixelsLong;
+        const FVector2D TileOrigin = bLongX
+            ? FVector2D(Data.Bounds.Min.X + TileLongStart, Data.Bounds.Min.Y)
+            : FVector2D(Data.Bounds.Min.X, Data.Bounds.Min.Y + TileLongStart);
+
         TArray<FColor> BaseBiomePixels;
         TArray<FColor> LocalBiomePixels;
         TArray<FColor> ClimatePixels;
@@ -1260,19 +1346,21 @@ static bool BuildClimateTextureTiles(
         ClimatePixels.SetNumUninitialized(CountX * CountY);
         TerrainPixels.SetNumUninitialized(CountX * CountY);
         WaterPixels.SetNumUninitialized(CountX * CountY);
-        for (int32 LocalY = 0; LocalY < CountY; ++LocalY)
+        for (int32 PixelY = 0; PixelY < CountY; ++PixelY)
         {
-            for (int32 LocalX = 0; LocalX < CountX; ++LocalX)
+            for (int32 PixelX = 0; PixelX < CountX; ++PixelX)
             {
-                const int32 SourceCell = Data.Index(
-                    StartX + LocalX, StartY + LocalY
+                const FVector2D Position = TileOrigin + FVector2D(
+                    (PixelX + 0.5) * TileTexelSize,
+                    (PixelY + 0.5) * TileTexelSize
                 );
-                const int32 Pixel = LocalY * CountX + LocalX;
-                BaseBiomePixels[Pixel] = WorldBaseBiomePixels[SourceCell];
-                LocalBiomePixels[Pixel] = WorldLocalBiomePixels[SourceCell];
-                ClimatePixels[Pixel] = WorldClimatePixels[SourceCell];
-                TerrainPixels[Pixel] = WorldTerrainPixels[SourceCell];
-                WaterPixels[Pixel] = WorldWaterPixels[SourceCell];
+                const int32 Pixel = PixelY * CountX + PixelX;
+                RasterizeClimatePixel(
+                    Data, SurfaceMasks, Position,
+                    MinimumHeight, HeightRange, FlowLogRange,
+                    BaseBiomePixels[Pixel], LocalBiomePixels[Pixel],
+                    ClimatePixels[Pixel], TerrainPixels[Pixel], WaterPixels[Pixel]
+                );
             }
         }
 
@@ -1358,28 +1446,65 @@ static bool BuildClimateTextureTiles(
         FAvenorClimateTileReference& Tile =
             Asset.ClimateTiles.AddDefaulted_GetRef();
         Tile.TileIndex = TileIndex;
-        Tile.StartCell = FIntPoint(StartX, StartY);
+        Tile.StartCell = FIntPoint(
+            bLongX ? TileIndex * NominalTilePixelsLong : 0,
+            bLongX ? 0 : TileIndex * NominalTilePixelsLong
+        );
         Tile.CellCount = FIntPoint(CountX, CountY);
-        const FVector2D TileMin(
-            Data.Bounds.Min.X + StartX * Data.CellSize,
-            Data.Bounds.Min.Y + StartY * Data.CellSize
+        const FVector2D TileMax = TileOrigin + FVector2D(
+            CountX * TileTexelSize, CountY * TileTexelSize
         );
-        const FVector2D TileMax(
-            FMath::Min(
-                Data.Bounds.Max.X,
-                Data.Bounds.Min.X + (StartX + CountX) * Data.CellSize
-            ),
-            FMath::Min(
-                Data.Bounds.Max.Y,
-                Data.Bounds.Min.Y + (StartY + CountY) * Data.CellSize
-            )
-        );
-        Tile.WorldBounds = FBox2D(TileMin, TileMax);
+        Tile.WorldBounds = FBox2D(TileOrigin, TileMax);
         Tile.BaseBiomeTexture = BaseBiomeTexture;
         Tile.LocalBiomeTexture = LocalBiomeTexture;
         Tile.ClimateFilterTexture = ClimateTexture;
         Tile.TerrainFilterTexture = TerrainTexture;
         Tile.WaterSurfaceTexture = WaterTexture;
+    }
+
+    // The world overview is a single non-tiled texture covering the entire
+    // world, so it is capped to a smaller maximum dimension than a tile -
+    // it exists to give materials/tools a whole-world-at-once view, not to
+    // carry the same fine detail as the per-region tiles above.
+    const double WorldTexelSize = FMath::Max(
+        TexelSizeForExtent(WorldLongLength, MaxWorldOverviewTextureDimension),
+        TexelSizeForExtent(WorldCrossLength, MaxWorldOverviewTextureDimension)
+    );
+    const int32 WorldPixelsLong = FMath::Max(
+        2, FMath::RoundToInt(WorldLongLength / WorldTexelSize)
+    );
+    const int32 WorldPixelsCross = FMath::Max(
+        2, FMath::RoundToInt(WorldCrossLength / WorldTexelSize)
+    );
+    const int32 WorldCountX = bLongX ? WorldPixelsLong : WorldPixelsCross;
+    const int32 WorldCountY = bLongX ? WorldPixelsCross : WorldPixelsLong;
+
+    TArray<FColor> WorldBaseBiomePixels;
+    TArray<FColor> WorldLocalBiomePixels;
+    TArray<FColor> WorldClimatePixels;
+    TArray<FColor> WorldTerrainPixels;
+    TArray<FColor> WorldWaterPixels;
+    WorldBaseBiomePixels.SetNumUninitialized(WorldCountX * WorldCountY);
+    WorldLocalBiomePixels.SetNumUninitialized(WorldCountX * WorldCountY);
+    WorldClimatePixels.SetNumUninitialized(WorldCountX * WorldCountY);
+    WorldTerrainPixels.SetNumUninitialized(WorldCountX * WorldCountY);
+    WorldWaterPixels.SetNumUninitialized(WorldCountX * WorldCountY);
+    for (int32 PixelY = 0; PixelY < WorldCountY; ++PixelY)
+    {
+        for (int32 PixelX = 0; PixelX < WorldCountX; ++PixelX)
+        {
+            const FVector2D Position(
+                Data.Bounds.Min.X + (PixelX + 0.5) * WorldTexelSize,
+                Data.Bounds.Min.Y + (PixelY + 0.5) * WorldTexelSize
+            );
+            const int32 Pixel = PixelY * WorldCountX + PixelX;
+            RasterizeClimatePixel(
+                Data, SurfaceMasks, Position,
+                MinimumHeight, HeightRange, FlowLogRange,
+                WorldBaseBiomePixels[Pixel], WorldLocalBiomePixels[Pixel],
+                WorldClimatePixels[Pixel], WorldTerrainPixels[Pixel], WorldWaterPixels[Pixel]
+            );
+        }
     }
 
     const FString WorldBaseBiomeName = FString::Printf(
@@ -1401,40 +1526,40 @@ static bool BuildClimateTextureTiles(
     UTexture2D* WorldBaseBiomeTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldBaseBiomeName),
         WorldBaseBiomeName,
-        Data.Columns,
-        Data.Rows,
+        WorldCountX,
+        WorldCountY,
         WorldBaseBiomePixels,
         TF_Nearest
     );
     UTexture2D* WorldLocalBiomeTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldLocalBiomeName),
         WorldLocalBiomeName,
-        Data.Columns,
-        Data.Rows,
+        WorldCountX,
+        WorldCountY,
         WorldLocalBiomePixels,
         TF_Nearest
     );
     UTexture2D* WorldClimateTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldClimateName),
         WorldClimateName,
-        Data.Columns,
-        Data.Rows,
+        WorldCountX,
+        WorldCountY,
         WorldClimatePixels,
         TF_Bilinear
     );
     UTexture2D* WorldTerrainTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldTerrainName),
         WorldTerrainName,
-        Data.Columns,
-        Data.Rows,
+        WorldCountX,
+        WorldCountY,
         WorldTerrainPixels,
         TF_Bilinear
     );
     UTexture2D* WorldWaterTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldWaterName),
         WorldWaterName,
-        Data.Columns,
-        Data.Rows,
+        WorldCountX,
+        WorldCountY,
         WorldWaterPixels,
         TF_Bilinear
     );
@@ -1454,8 +1579,8 @@ static bool BuildClimateTextureTiles(
     Asset.WorldClimateMaps.WorldBounds = FBox2D(
         FVector2D(Data.Bounds.Min.X, Data.Bounds.Min.Y),
         FVector2D(Data.Bounds.Max.X, Data.Bounds.Max.Y));
-    Asset.WorldClimateMaps.CellCount = FIntPoint(Data.Columns, Data.Rows);
-    Asset.WorldClimateMaps.CellSize = Data.CellSize;
+    Asset.WorldClimateMaps.CellCount = FIntPoint(WorldCountX, WorldCountY);
+    Asset.WorldClimateMaps.CellSize = WorldTexelSize;
     Asset.WorldClimateMaps.BaseBiomeTexture = WorldBaseBiomeTexture;
     Asset.WorldClimateMaps.LocalBiomeTexture = WorldLocalBiomeTexture;
     Asset.WorldClimateMaps.ClimateFilterTexture = WorldClimateTexture;
@@ -6333,7 +6458,13 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     double CellSize = FMath::Max(2500.0, Generator.AnalysisCellSize);
     int64 Columns = FMath::Max<int64>(2, FMath::CeilToInt(Size.X / CellSize));
     int64 Rows = FMath::Max<int64>(2, FMath::CeilToInt(Size.Y / CellSize));
-    const int64 MaximumCells = FMath::Clamp<int64>(Generator.MaximumAnalysisCells, 10000, 2000000);
+    // 20,000,000 is a hard safety ceiling, not a target - it exists only to
+    // stop a mis-set value from producing an unbounded allocation. The
+    // per-cell footprint here is duplicated several times over during
+    // generation (erosion, drainage, per-landform masks), so realistically
+    // only push toward this ceiling on a machine with headroom to spare, and
+    // only after watching RAM/bake time at a smaller value first.
+    const int64 MaximumCells = FMath::Clamp<int64>(Generator.MaximumAnalysisCells, 10000, 20000000);
     if (Columns * Rows > MaximumCells)
     {
         CellSize *= FMath::Sqrt(static_cast<double>(Columns * Rows) / static_cast<double>(MaximumCells));
@@ -7455,6 +7586,7 @@ AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
 void AAvenorStripTerrainGenerator::ResolveSettings()
 {
     AnalysisCellSize = Erosion.AnalysisSpacing;
+    MaximumAnalysisCells = Erosion.MaximumAnalysisCells;
     StructuralRelief = FMath::Max(25000.0, Landforms.ReliefHeight);
     // 0 means "auto": derive a base feature scale from the world's short-axis
     // extent so terrain provinces stay proportionate as a test world is
@@ -7488,6 +7620,7 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     ClimateRegionSpacing = Climate.RegionSpacing > 0.0
         ? FMath::Max(100000.0, Climate.RegionSpacing)
         : FMath::Clamp(LongAxisExtent / 6.0, 300000.0, 3000000.0);
+    ClimateMapTexelSize = FMath::Clamp(Climate.MapTexelSize, 100.0, 100000.0);
     ClimateWaterInfluenceDistance = FMath::Max(
         10000.0, Climate.WaterInfluenceDistance
     );
@@ -7759,7 +7892,8 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
             GetFName().ToString(),
             LongAxis,
             ClimateRegionSpacing,
-            WaterTerrain.RiverBankWidth
+            WaterTerrain.RiverBankWidth,
+            ClimateMapTexelSize
         ))
         {
             UE_LOG(

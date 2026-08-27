@@ -37,9 +37,10 @@ struct FAvenorLandformSettings
 };
 
 /**
- * Low-frequency climate controls. Climate is evaluated on the existing
- * analysis grid and baked beside the geography, so enabling it does not add
- * another high-resolution world simulation.
+ * Low-frequency climate controls. The climate simulation itself always runs
+ * on the existing analysis grid, so enabling it does not add another
+ * high-resolution world simulation - only the baked texture maps below can
+ * be rasterized at an independent, much finer resolution than that grid.
  */
 USTRUCT(BlueprintType)
 struct FAvenorClimateSettings
@@ -75,6 +76,9 @@ struct FAvenorClimateSettings
 
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "How strongly mountains block moisture on their lee side and enhance it on their windward side. 0 disables rain shadows entirely, leaving moisture purely a function of the broad climate regions and elevation."))
     double RainShadowStrength = 0.6;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "100.0", ClampMax = "100000.0", ToolTip = "World size of one texel in the baked biome/climate/terrain-filter/water-surface texture maps, independent of Analysis Spacing. These maps are rasterized by resampling the analysis grid (smoothly for continuous fields, exactly for water/shoreline distance), so this can go much finer than the analysis grid without repeating the erosion simulation at that resolution - it is comparatively cheap. Each output texture is still capped to a safe maximum dimension, so an unreasonably fine value here is automatically coarsened per texture (per-region tiles can hold much finer detail than the single whole-world overview map)."))
+    double MapTexelSize = 5000.0;
 };
 
 /** Erosion is deliberately one coherent process, rather than a panel of unrelated coefficients. */
@@ -91,6 +95,9 @@ struct FAvenorErosionSettings
 
     UPROPERTY(EditAnywhere, Category = "Erosion", meta = (Units = "cm", ClampMin = "2500.0", ClampMax = "50000.0", ToolTip = "Analysis spacing only. Native water modifiers provide the final detailed banks and beds."))
     double AnalysisSpacing = 10000.0;
+
+    UPROPERTY(EditAnywhere, Category = "Erosion", meta = (ClampMin = "10000", ClampMax = "20000000", ToolTip = "Hard cap on the number of analysis cells the generator will simulate, regardless of world size or Analysis Spacing. If World Size / Analysis Spacing would exceed this, the generator silently coarsens the actual spacing to fit (the resulting cell size is reported in Last Build Stamp) - so this is the real ceiling on baked terrain detail, not Analysis Spacing alone. It exists because this array is duplicated several times over during generation (erosion, drainage, per-landform masks), so cost scales roughly linearly with this number and quadratically with resolution for a fixed world size: doubling detail (halving cell size) is about 4x the cells. Rough guide on this machine: 500,000 (default) is safe for quick iteration; a few million is a reasonable 'hero' bake for a capable PC; only push toward the upper end if you have watched RAM use and bake time at a smaller value first. Mesh Partition's own vertex density (which can differ per platform target) decides how much of this baked detail actually becomes visible geometry - it is not itself limited by this value."))
+    int32 MaximumAnalysisCells = 500000;
 };
 
 /** Controls feature selection. Native Water Body settings perform the final carving. */
@@ -329,6 +336,7 @@ public:
     double ClimateMoisture = 0.5;
     double ClimateRegionalVariation = 0.72;
     double ClimateRegionSpacing = 1500000.0;
+    double ClimateMapTexelSize = 5000.0;
     double ClimateWaterInfluenceDistance = 100000.0;
     double ClimateWaterMoistureBoost = 0.35;
     bool bShowcaseClimateCompression = false;
@@ -384,10 +392,6 @@ public:
     bool bGenerateOcean = false;
     double SeaLevel = 0.0;
     double CoastTransitionWidth = 100000.0;
-    double MinimumOceanDepth = 5000.0;
-    double MaximumOceanDepth = 50000.0;
-    bool bOceanWidthEdges = true;
-    bool bOceanLengthEnds = false;
 
 protected:
 #if WITH_EDITOR
