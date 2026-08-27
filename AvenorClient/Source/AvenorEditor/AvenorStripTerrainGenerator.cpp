@@ -5439,15 +5439,28 @@ static double EvaluateLandform(
     // so calibrated percentiles remain the sole thresholding mechanism.
     const double MountainPotential =
         MountainProvince * FMath::Lerp(0.58, 1.0, FoldContinuity);
+    // Widened 3x (and the floor raised well past its old 0.02/0.035): a
+    // multi-octave Fbm field's useful value range is typically only a few
+    // tenths wide, so a span this narrow made BroadRange/BroadUpland cross
+    // from 0 to 1 within a sliver of that range - which, given how smoothly
+    // the underlying noise itself actually varies in world space, collapsed
+    // to a near step-function on the ground: hill terrain at Mountain 0.02
+    // sitting directly against a sheer wall at Mountain 0.4+, no foothill or
+    // valley in between, regardless of how well the height *formula* blends
+    // by proximity (EvaluateFoothillLandform) - proximity itself was jumping
+    // from 0 to 1 over a couple of analysis cells. This only widens the
+    // transition band; a cell whose MountainPotential is genuinely far out
+    // in the tail (a true summit) still saturates to BroadRange/BroadUpland
+    // = 1 same as before.
     const double MountainSpan = FMath::Max(
-        0.02,
-        MountainCalibration.PeakReference
-            - MountainCalibration.MountainThreshold
+        0.10,
+        (MountainCalibration.PeakReference
+            - MountainCalibration.MountainThreshold) * 3.0
     );
     const double UplandSpan = FMath::Max(
-        0.035,
-        MountainCalibration.PeakReference
-            - MountainCalibration.UplandThreshold
+        0.18,
+        (MountainCalibration.PeakReference
+            - MountainCalibration.UplandThreshold) * 3.0
     );
     const double BroadRange = Smooth01(FMath::Clamp(
         (MountainPotential - MountainCalibration.MountainThreshold)
