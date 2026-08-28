@@ -6121,8 +6121,15 @@ static void ApplyTerrainClimate(
         const double RegionalMoisture = Data.MacroMoisture.IsValidIndex(Cell)
             ? Data.MacroMoisture[Cell] : Data.Moisture[Cell];
         const double ElevationMetres = FMath::Max(0.0, Data.Height[Cell]) / 100.0;
+        // Was a hardcoded 3000.0 regardless of the world's actual relief
+        // budget (Generator.StructuralRelief, in cm) - correct by default
+        // only because the default Relief Height also happens to be 3000m,
+        // but silently wrong for any other setting. Deriving it from the
+        // actual budget keeps a mountain's fraction of its own world's
+        // relief meaningful regardless of that setting.
         const double ElevationFraction = FMath::Clamp(
-            ElevationMetres / 3000.0, 0.0, 1.5
+            ElevationMetres / FMath::Max(100.0, Generator.StructuralRelief / 100.0),
+            0.0, 1.5
         );
         const double MountainExposure = FMath::Clamp(
             Data.MountainMask[Cell], 0.0, 1.0
@@ -6140,10 +6147,15 @@ static void ApplyTerrainClimate(
         // read as "warm" purely because it wasn't the literal summit. Final
         // biome classification below determines the snowline from the
         // resulting temperature rather than a fixed Z.
+        // Coefficients raised (0.46/0.16/0.06 -> 0.62/0.24/0.09): a
+        // moderate mountainside only a third of the way up the world's
+        // relief budget could still classify as the same Warm/Temperate
+        // band as the lowland regional baseline it rose out of, which reads
+        // wrong regardless of how the fraction itself is measured.
         Data.Temperature[Cell] = FMath::Clamp(
-            RegionalTemperature - ElevationFraction * 0.46
-                - MountainExposure * 0.16
-                - HillExposure * 0.06,
+            RegionalTemperature - ElevationFraction * 0.62
+                - MountainExposure * 0.24
+                - HillExposure * 0.09,
             0.0, 1.0
         );
 
