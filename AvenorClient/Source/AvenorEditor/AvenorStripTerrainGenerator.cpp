@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 38;
+static constexpr int32 GeneratorAlgorithmVersion = 39;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1277,6 +1277,7 @@ static void BuildExactWorldWaterPixels(
         }
     }
 
+    int32 RasterizedSegments = 0;
     for (const FRiverReach& River : Data.Rivers)
     {
         if (River.Points.Num() < 2)
@@ -1292,6 +1293,7 @@ static void BuildExactWorldWaterPixels(
         for (int32 PointIndex = 0;
              PointIndex + 1 < River.Points.Num(); ++PointIndex)
         {
+            ++RasterizedSegments;
             const FVector2D A(River.Points[PointIndex]);
             const FVector2D B(River.Points[PointIndex + 1]);
             const FVector2D Minimum(
@@ -1345,6 +1347,11 @@ static void BuildExactWorldWaterPixels(
                                 1.0 - Distance / HalfWidth
                             ))
                         );
+                        // G is an inclusive river-proximity field. Keeping it
+                        // full through the channel guarantees a continuous
+                        // material mask; the later bed layer uses R to
+                        // override the channel independently.
+                        Pixel.G = 255;
                     }
                     else if (Distance <= InfluenceRadius)
                     {
@@ -1361,13 +1368,25 @@ static void BuildExactWorldWaterPixels(
         }
     }
 
-    // At bends and confluences, a neighbouring segment's bank rectangle can
-    // overlap another segment's bed. The bed owns those pixels.
-    for (FColor& Pixel : OutPixels)
+    int32 RiverbedPixels = 0;
+    int32 RiverProximityPixels = 0;
+    for (const FColor& Pixel : OutPixels)
     {
-        const double Bed = Pixel.R / 255.0;
-        Pixel.G = UnitToByte((Pixel.G / 255.0) * (1.0 - Bed));
+        RiverbedPixels += Pixel.R > 0 ? 1 : 0;
+        RiverProximityPixels += Pixel.G > 0 ? 1 : 0;
     }
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor exact world-water raster: %d x %d | %d rivers | %d segments | %d riverbed pixels (R) | %d river proximity/bank pixels (G) | bank width %.0f cm"),
+        Width,
+        Height,
+        Data.Rivers.Num(),
+        RasterizedSegments,
+        RiverbedPixels,
+        RiverProximityPixels,
+        BankWidth
+    );
 }
 
 static bool BuildClimateTextureTiles(
