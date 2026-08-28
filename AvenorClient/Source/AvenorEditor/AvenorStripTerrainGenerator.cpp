@@ -636,7 +636,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 37;
+static constexpr int32 GeneratorAlgorithmVersion = 38;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -1223,6 +1223,152 @@ static FClimateSurfaceMasks BuildClimateSurfaceMasks(
     return Masks;
 }
 
+/**
+ * Builds the material-facing whole-world water map at rendering resolution.
+ * River R/G are evaluated from the final baked spline segments instead of
+ * resampling the much coarser erosion analysis grid. Lake B/A deliberately
+ * retain the existing polygon masks, whose result is already satisfactory.
+ */
+static void BuildExactWorldWaterPixels(
+    const FAvenorStripData& Data,
+    const FClimateSurfaceMasks& SurfaceMasks,
+    int32 Width,
+    int32 Height,
+    double VisibleRiverBankWidth,
+    TArray<FColor>& OutPixels
+)
+{
+    if (Width <= 0 || Height <= 0)
+    {
+        OutPixels.Reset();
+        return;
+    }
+
+    const FVector2D WorldSize = Data.Bounds.GetSize();
+    const FVector2D PixelSize(
+        WorldSize.X / static_cast<double>(Width),
+        WorldSize.Y / static_cast<double>(Height)
+    );
+    const double LargestPixel = FMath::Max(PixelSize.X, PixelSize.Y);
+    const double BankWidth = FMath::Max(LargestPixel, VisibleRiverBankWidth);
+
+    OutPixels.SetNumUninitialized(Width * Height);
+    for (int32 Y = 0; Y < Height; ++Y)
+    {
+        for (int32 X = 0; X < Width; ++X)
+        {
+            const FVector2D Position(
+                Data.Bounds.Min.X + (X + 0.5) * PixelSize.X,
+                Data.Bounds.Min.Y + (Y + 0.5) * PixelSize.Y
+            );
+            const double Lakebed = Data.SampleGrid(
+                SurfaceMasks.Lakebed, Position
+            );
+            const double Lakeshore = Data.SampleGrid(
+                SurfaceMasks.Lakeshore, Position
+            );
+            OutPixels[Y * Width + X] = FColor(
+                0,
+                0,
+                UnitToByte(Lakebed),
+                UnitToByte(Lakeshore)
+            );
+        }
+    }
+
+    for (const FRiverReach& River : Data.Rivers)
+    {
+        if (River.Points.Num() < 2)
+        {
+            continue;
+        }
+
+        const double HalfWidth = FMath::Max(
+            LargestPixel * 0.55,
+            FMath::Max(100.0, River.Width * 0.5)
+        );
+        const double InfluenceRadius = HalfWidth + BankWidth;
+        for (int32 PointIndex = 0;
+             PointIndex + 1 < River.Points.Num(); ++PointIndex)
+        {
+            const FVector2D A(River.Points[PointIndex]);
+            const FVector2D B(River.Points[PointIndex + 1]);
+            const FVector2D Minimum(
+                FMath::Min(A.X, B.X) - InfluenceRadius,
+                FMath::Min(A.Y, B.Y) - InfluenceRadius
+            );
+            const FVector2D Maximum(
+                FMath::Max(A.X, B.X) + InfluenceRadius,
+                FMath::Max(A.Y, B.Y) + InfluenceRadius
+            );
+            const int32 MinX = FMath::Clamp(
+                FMath::FloorToInt(
+                    (Minimum.X - Data.Bounds.Min.X) / PixelSize.X
+                ),
+                0, Width - 1
+            );
+            const int32 MaxX = FMath::Clamp(
+                FMath::CeilToInt(
+                    (Maximum.X - Data.Bounds.Min.X) / PixelSize.X
+                ),
+                0, Width - 1
+            );
+            const int32 MinY = FMath::Clamp(
+                FMath::FloorToInt(
+                    (Minimum.Y - Data.Bounds.Min.Y) / PixelSize.Y
+                ),
+                0, Height - 1
+            );
+            const int32 MaxY = FMath::Clamp(
+                FMath::CeilToInt(
+                    (Maximum.Y - Data.Bounds.Min.Y) / PixelSize.Y
+                ),
+                0, Height - 1
+            );
+
+            for (int32 Y = MinY; Y <= MaxY; ++Y)
+            {
+                for (int32 X = MinX; X <= MaxX; ++X)
+                {
+                    const FVector2D Position(
+                        Data.Bounds.Min.X + (X + 0.5) * PixelSize.X,
+                        Data.Bounds.Min.Y + (Y + 0.5) * PixelSize.Y
+                    );
+                    const double Distance = SegmentDistance(Position, A, B);
+                    FColor& Pixel = OutPixels[Y * Width + X];
+                    if (Distance <= HalfWidth)
+                    {
+                        Pixel.R = FMath::Max(
+                            Pixel.R,
+                            UnitToByte(Smooth01(
+                                1.0 - Distance / HalfWidth
+                            ))
+                        );
+                    }
+                    else if (Distance <= InfluenceRadius)
+                    {
+                        Pixel.G = FMath::Max(
+                            Pixel.G,
+                            UnitToByte(Smooth01(
+                                1.0
+                                - (Distance - HalfWidth) / BankWidth
+                            ))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // At bends and confluences, a neighbouring segment's bank rectangle can
+    // overlap another segment's bed. The bed owns those pixels.
+    for (FColor& Pixel : OutPixels)
+    {
+        const double Bed = Pixel.R / 255.0;
+        Pixel.G = UnitToByte((Pixel.G / 255.0) * (1.0 - Bed));
+    }
+}
+
 static bool BuildClimateTextureTiles(
     UAvenorTerrainData& Asset,
     const FAvenorStripData& Data,
@@ -1230,6 +1376,7 @@ static bool BuildClimateTextureTiles(
     EAvenorStripLongAxis LongAxis,
     double TileLength,
     double RiverBankWidth,
+    double MaterialRiverBankWidth,
     double RequestedTexelSize
 )
 {
@@ -1479,6 +1626,28 @@ static bool BuildClimateTextureTiles(
     const int32 WorldCountX = bLongX ? WorldPixelsLong : WorldPixelsCross;
     const int32 WorldCountY = bLongX ? WorldPixelsCross : WorldPixelsLong;
 
+    // Only the material-facing water map needs metre-scale precision. Keeping
+    // climate/biome maps at their requested resolution avoids multiplying the
+    // memory cost of every generated control texture.
+    constexpr double RequestedWorldWaterTexelSize = 1000.0; // 10 metres
+    const double WorldWaterTexelSize = FMath::Max(
+        RequestedWorldWaterTexelSize,
+        FMath::Max(
+            WorldLongLength / MaxWorldOverviewTextureDimension,
+            WorldCrossLength / MaxWorldOverviewTextureDimension
+        )
+    );
+    const int32 WorldWaterPixelsLong = FMath::Max(
+        2, FMath::RoundToInt(WorldLongLength / WorldWaterTexelSize)
+    );
+    const int32 WorldWaterPixelsCross = FMath::Max(
+        2, FMath::RoundToInt(WorldCrossLength / WorldWaterTexelSize)
+    );
+    const int32 WorldWaterCountX = bLongX
+        ? WorldWaterPixelsLong : WorldWaterPixelsCross;
+    const int32 WorldWaterCountY = bLongX
+        ? WorldWaterPixelsCross : WorldWaterPixelsLong;
+
     TArray<FColor> WorldBaseBiomePixels;
     TArray<FColor> WorldLocalBiomePixels;
     TArray<FColor> WorldClimatePixels;
@@ -1506,6 +1675,15 @@ static bool BuildClimateTextureTiles(
             );
         }
     }
+
+    BuildExactWorldWaterPixels(
+        Data,
+        SurfaceMasks,
+        WorldWaterCountX,
+        WorldWaterCountY,
+        MaterialRiverBankWidth,
+        WorldWaterPixels
+    );
 
     const FString WorldBaseBiomeName = FString::Printf(
         TEXT("T_AvenorWorldBiome_%s"), *OwnerName
@@ -1558,8 +1736,8 @@ static bool BuildClimateTextureTiles(
     UTexture2D* WorldWaterTexture = CreateOrUpdateClimateTexture(
         FString::Printf(TEXT("%s/%s"), *WorldTextureFolder, *WorldWaterName),
         WorldWaterName,
-        WorldCountX,
-        WorldCountY,
+        WorldWaterCountX,
+        WorldWaterCountY,
         WorldWaterPixels,
         TF_Bilinear
     );
@@ -8181,7 +8359,7 @@ FString AAvenorStripTerrainGenerator::BuildSettingsSnapshot() const
         TEXT("land=%.17g,%.17g,%.17g,%.17g|")
         TEXT("climate=%d,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d|")
         TEXT("erosion=%.17g,%d,%.17g|hydrology=%d,%.17g,%.17g,%d,%d,%.17g|")
-        TEXT("water=%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d,%.17g,%s,%s,%s,%s"),
+        TEXT("water=%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%d,%.17g,%s,%s,%s,%s"),
         UE::Avenor::Strip::BakedData::GeneratorAlgorithmVersion,
         Seed, WorldSize.X, WorldSize.Y, static_cast<int32>(LongAxis),
         Landforms.ReliefHeight, Landforms.StructuralScale,
@@ -8194,7 +8372,8 @@ FString AAvenorStripTerrainGenerator::BuildSettingsSnapshot() const
         Hydrology.bRivers, Hydrology.RiverDensity, Hydrology.MinimumRiverLength,
         Hydrology.bLakes, Hydrology.MaximumLakes, Hydrology.MinimumLakeDepression,
         WaterTerrain.RiverWidthScale, WaterTerrain.RiverDepthScale,
-        WaterTerrain.RiverBankWidth, WaterTerrain.LakeBedDepth,
+        WaterTerrain.RiverBankWidth, WaterTerrain.MaterialRiverBankWidth,
+        WaterTerrain.LakeBedDepth,
         WaterTerrain.LakeShoreWidth, WaterTerrain.LakeSurfaceInset,
         WaterTerrain.DryBankWidth, WaterTerrain.BlurRadius,
         WaterTerrain.EdgeRoughness,
@@ -8303,6 +8482,7 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
             LongAxis,
             ClimateRegionSpacing,
             WaterTerrain.RiverBankWidth,
+            WaterTerrain.MaterialRiverBankWidth,
             ClimateMapTexelSize
         ))
         {
