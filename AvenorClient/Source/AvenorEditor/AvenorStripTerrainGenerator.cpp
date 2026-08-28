@@ -2632,6 +2632,8 @@ static void EvolveTerrainFromDrainage(
                 ? Data.MountainMask[Cell] : 0.0;
             const double Hill = Data.HillMask.IsValidIndex(Cell)
                 ? Data.HillMask[Cell] : 0.0;
+            const double Plain = Data.PlainsMask.IsValidIndex(Cell)
+                ? Data.PlainsMask[Cell] : 0.0;
             const double Desert = Data.DesertMask.IsValidIndex(Cell)
                 ? Data.DesertMask[Cell] : 0.0;
             const double Resistance = bUseResistance
@@ -2651,8 +2653,15 @@ static void EvolveTerrainFromDrainage(
             ));
             const double Slope = FMath::Clamp(Data.Slope[Cell], 0.0, 0.8);
 
-            // Differential weathering creates residual mesa/escarpment terrain.
-            const double Upland = FMath::Clamp(Hill + Mountain * 0.35, 0.0, 1.0);
+            // Differential weathering creates residual mesa/escarpment
+            // terrain. Plain was missing here too (see CanyonSuitability
+            // below for the confirmed real-world evidence this gap
+            // mattered) - real mesa desert country is mostly flat plains
+            // with the softer surrounding ground worn down around isolated
+            // resistant remnants, not a hilly landscape to begin with.
+            const double Upland = FMath::Clamp(
+                Hill + Mountain * 0.35 + Plain * 0.50, 0.0, 1.0
+            );
             Delta[Cell] -= Desert * Upland * (1.0 - Resistance)
                 * Strength * Data.CellSize * 0.006
                 * (0.35 + FMath::Clamp(Slope / 0.10, 0.0, 1.0));
@@ -2662,9 +2671,16 @@ static void EvolveTerrainFromDrainage(
                 continue;
             }
 
+            // Hill/Mountain-only here (and in Upland and ResistantCap above)
+            // meant a confirmed Desert 1.00, Hill 0.05 (i.e. plains-
+            // dominant) cell still carved an ordinary broad valley - canyon
+            // incision could never engage regardless of Lithology/
+            // Resistance, on what is the single most common desert
+            // landform of all. Added Plain so genuinely resistant desert
+            // plains can carve canyons too.
             const double CanyonSuitability = Desert
                 * Smooth01(FMath::Clamp((Resistance - 0.22) / 0.55, 0.0, 1.0))
-                * FMath::Clamp(Hill + Mountain * 0.55, 0.0, 1.0);
+                * FMath::Clamp(Hill + Mountain * 0.55 + Plain * 0.65, 0.0, 1.0);
             // Same D8-dominance damping as ApplyStreamPowerErosion, and for
             // the same reason: this channel-centred incision term (not the
             // deliberate BroadValley widening below it) can otherwise
@@ -5785,11 +5801,21 @@ static double EvaluateLandform(
     // the only real source of on non-hill terrain) never had anywhere to
     // engage on a mountain's main mass. Real hot deserts have canyon-cut,
     // mesa-and-butte mountain terrain, not lush rounded ranges.
+    // Plains was still missing from this same gate - the exact same
+    // problem, on the most common desert landform of all. Real mesa-and-
+    // canyon desert country (Monument Valley, the Colorado Plateau) is
+    // iconically a PLAINS phenomenon: mostly flat, with isolated resistant
+    // buttes and rivers cutting canyons through it - not a hilly landscape.
+    // Confirmed as a real gap, not just theory: a probed cell reading
+    // Desert 1.00 with Hill 0.05 (i.e. plains-dominant) still carved an
+    // ordinary broad river valley, because ResistantCap could never
+    // engage there regardless of Lithology.
     const double ResistantCap = OutDesertMask
         * FMath::Clamp(
             LandformPlan.RollingHill
                 + LandformPlan.Foothill * 0.45
-                + LandformPlan.Mountain * 0.85,
+                + LandformPlan.Mountain * 0.85
+                + LandformPlan.Plain * 0.65,
             0.0, 1.0
         )
         * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
