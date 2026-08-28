@@ -4867,6 +4867,183 @@ static void ExtractRivers(
         River.Bounds = River.Bounds.ExpandBy(River.ValleyHalfWidth);
     }
 }
+
+// Small standalone lakes along non-canyon desert river reaches, for visual
+// variety rather than hydrological realism - a real oasis is usually
+// spring-fed, not surface drainage. Deliberately never placed on a canyon
+// reach (Reach.bIsCanyon, already resolved by ExtractRivers above): a
+// canyon already has its river visibly present and cutting through, so an
+// isolated pool there would be redundant rather than a logical desert
+// feature. Runs after both ExtractLakes and ExtractRivers so it can see
+// the final river network (with canyon status resolved) and simply append
+// to Data.Lakes without disturbing any existing river-to-lake linkage.
+static void PlaceDesertOases(
+    FAvenorStripData& Data,
+    int32 Seed,
+    int32 MaxOasisCount,
+    double OasisRadius
+)
+{
+    if (MaxOasisCount <= 0 || Data.Rivers.Num() == 0)
+    {
+        return;
+    }
+    // Not exposed as a setting - purely an internal anti-clustering rule so
+    // a handful of oases spread across the map rather than bunching along
+    // one river system.
+    const double MinimumSpacing = FMath::Max(OasisRadius * 8.0, 200000.0);
+    const double EdgeMargin = OasisRadius * 1.5;
+
+    FRandomStream Random(Seed ^ 0x0a5e5c0d);
+    TArray<int32> ReachOrder;
+    ReachOrder.Reserve(Data.Rivers.Num());
+    for (int32 Index = 0; Index < Data.Rivers.Num(); ++Index)
+    {
+        ReachOrder.Add(Index);
+    }
+    for (int32 Index = ReachOrder.Num() - 1; Index > 0; --Index)
+    {
+        ReachOrder.Swap(Index, Random.RandRange(0, Index));
+    }
+
+    TArray<FVector2D> PlacedPositions;
+    for (const FLakeBasin& ExistingLake : Data.Lakes)
+    {
+        PlacedPositions.Add(ExistingLake.Bounds.GetCenter());
+    }
+
+    int32 PlacedCount = 0;
+    for (const int32 ReachIndex : ReachOrder)
+    {
+        if (PlacedCount >= MaxOasisCount)
+        {
+            break;
+        }
+        const FRiverReach& Reach = Data.Rivers[ReachIndex];
+        if (Reach.bIsCanyon || Reach.Points.Num() < 2)
+        {
+            continue;
+        }
+
+        TArray<int32> Candidates;
+        for (int32 PointIndex = 0; PointIndex < Reach.Points.Num(); ++PointIndex)
+        {
+            const FVector2D Position(Reach.Points[PointIndex]);
+            if (Position.X - Data.Bounds.Min.X < EdgeMargin
+                || Data.Bounds.Max.X - Position.X < EdgeMargin
+                || Position.Y - Data.Bounds.Min.Y < EdgeMargin
+                || Data.Bounds.Max.Y - Position.Y < EdgeMargin)
+            {
+                continue;
+            }
+            // Same real-desert threshold ExtractRivers uses for MeanDesert
+            // when deciding canyon eligibility, so oasis placement and
+            // canyon placement agree on what counts as "real desert" here.
+            if (Data.SampleGrid(Data.DesertMask, Position) > 0.42)
+            {
+                Candidates.Add(PointIndex);
+            }
+        }
+        if (Candidates.Num() == 0)
+        {
+            continue;
+        }
+        const FVector2D ChosenPosition(
+            Reach.Points[Candidates[Random.RandRange(0, Candidates.Num() - 1)]]
+        );
+
+        bool bTooClose = false;
+        for (const FVector2D& Placed : PlacedPositions)
+        {
+            if (FVector2D::DistSquared(Placed, ChosenPosition)
+                < MinimumSpacing * MinimumSpacing)
+            {
+                bTooClose = true;
+                break;
+            }
+        }
+        if (bTooClose)
+        {
+            continue;
+        }
+
+        const double GroundHeight = Data.SampleHeight(ChosenPosition);
+        constexpr double OasisDepth = 400.0;
+        constexpr int32 OasisSides = 10;
+        TArray<FVector> Shoreline;
+        Shoreline.Reserve(OasisSides);
+        for (int32 Side = 0; Side < OasisSides; ++Side)
+        {
+            const double Angle = 2.0 * PI * static_cast<double>(Side)
+                / static_cast<double>(OasisSides);
+            Shoreline.Add(FVector(
+                ChosenPosition.X + FMath::Cos(Angle) * OasisRadius,
+                ChosenPosition.Y + FMath::Sin(Angle) * OasisRadius,
+                GroundHeight
+            ));
+        }
+
+        // Carve a genuine shallow basin rather than floating water on flat
+        // ground, the same way natural lakes get their depression from
+        // real terrain instead of an assumed flat disc.
+        const int32 CentreX = FMath::Clamp(
+            FMath::RoundToInt((ChosenPosition.X - Data.Bounds.Min.X) / Data.CellSize),
+            0, Data.Columns - 1
+        );
+        const int32 CentreY = FMath::Clamp(
+            FMath::RoundToInt((ChosenPosition.Y - Data.Bounds.Min.Y) / Data.CellSize),
+            0, Data.Rows - 1
+        );
+        const int32 CellRadius = FMath::CeilToInt(OasisRadius / Data.CellSize) + 1;
+        for (int32 Y = FMath::Max(0, CentreY - CellRadius);
+            Y <= FMath::Min(Data.Rows - 1, CentreY + CellRadius); ++Y)
+        {
+            for (int32 X = FMath::Max(0, CentreX - CellRadius);
+                X <= FMath::Min(Data.Columns - 1, CentreX + CellRadius); ++X)
+            {
+                const int32 Cell = Data.Index(X, Y);
+                const double Distance = FVector2D::Distance(
+                    Data.CellPosition(Cell), ChosenPosition
+                );
+                const double Falloff = Smooth01(FMath::Clamp(
+                    1.0 - Distance / OasisRadius, 0.0, 1.0
+                ));
+                if (Falloff <= 0.0)
+                {
+                    continue;
+                }
+                Data.Height[Cell] -= OasisDepth * Falloff;
+            }
+        }
+
+        FLakeBasin Oasis;
+        Oasis.Shoreline = Shoreline;
+        Oasis.ShorelineHeight = GroundHeight;
+        Oasis.SurfaceHeight = GroundHeight - OasisDepth * 0.55;
+        Oasis.MaximumDepth = OasisDepth;
+        Oasis.ModifierBedDepth = OasisDepth * 1.4;
+        Oasis.BankBlendWidth = FMath::Max(1000.0, OasisRadius * 0.35);
+        Oasis.DepthRampWidth = FMath::Max(500.0, OasisRadius * 0.25);
+        Oasis.Bounds = FBox2D(ForceInit);
+        for (const FVector& ShorePoint : Shoreline)
+        {
+            Oasis.Bounds += FVector2D(ShorePoint);
+        }
+        Data.Lakes.Add(MoveTemp(Oasis));
+
+        PlacedPositions.Add(ChosenPosition);
+        ++PlacedCount;
+    }
+
+    if (PlacedCount > 0)
+    {
+        UE_LOG(
+            LogTemp, Display,
+            TEXT("Avenor desert oases: placed %d of a requested %d, along non-canyon desert river reaches."),
+            PlacedCount, MaxOasisCount
+        );
+    }
+}
 } // namespace UE::Avenor::Strip
 
 double FAvenorStripData::SampleHeight(const FVector2D& Position) const
@@ -6779,6 +6956,10 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Generator.bGenerateMesasAndCanyons, Generator.CanyonStartArea,
             Generator.RiverChannelSteepness
         );
+        PlaceDesertOases(
+            *Data, Generator.Seed, Generator.MaximumDesertOases,
+            Generator.DesertOasisRadius
+        );
     }
     if (Generator.bGenerateOcean)
     {
@@ -7831,6 +8012,8 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     bGenerateLakes = Hydrology.bLakes;
     MaximumLakeCount = Hydrology.MaximumLakes;
     MinimumLakeDepth = Hydrology.MinimumLakeDepression;
+    MaximumDesertOases = FMath::Clamp(Hydrology.MaximumDesertOases, 0, 32);
+    DesertOasisRadius = FMath::Clamp(Hydrology.DesertOasisRadius, 1000.0, 50000.0);
     MinimumLakeBedDepth = FMath::Max(100.0, WaterTerrain.LakeBedDepth * 0.35);
     MaximumLakeBedDepth = FMath::Max(MinimumLakeBedDepth, WaterTerrain.LakeBedDepth);
     LakeBankBlendWidth = WaterTerrain.LakeShoreWidth;

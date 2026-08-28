@@ -135,6 +135,12 @@ struct FAvenorHydrologySettings
 
     UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bLakes", Units = "cm", ClampMin = "100.0"))
     double MinimumLakeDepression = 1500.0;
+
+    UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bRivers", ClampMin = "0", ClampMax = "32", ToolTip = "Small standalone lakes placed along non-canyon river reaches that cross real desert terrain - visual variety rather than hydrological realism (a real oasis is normally spring-fed, not surface drainage). Never placed on a canyon reach, since a canyon already has its river visibly present. 0 disables oases."))
+    int32 MaximumDesertOases = 4;
+
+    UPROPERTY(EditAnywhere, Category = "Hydrology", meta = (EditCondition = "bRivers", Units = "cm", ClampMin = "1000.0", ClampMax = "50000.0", ToolTip = "Radius of each desert oasis lake."))
+    double DesertOasisRadius = 8000.0;
 };
 
 /** Values copied onto every generated Water Body and consumed by MeshPartitionWater. */
@@ -400,6 +406,8 @@ public:
     double MaximumLakeBedDepth = 5000.0;
     double MaximumLakeArea = 250.0;
     int32 MaximumLakeCount = 12;
+    int32 MaximumDesertOases = 4;
+    double DesertOasisRadius = 8000.0;
     double MaximumLakeCoverageFraction = 0.03;
     double LakeBankBlendWidth = 24000.0;
     double LakeDepthRampWidth = 7500.0;
