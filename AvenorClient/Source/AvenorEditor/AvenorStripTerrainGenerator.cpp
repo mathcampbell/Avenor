@@ -1628,8 +1628,15 @@ static void SmoothLowReliefTerrain(FAvenorStripData& Data, int32 Iterations)
                 const double ProtectedRelief = FMath::Clamp(
                     FMath::Max(Mountain, Desert * 0.62), 0.0, 1.0
                 );
+                // Hill's coefficient was 0.30 - erosion runs after this pass
+                // and was given a much lower LowlandStreamStartArea so it can
+                // actually carve rolling-hill terrain now, but that erosion
+                // still needs some pre-existing roughness to seed drainage
+                // divergence from (the same reason MassifDetail exists for
+                // mountains). Smoothing this hard away first left little for
+                // it to find.
                 const double Smoothing = FMath::Clamp(
-                    (Plains * 0.48 + Hill * 0.30)
+                    (Plains * 0.48 + Hill * 0.16)
                         * (1.0 - ProtectedRelief * 0.90),
                     0.0, 0.52
                 );
@@ -5800,6 +5807,25 @@ static double EvaluateLandform(
     );
     Height += Relief * 0.018 * SavannahOutcrop;
 
+    // Hot-wet terrain above (TropicalMass/TropicalSupport) is deliberately
+    // soft, rounded upland - real jungle country, not a globally resistant
+    // range. But real tropical uplands aren't uniformly soft either: a
+    // resistant band outcrops here and there as a genuine cliff or
+    // escarpment poking through the weathered, forested slopes around it.
+    // Reuses the same sparse-threshold pattern as SavannahOutcrop above (a
+    // narrow high slice of Lithology, sharpened with Pow so it stays rare
+    // and abrupt rather than a broad rocky texture) but tuned for taller,
+    // rarer features and higher resistance - an actual cliff face, not a
+    // kopje - so it reads as an exception to the soft terrain around it,
+    // not a rockier version of the same thing.
+    const double JungleOutcrop = TropicalWet * FMath::Clamp(
+        LandformPlan.RollingHill + LandformPlan.Foothill * 0.70, 0.0, 1.0
+    ) * FMath::Pow(
+        Smooth01(FMath::Clamp((Lithology - 0.74) / 0.24, 0.0, 1.0)),
+        2.4
+    );
+    Height += Relief * 0.026 * JungleOutcrop;
+
     // Real dune fields aren't confined to dead-flat basins - gentle desert
     // hillslopes (ergs climbing a bajada, not just pan-flat sand seas) carry
     // dune texture too, just fading out as slope/relief increases.
@@ -5838,6 +5864,7 @@ static double EvaluateLandform(
             + OutDesertMask * 0.10
             + ResistantCap * 0.62
             + SavannahOutcrop * 0.20
+            + JungleOutcrop * 0.24
             + RiftShoulder * 0.10,
         0.0, 1.0
     );
@@ -7693,7 +7720,15 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
     bGenerateRivers = Hydrology.bRivers;
     const double Density = FMath::Clamp(Hydrology.RiverDensity, 0.0, 1.0);
     MountainStreamStartArea = FMath::Lerp(2.0, 0.25, Density);
-    LowlandStreamStartArea = FMath::Lerp(12.0, 2.0, Density);
+    // Was Lerp(12.0, 2.0, Density) - 6-8x MountainStreamStartArea, so hill/
+    // plains terrain needed a far larger catchment than mountains before
+    // erosion carved anything at all. Real gentle terrain does need more
+    // accumulated flow than steep terrain to start eroding, but that gap
+    // was extreme enough that rolling hills essentially never developed
+    // visible valleys - including the hot-wet "jungle upland awaiting
+    // drainage dissection" terrain in EvaluateLandform, which depends on
+    // this same threshold to actually get dissected.
+    LowlandStreamStartArea = FMath::Lerp(5.0, 1.0, Density);
     MinimumRiverSystemLength = Hydrology.MinimumRiverLength;
     HeadwaterWidth = 800.0 * WaterTerrain.RiverWidthScale;
     MainRiverWidth = 12000.0 * WaterTerrain.RiverWidthScale;
