@@ -2440,16 +2440,14 @@ static void ApplyMountainDrainageErosion(
                     (LocalMoisture - 0.42) / 0.46, 0.0, 1.0
                 ))
                 * MountainSupport;
-            // Raised from a 0.08-cell-size cap and a 0.032-0.062 base
-            // coefficient: at typical channel/slope/support factors well
-            // under 1, that only ever carved a few tens of metres total
-            // across all passes - negligible next to the mountain shape's
-            // own noise-driven relief, so what should read as genuine
-            // eroded channels was invisible under it instead.
+            // Raised again (was a 0.08-cell-size cap and 0.032-0.062, then a
+            // 0.16 cap and 0.055-0.105): still reading as noise-dominated
+            // rather than erosion-dominated after the first increase, so
+            // pushing further in the same, already-confirmed direction.
             const double Incision = FMath::Min(
-                Data.CellSize * 0.16,
+                Data.CellSize * 0.26,
                 Strength * Data.CellSize
-                    * FMath::Lerp(0.055, 0.105, PassAlpha) * ChannelPower
+                    * FMath::Lerp(0.085, 0.16, PassAlpha) * ChannelPower
                     * (0.35 + SlopePower * 0.65)
                     * MountainSupport * D8Dominance
                     * FMath::Lerp(1.0, 1.28, AlpineValley)
@@ -2669,13 +2667,15 @@ static void EvolveTerrainFromDrainage(
                 ? FMath::Clamp(
                     Data.AccumulationD8[Cell] / FMath::Max(0.01, Data.Accumulation[Cell]), 0.0, 1.0
                 ) : 1.0;
-            // Raised from a 0.022-0.065 base coefficient: this is the pass
-            // that turns ApplyStreamPowerErosion's deliberately modest
+            // Raised again (was 0.022-0.065, then 0.038-0.105): this is the
+            // pass that turns ApplyStreamPowerErosion's deliberately modest
             // channel seed into a real carved valley, so it needs enough
             // range to actually read as erosion against the mountain
-            // shape's own relief, not just a faint scratch under it.
+            // shape's own relief, not just a faint scratch under it. Still
+            // reading as noise-dominated after the first increase, so
+            // pushing further in the same, already-confirmed direction.
             const double Incision = Strength * Data.CellSize
-                * FMath::Lerp(0.038, 0.105, CanyonSuitability)
+                * FMath::Lerp(0.06, 0.16, CanyonSuitability)
                 * ChannelPower
                 * (0.45 + FMath::Clamp(Slope / 0.09, 0.0, 1.0) * 0.55)
                 * FMath::Lerp(1.0 - Resistance * 0.72, 0.78, CanyonSuitability)
@@ -2729,7 +2729,7 @@ static void EvolveTerrainFromDrainage(
             }
         }
 
-        const double MaximumPassChange = Data.CellSize * 0.22;
+        const double MaximumPassChange = Data.CellSize * 0.34;
         for (int32 Cell = 0; Cell < Data.Height.Num(); ++Cell)
         {
             Data.Height[Cell] += FMath::Clamp(
@@ -5178,9 +5178,12 @@ static FLandformHeightSource EvaluateMountainLandform(
     // to swing height by hundreds), so what should have read as real
     // eroded rivulets was really just noise. Toning this down hands more of
     // the visible fine detail back to actual erosion.
+    // Still reading as noise rather than erosion after the first pass at
+    // taming this - pushing further in the same direction rather than
+    // guessing at something new, since that direction was confirmed right.
     const double Detail = FMath::Clamp(MassifDetail, 0.0, 1.0);
-    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.45, 1.35, Detail);
-    const double MountainShape = (MassifShape * FMath::Lerp(0.75, 1.10, Detail)) + SummitShape;
+    const double SummitShape = Massif * Summit * (0.16 + Peak * 0.60) * FMath::Lerp(0.65, 1.15, Detail);
+    const double MountainShape = (MassifShape * FMath::Lerp(0.90, 1.03, Detail)) + SummitShape;
     Source.HeightDelta = Relief * ActivityScale * MountainShape;
     // Valley floors between ridgelines (low Ridge) are also softer rock than
     // the crests themselves (high Ridge) - this lets the erosion passes that
