@@ -158,6 +158,9 @@ struct FAvenorWaterTerrainSettings
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0"))
     double RiverBankWidth = 12000.0;
 
+    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0", ClampMax = "20000.0", ToolTip = "Visible material bank width baked directly from the final river splines. Independent of the much broader terrain-carving and ecological riverbank influence."))
+    double MaterialRiverBankWidth = 3000.0;
+
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0"))
     double LakeBedDepth = 3000.0;
 
