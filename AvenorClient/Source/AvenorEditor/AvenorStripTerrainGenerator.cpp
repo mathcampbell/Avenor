@@ -6147,15 +6147,17 @@ static void ApplyTerrainClimate(
         // read as "warm" purely because it wasn't the literal summit. Final
         // biome classification below determines the snowline from the
         // resulting temperature rather than a fixed Z.
-        // Coefficients raised (0.46/0.16/0.06 -> 0.62/0.24/0.09): a
-        // moderate mountainside only a third of the way up the world's
-        // relief budget could still classify as the same Warm/Temperate
-        // band as the lowland regional baseline it rose out of, which reads
-        // wrong regardless of how the fraction itself is measured.
+        // Coefficients raised from 0.46/0.16/0.06 defaults and exposed as
+        // Climate.ElevationLapseStrength/MountainExposureCooling/
+        // HillExposureCooling: a moderate mountainside only a third of the
+        // way up the world's relief budget could still classify as the
+        // same Warm/Temperate band as the lowland regional baseline it
+        // rose out of, which reads wrong regardless of how the fraction
+        // itself is measured.
         Data.Temperature[Cell] = FMath::Clamp(
-            RegionalTemperature - ElevationFraction * 0.62
-                - MountainExposure * 0.24
-                - HillExposure * 0.09,
+            RegionalTemperature - ElevationFraction * Generator.ClimateElevationLapseStrength
+                - MountainExposure * Generator.ClimateMountainExposureCooling
+                - HillExposure * Generator.ClimateHillExposureCooling,
             0.0, 1.0
         );
 
@@ -7719,6 +7721,15 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
         FMath::Max(0.0, Climate.PrevailingWindDirectionDegrees), 360.0
     );
     RainShadowStrength = FMath::Clamp(Climate.RainShadowStrength, 0.0, 1.0);
+    ClimateElevationLapseStrength = FMath::Clamp(
+        Climate.ElevationLapseStrength, 0.0, 1.5
+    );
+    ClimateMountainExposureCooling = FMath::Clamp(
+        Climate.MountainExposureCooling, 0.0, 1.0
+    );
+    ClimateHillExposureCooling = FMath::Clamp(
+        Climate.HillExposureCooling, 0.0, 1.0
+    );
 
     ErosionResistanceStrength = (bGenerateClimate || bGenerateMesasAndCanyons)
         ? 0.55 : 0.0;

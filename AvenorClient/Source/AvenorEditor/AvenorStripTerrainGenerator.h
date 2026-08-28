@@ -77,6 +77,15 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "How strongly mountains block moisture on their lee side and enhance it on their windward side. 0 disables rain shadows entirely, leaving moisture purely a function of the broad climate regions and elevation."))
     double RainShadowStrength = 0.6;
 
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.5", ToolTip = "How strongly climbing toward the top of the world's relief budget cools local temperature. Scales with elevation as a fraction of Relief Height, not an absolute metre count, so it stays meaningful regardless of that setting."))
+    double ElevationLapseStrength = 0.62;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Extra cooling for exposed mountain terrain (wind exposure, bare rock, thin soil), independent of literal elevation - lets a rocky mountain shoulder or saddle read as cold without needing to be the actual summit."))
+    double MountainExposureCooling = 0.24;
+
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Same idea as Mountain Exposure Cooling but for hill terrain, at a gentler default strength."))
+    double HillExposureCooling = 0.09;
+
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (Units = "cm", ClampMin = "100.0", ClampMax = "100000.0", ToolTip = "World size of one texel in the baked biome/climate/terrain-filter/water-surface texture maps, independent of Analysis Spacing. These maps are rasterized by resampling the analysis grid (smoothly for continuous fields, exactly for water/shoreline distance), so this can go much finer than the analysis grid without repeating the erosion simulation at that resolution - it is comparatively cheap. Each output texture is still capped to a safe maximum dimension, so an unreasonably fine value here is automatically coarsened per texture (per-region tiles can hold much finer detail than the single whole-world overview map)."))
     double MapTexelSize = 5000.0;
 };
@@ -342,6 +351,9 @@ public:
     bool bShowcaseClimateCompression = false;
     double PrevailingWindDirectionDegrees = 0.0;
     double RainShadowStrength = 0.6;
+    double ClimateElevationLapseStrength = 0.62;
+    double ClimateMountainExposureCooling = 0.24;
+    double ClimateHillExposureCooling = 0.09;
     bool bGenerateMesasAndCanyons = false;
     double MesaScale = 400000.0;
     double ErosionResistanceStrength = 0.0;
