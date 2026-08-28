@@ -3130,11 +3130,21 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
         const double StartArea = FMath::Lerp(
             LowlandStartArea, MountainStartArea, MountainFraction
         ) * DrainageSourceMultiplier(Data, Cell);
+        // Hot/dry desert never gets a surface river, full stop - real deserts
+        // this arid lose surface flow to evaporation and infiltration long
+        // before it could organise into a channel. Bake that in as a
+        // hard veto here rather than relying on DrainageSourceMultiplier's
+        // arid dampening alone: that only inflates the seeding threshold, so
+        // a large enough upstream (e.g. mountain-fed) catchment can still
+        // clear it and produce a river deep into confirmed desert.
+        const bool bTrueDesert = Data.Biome.IsValidIndex(Cell)
+            && static_cast<EAvenorBiomeClass>(Data.Biome[Cell]) == EAvenorBiomeClass::HotDry;
         // Use the D8 accumulation here, matching the D8-based PrimaryReceiver
         // topology this function builds Channel from - the MFD Accumulation
         // used for erosion incision doesn't necessarily agree cell-for-cell
         // with which single path PrimaryReceiver says the water takes.
-        if (Data.AccumulationD8[Cell] >= StartArea
+        if (!bTrueDesert
+            && Data.AccumulationD8[Cell] >= StartArea
             && PrimaryReceiver(Data, Cell) != INDEX_NONE)
         {
             SeedCells[Cell] = true;
@@ -3153,6 +3163,14 @@ static TArray<bool> BuildAuthoritativeRiverNetwork(
         {
             const int32 Receiver = PrimaryReceiver(Data, Cell);
             if (Receiver == INDEX_NONE || !Channel.IsValidIndex(Receiver) || Channel[Receiver])
+            {
+                break;
+            }
+            // A river flowing in from wetter terrain sinks at the true-desert
+            // boundary instead of continuing through it - a losing/endorheic
+            // stream, not a channel that just happens to cross a desert.
+            if (Data.Biome.IsValidIndex(Receiver)
+                && static_cast<EAvenorBiomeClass>(Data.Biome[Receiver]) == EAvenorBiomeClass::HotDry)
             {
                 break;
             }
@@ -4969,16 +4987,40 @@ static void PlaceDesertOases(
 
         const double GroundHeight = Data.SampleHeight(ChosenPosition);
         constexpr double OasisDepth = 400.0;
-        constexpr int32 OasisSides = 10;
+        constexpr int32 OasisSides = 16;
+
+        // A perfectly regular polygon reads as an obviously artificial disc,
+        // so warp the radius with a few random sine harmonics instead of a
+        // constant OasisRadius - an organic, uneven waterline like a real
+        // spring-fed pool rather than a stamped circle. The same function is
+        // reused below to carve the depression, so the actual basin shape
+        // agrees with the shoreline instead of a round hole under a blobby
+        // waterline.
+        const double HarmonicPhase1 = Random.FRandRange(0.0, 2.0 * PI);
+        const double HarmonicPhase2 = Random.FRandRange(0.0, 2.0 * PI);
+        const double HarmonicPhase3 = Random.FRandRange(0.0, 2.0 * PI);
+        const double HarmonicAmplitude1 = Random.FRandRange(0.20, 0.32);
+        const double HarmonicAmplitude2 = Random.FRandRange(0.10, 0.20);
+        const double HarmonicAmplitude3 = Random.FRandRange(0.05, 0.12);
+        auto OasisRadiusAtAngle = [&](double Angle)
+        {
+            const double Factor = 1.0
+                + HarmonicAmplitude1 * FMath::Sin(2.0 * Angle + HarmonicPhase1)
+                + HarmonicAmplitude2 * FMath::Sin(3.0 * Angle + HarmonicPhase2)
+                + HarmonicAmplitude3 * FMath::Sin(5.0 * Angle + HarmonicPhase3);
+            return OasisRadius * FMath::Clamp(Factor, 0.55, 1.45);
+        };
+
         TArray<FVector> Shoreline;
         Shoreline.Reserve(OasisSides);
         for (int32 Side = 0; Side < OasisSides; ++Side)
         {
             const double Angle = 2.0 * PI * static_cast<double>(Side)
                 / static_cast<double>(OasisSides);
+            const double Radius = OasisRadiusAtAngle(Angle);
             Shoreline.Add(FVector(
-                ChosenPosition.X + FMath::Cos(Angle) * OasisRadius,
-                ChosenPosition.Y + FMath::Sin(Angle) * OasisRadius,
+                ChosenPosition.X + FMath::Cos(Angle) * Radius,
+                ChosenPosition.Y + FMath::Sin(Angle) * Radius,
                 GroundHeight
             ));
         }
@@ -4994,7 +5036,7 @@ static void PlaceDesertOases(
             FMath::RoundToInt((ChosenPosition.Y - Data.Bounds.Min.Y) / Data.CellSize),
             0, Data.Rows - 1
         );
-        const int32 CellRadius = FMath::CeilToInt(OasisRadius / Data.CellSize) + 1;
+        const int32 CellRadius = FMath::CeilToInt(OasisRadius * 1.45 / Data.CellSize) + 1;
         for (int32 Y = FMath::Max(0, CentreY - CellRadius);
             Y <= FMath::Min(Data.Rows - 1, CentreY + CellRadius); ++Y)
         {
@@ -5002,11 +5044,14 @@ static void PlaceDesertOases(
                 X <= FMath::Min(Data.Columns - 1, CentreX + CellRadius); ++X)
             {
                 const int32 Cell = Data.Index(X, Y);
-                const double Distance = FVector2D::Distance(
-                    Data.CellPosition(Cell), ChosenPosition
+                const FVector2D CellPosition = Data.CellPosition(Cell);
+                const FVector2D Offset = CellPosition - ChosenPosition;
+                const double Distance = Offset.Size();
+                const double LocalRadius = OasisRadiusAtAngle(
+                    FMath::Atan2(Offset.Y, Offset.X)
                 );
                 const double Falloff = Smooth01(FMath::Clamp(
-                    1.0 - Distance / OasisRadius, 0.0, 1.0
+                    1.0 - Distance / LocalRadius, 0.0, 1.0
                 ));
                 if (Falloff <= 0.0)
                 {
@@ -5987,6 +6032,17 @@ static double EvaluateLandform(
     // Desert 1.00 with Hill 0.05 (i.e. plains-dominant) still carved an
     // ordinary broad river valley, because ResistantCap could never
     // engage there regardless of Lithology.
+    // Lithology is an independent noise field with no correlation to where
+    // desert actually sits, so a fixed threshold meant confirmed Desert=1.00
+    // cells could still roll a locally-low Lithology sample and never clear
+    // the bar at all - the same "two independent fields need to coincide"
+    // problem ContinentalDryness fixed for temperature/moisture, here
+    // starving ResistantCap (and the canyon carving it drives) of anywhere
+    // to engage even in real desert. Real deserts expose bare resistant rock
+    // far more reliably than the bare-noise value would suggest (no
+    // vegetation or soil to hide it), so let the threshold fall as
+    // OutDesertMask rises instead of holding it fixed.
+    const double ResistantThreshold = FMath::Lerp(0.48, 0.18, OutDesertMask);
     const double ResistantCap = OutDesertMask
         * FMath::Clamp(
             LandformPlan.RollingHill
@@ -5995,7 +6051,7 @@ static double EvaluateLandform(
                 + LandformPlan.Plain * 0.65,
             0.0, 1.0
         )
-        * Smooth01(FMath::Clamp((Lithology - 0.48) / 0.38, 0.0, 1.0));
+        * Smooth01(FMath::Clamp((Lithology - ResistantThreshold) / 0.38, 0.0, 1.0));
 
     // Warm-dry country is savannah rather than a diluted hot desert. Keep
     // most of it as long, quiet plains/rolling hills, but allow sparse broad
