@@ -2281,9 +2281,31 @@ static double DrainageSourceMultiplier(
     const double SourceSupport = FMath::Max(
         ReliefSupport, WetLowlandSupport
     );
-    return 1.0
-        + (1.0 - SourceSupport) * 1.45
-        + AridSourcePenalty * 1.65;
+    // WetLowlandSupport above only ever saturates SourceSupport at 1.0, i.e.
+    // a neutral multiplier - "as dense as a relief-driven mountain stream",
+    // not "denser than baseline". Every wet climate should read as denser
+    // than that: hot-wet rainforest and temperate/cold-wet forested country
+    // both get plenty of streams, and warm-wet swamp - basically drowned in
+    // the stuff - the most of all. This needs its own subtractive term to
+    // push the threshold below neutral rather than just up to it.
+    const double SourceTemperature = Data.MacroTemperature.IsValidIndex(Cell)
+        ? Data.MacroTemperature[Cell] : 0.5;
+    const double WetnessBonus = Smooth01(FMath::Clamp(
+        (SourceMoisture - 0.55) / 0.30, 0.0, 1.0
+    ));
+    // Peaks in the warm band (matches WarmMoist's classification range),
+    // where warm-wet lowland reads as swamp rather than rainforest or
+    // temperate forest.
+    const double SwampBonus = WetnessBonus * Smooth01(FMath::Clamp(
+        1.0 - FMath::Abs(SourceTemperature - 0.62) / 0.20, 0.0, 1.0
+    ));
+    const double WetSourceBonus = WetnessBonus * 0.55 + SwampBonus * 0.35;
+    return FMath::Max(0.35,
+        1.0
+            + (1.0 - SourceSupport) * 1.45
+            + AridSourcePenalty * 1.65
+            - WetSourceBonus
+    );
 }
 
 // Geomorphic erosion preserves palaeodrainage more readily than the modern
