@@ -1244,7 +1244,8 @@ static void BuildExactWorldWaterPixels(
         return;
     }
 
-    const FVector2D WorldSize = Data.Bounds.GetSize();
+    const FVector BoundsSize = Data.Bounds.GetSize();
+    const FVector2D WorldSize(BoundsSize.X, BoundsSize.Y);
     const FVector2D PixelSize(
         WorldSize.X / static_cast<double>(Width),
         WorldSize.Y / static_cast<double>(Height)
