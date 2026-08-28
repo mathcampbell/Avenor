@@ -5953,7 +5953,8 @@ static void BuildMacroClimate(
     MoistureAnchors[0] = FMath::Clamp(
         Generator.ClimateMoisture
             + Random.FRandRange(-0.08f, 0.08f)
-                * Generator.ClimateRegionalVariation,
+                * Generator.ClimateRegionalVariation
+            - (TemperatureAnchors[0] - 0.5) * Generator.ClimateContinentalDryness,
         0.03, 0.97
     );
     double TemperatureTrend = Random.FRandRange(-0.06f, 0.06f);
@@ -5986,8 +5987,21 @@ static void BuildMacroClimate(
             TemperatureAnchors[Index - 1] + TemperatureTrend,
             0.03, 0.97
         );
+        // Temperature and moisture are otherwise fully independent random
+        // walks along the strip. HotFraction/Dryness (and therefore Aridity)
+        // need BOTH conditions at the SAME cell - the percentile stretch
+        // below guarantees some cell reaches near-maximum temperature and
+        // some cell reaches near-minimum moisture somewhere on the map, but
+        // never guaranteed those to be the same cell, since two independent
+        // walks landing their extremes at the same position along the strip
+        // is mostly coincidence. This nudges moisture down as temperature
+        // rises above the midpoint (and up as it falls below), the same
+        // hot-is-typically-dry / cold-is-typically-wetter correlation real
+        // climates show, without making moisture fully deterministic from
+        // temperature - a coupling of 0 restores full independence.
         MoistureAnchors[Index] = FMath::Clamp(
-            MoistureAnchors[Index - 1] + MoistureTrend,
+            MoistureAnchors[Index - 1] + MoistureTrend
+                - (TemperatureAnchors[Index] - 0.5) * Generator.ClimateContinentalDryness,
             0.03, 0.97
         );
     }
@@ -7721,6 +7735,9 @@ void AAvenorStripTerrainGenerator::ResolveSettings()
         FMath::Max(0.0, Climate.PrevailingWindDirectionDegrees), 360.0
     );
     RainShadowStrength = FMath::Clamp(Climate.RainShadowStrength, 0.0, 1.0);
+    ClimateContinentalDryness = FMath::Clamp(
+        Climate.ContinentalDryness, 0.0, 1.0
+    );
     ClimateElevationLapseStrength = FMath::Clamp(
         Climate.ElevationLapseStrength, 0.0, 1.5
     );

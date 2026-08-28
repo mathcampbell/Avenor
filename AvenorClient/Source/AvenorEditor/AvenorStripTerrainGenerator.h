@@ -77,6 +77,9 @@ struct FAvenorClimateSettings
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "How strongly mountains block moisture on their lee side and enhance it on their windward side. 0 disables rain shadows entirely, leaving moisture purely a function of the broad climate regions and elevation."))
     double RainShadowStrength = 0.6;
 
+    UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "Regional temperature and moisture are otherwise fully independent random walks along the strip, so a hot region and a dry region reaching their extremes at the same location is mostly coincidence - true desert (which needs both at once) can end up rare or absent even with high Regional Variation. This nudges moisture down as temperature rises above its midpoint and up as it falls below, the same hot-is-typically-dry/cold-is-typically-wetter correlation real climates show. 0 restores full independence."))
+    double ContinentalDryness = 0.45;
+
     UPROPERTY(EditAnywhere, Category = "Climate", meta = (ClampMin = "0.0", ClampMax = "1.5", ToolTip = "How strongly climbing toward the top of the world's relief budget cools local temperature. Scales with elevation as a fraction of Relief Height, not an absolute metre count, so it stays meaningful regardless of that setting."))
     double ElevationLapseStrength = 0.62;
 
@@ -351,6 +354,7 @@ public:
     bool bShowcaseClimateCompression = false;
     double PrevailingWindDirectionDegrees = 0.0;
     double RainShadowStrength = 0.6;
+    double ClimateContinentalDryness = 0.45;
     double ClimateElevationLapseStrength = 0.62;
     double ClimateMountainExposureCooling = 0.24;
     double ClimateHillExposureCooling = 0.09;
