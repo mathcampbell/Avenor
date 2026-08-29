@@ -40,6 +40,7 @@
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include <atomic>
 #include <queue>
 #include <vector>
 
@@ -7371,6 +7372,16 @@ public:
             return;
         }
         FAvenorTerrainHeightChunkCache ChunkCache;
+        FBox2D SectionXYBounds(ForceInit);
+        int32 SampledVertices = 0;
+        int32 RiverBedVertices = 0;
+        int32 RiverBankVertices = 0;
+        int32 LakeBedVertices = 0;
+        int32 LakeShoreVertices = 0;
+        float MaximumRiverBed = 0.0f;
+        float MaximumRiverBank = 0.0f;
+        float MaximumLakeBed = 0.0f;
+        float MaximumLakeShore = 0.0f;
         for (int32 Vertex = 0; Vertex < MeshView.VertexCount(); ++Vertex)
         {
             FVector3d WorldPosition = MeshTransform.TransformPosition(MeshView.GetVertexPos(Vertex));
@@ -7380,6 +7391,8 @@ public:
             {
                 continue;
             }
+            ++SampledVertices;
+            SectionXYBounds += XY;
             float FinalHeight = Sample.Height;
             Data->SampleFinalHeight(
                 XY, FinalHeight, ChunkCache, nullptr
@@ -7420,6 +7433,81 @@ public:
             MeshView.SetVertexAttributeWeight(RiverBankChannel, Vertex, WaterWeights.RiverBank);
             MeshView.SetVertexAttributeWeight(LakeBedChannel, Vertex, WaterWeights.LakeBed);
             MeshView.SetVertexAttributeWeight(LakeShoreChannel, Vertex, WaterWeights.LakeShore);
+
+            RiverBedVertices += WaterWeights.RiverBed > 0.001f ? 1 : 0;
+            RiverBankVertices += WaterWeights.RiverBank > 0.001f ? 1 : 0;
+            LakeBedVertices += WaterWeights.LakeBed > 0.001f ? 1 : 0;
+            LakeShoreVertices += WaterWeights.LakeShore > 0.001f ? 1 : 0;
+            MaximumRiverBed = FMath::Max(MaximumRiverBed, WaterWeights.RiverBed);
+            MaximumRiverBank = FMath::Max(MaximumRiverBank, WaterWeights.RiverBank);
+            MaximumLakeBed = FMath::Max(MaximumLakeBed, WaterWeights.LakeBed);
+            MaximumLakeShore = FMath::Max(MaximumLakeShore, WaterWeights.LakeShore);
+        }
+
+        bool bSectionNearWater = false;
+        if (SampledVertices > 0)
+        {
+            auto OverlapsSection = [&](const FBox2D& Bounds)
+            {
+                return SectionXYBounds.Min.X <= Bounds.Max.X
+                    && SectionXYBounds.Max.X >= Bounds.Min.X
+                    && SectionXYBounds.Min.Y <= Bounds.Max.Y
+                    && SectionXYBounds.Max.Y >= Bounds.Min.Y;
+            };
+            for (int32 RiverIndex = 0;
+                 RiverIndex < RiverMaterialBounds.Num(); ++RiverIndex)
+            {
+                if (Data->Rivers.IsValidIndex(RiverIndex)
+                    && Data->Rivers[RiverIndex].Points.Num() >= 2
+                    && OverlapsSection(RiverMaterialBounds[RiverIndex]))
+                {
+                    bSectionNearWater = true;
+                    break;
+                }
+            }
+            if (!bSectionNearWater)
+            {
+                for (int32 LakeIndex = 0;
+                     LakeIndex < LakeMaterialBounds.Num(); ++LakeIndex)
+                {
+                    if (Data->Lakes.IsValidIndex(LakeIndex)
+                        && Data->Lakes[LakeIndex].Shoreline.Num() >= 3
+                        && OverlapsSection(LakeMaterialBounds[LakeIndex]))
+                    {
+                        bSectionNearWater = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        static std::atomic<int32> InitialDiagnosticBudget{0};
+        const int32 DiagnosticIndex =
+            InitialDiagnosticBudget.fetch_add(1, std::memory_order_relaxed);
+        if (bSectionNearWater || DiagnosticIndex < 8)
+        {
+            UE_LOG(
+                LogTemp,
+                Display,
+                TEXT("Avenor MP channel diagnostic: mesh vertices %d, sampled %d, baked rivers %d, lakes %d | nonzero RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | section near water %s | XY [%.0f, %.0f]-[%.0f, %.0f]"),
+                MeshView.VertexCount(),
+                SampledVertices,
+                Data->Rivers.Num(),
+                Data->Lakes.Num(),
+                RiverBedVertices,
+                MaximumRiverBed,
+                RiverBankVertices,
+                MaximumRiverBank,
+                LakeBedVertices,
+                MaximumLakeBed,
+                LakeShoreVertices,
+                MaximumLakeShore,
+                bSectionNearWater ? TEXT("yes") : TEXT("no"),
+                SampledVertices > 0 ? SectionXYBounds.Min.X : 0.0,
+                SampledVertices > 0 ? SectionXYBounds.Min.Y : 0.0,
+                SampledVertices > 0 ? SectionXYBounds.Max.X : 0.0,
+                SampledVertices > 0 ? SectionXYBounds.Max.Y : 0.0
+            );
         }
     }
 
@@ -7430,7 +7518,7 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("590ce353-3701-4bec-b5ed-881a9b2149ad")); }
+    static FGuid Version() { return FGuid(TEXT("a864b5d7-91fb-443d-adae-bcca06eaef17")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
