@@ -7352,11 +7352,18 @@ public:
             UE::MeshPartition::EMeshViewComponents::VertexPos |
             UE::MeshPartition::EMeshViewComponents::VertexAttributeWeight
         );
-        Instance.UsedChannels = {
-            ElevationChannel, SlopeChannel, WetnessChannel, RiverChannel, LakeChannel,
-            MountainChannel, HillChannel, DesertChannel, PlainsChannel,
-            RiverBedChannel, RiverBankChannel, LakeBedChannel, LakeShoreChannel
-        };
+        Instance.UsedChannels = bHydrologyChannelsOnly
+            ? TArray<FName>{
+                RiverBedChannel, RiverBankChannel,
+                LakeBedChannel, LakeShoreChannel
+            }
+            : TArray<FName>{
+                ElevationChannel, SlopeChannel, WetnessChannel,
+                RiverChannel, LakeChannel, MountainChannel,
+                HillChannel, DesertChannel, PlainsChannel,
+                RiverBedChannel, RiverBankChannel,
+                LakeBedChannel, LakeShoreChannel
+            };
     }
 
     virtual void ApplyModifications(
@@ -7371,6 +7378,93 @@ public:
         {
             return;
         }
+        if (bHydrologyChannelsOnly)
+        {
+            FBox2D SectionXYBounds(ForceInit);
+            int32 RiverBedVertices = 0;
+            int32 RiverBankVertices = 0;
+            int32 LakeBedVertices = 0;
+            int32 LakeShoreVertices = 0;
+            float MaximumRiverBed = 0.0f;
+            float MaximumRiverBank = 0.0f;
+            float MaximumLakeBed = 0.0f;
+            float MaximumLakeShore = 0.0f;
+            for (int32 Vertex = 0; Vertex < MeshView.VertexCount(); ++Vertex)
+            {
+                const FVector3d WorldPosition =
+                    MeshTransform.TransformPosition(
+                        MeshView.GetVertexPos(Vertex)
+                    );
+                const FVector2D XY(WorldPosition.X, WorldPosition.Y);
+                SectionXYBounds += XY;
+                const FMaterialWaterWeights WaterWeights =
+                    SampleMaterialWaterWeights(
+                        *Data,
+                        XY,
+                        MaterialRiverBankWidth,
+                        MaterialLakeShoreWidth,
+                        RiverMaterialBounds,
+                        LakeMaterialBounds,
+                        LakeMaterialPolygons
+                    );
+                MeshView.SetVertexAttributeWeight(
+                    RiverBedChannel, Vertex, WaterWeights.RiverBed
+                );
+                MeshView.SetVertexAttributeWeight(
+                    RiverBankChannel, Vertex, WaterWeights.RiverBank
+                );
+                MeshView.SetVertexAttributeWeight(
+                    LakeBedChannel, Vertex, WaterWeights.LakeBed
+                );
+                MeshView.SetVertexAttributeWeight(
+                    LakeShoreChannel, Vertex, WaterWeights.LakeShore
+                );
+                RiverBedVertices +=
+                    WaterWeights.RiverBed > 0.001f ? 1 : 0;
+                RiverBankVertices +=
+                    WaterWeights.RiverBank > 0.001f ? 1 : 0;
+                LakeBedVertices +=
+                    WaterWeights.LakeBed > 0.001f ? 1 : 0;
+                LakeShoreVertices +=
+                    WaterWeights.LakeShore > 0.001f ? 1 : 0;
+                MaximumRiverBed = FMath::Max(
+                    MaximumRiverBed, WaterWeights.RiverBed
+                );
+                MaximumRiverBank = FMath::Max(
+                    MaximumRiverBank, WaterWeights.RiverBank
+                );
+                MaximumLakeBed = FMath::Max(
+                    MaximumLakeBed, WaterWeights.LakeBed
+                );
+                MaximumLakeShore = FMath::Max(
+                    MaximumLakeShore, WaterWeights.LakeShore
+                );
+            }
+            if (RiverBedVertices > 0 || RiverBankVertices > 0
+                || LakeBedVertices > 0 || LakeShoreVertices > 0)
+            {
+                UE_LOG(
+                    LogTemp,
+                    Display,
+                    TEXT("Avenor FINAL MP hydrology pass: vertices %d | RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | XY [%.0f, %.0f]-[%.0f, %.0f]"),
+                    MeshView.VertexCount(),
+                    RiverBedVertices,
+                    MaximumRiverBed,
+                    RiverBankVertices,
+                    MaximumRiverBank,
+                    LakeBedVertices,
+                    MaximumLakeBed,
+                    LakeShoreVertices,
+                    MaximumLakeShore,
+                    MeshView.VertexCount() > 0 ? SectionXYBounds.Min.X : 0.0,
+                    MeshView.VertexCount() > 0 ? SectionXYBounds.Min.Y : 0.0,
+                    MeshView.VertexCount() > 0 ? SectionXYBounds.Max.X : 0.0,
+                    MeshView.VertexCount() > 0 ? SectionXYBounds.Max.Y : 0.0
+                );
+            }
+            return;
+        }
+
         FAvenorTerrainHeightChunkCache ChunkCache;
         FBox2D SectionXYBounds(ForceInit);
         int32 SampledVertices = 0;
@@ -7518,8 +7612,13 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("a864b5d7-91fb-443d-adae-bcca06eaef17")); }
+    static FGuid Version() { return FGuid(TEXT("d2dcc5be-af51-41f4-bb8a-db18332ff0b8")); }
+    static FGuid HydrologyVersion()
+    {
+        return FGuid(TEXT("167e882d-a7c2-4572-b069-8bcfa5746c41"));
+    }
 
+    bool bHydrologyChannelsOnly = false;
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
     double MaterialRiverBankWidth = 3000.0;
@@ -8349,12 +8448,72 @@ FGuid UAvenorStripTerrainModifier::GetCodeVersionKey() const
     return FStripTerrainOp::Version();
 }
 
+TArray<FBox> UAvenorHydrologyChannelModifier::ComputeBounds() const
+{
+    const AAvenorStripTerrainGenerator* Generator =
+        Cast<AAvenorStripTerrainGenerator>(GetOwner());
+    if (!Generator)
+    {
+        return {};
+    }
+    const FBox GenerationBounds = Generator->GetGenerationBounds();
+    return GenerationBounds.IsValid
+        ? TArray<FBox>{GenerationBounds} : TArray<FBox>{};
+}
+
+TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
+UAvenorHydrologyChannelModifier::CreateBackgroundOp(
+    UE::MeshPartition::EBuildType BuildType
+) const
+{
+    (void)BuildType;
+    TSharedPtr<FStripTerrainOp> Op =
+        MakeShared<FStripTerrainOp>(GetFName());
+    Op->bHydrologyChannelsOnly = true;
+    const AAvenorStripTerrainGenerator* Generator =
+        Cast<AAvenorStripTerrainGenerator>(GetOwner());
+    if (Generator)
+    {
+        Op->WorldBounds = Generator->GetGenerationBounds();
+        Op->BaseWorldZ = Generator->GetActorLocation().Z;
+        Op->MaterialRiverBankWidth =
+            Generator->WaterTerrain.MaterialRiverBankWidth;
+        Op->MaterialLakeShoreWidth =
+            Generator->WaterTerrain.MaterialLakeShoreWidth;
+        Op->TerrainData.Reset(
+            Generator->BakedTerrainData.LoadSynchronous()
+        );
+        Op->BuildMaterialWaterBounds();
+        if (!Op->TerrainData.IsValid()
+            || !Op->TerrainData->HasValidData())
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Avenor hydrology channel modifier: no valid Baked Terrain Data is available.")
+            );
+        }
+    }
+    return Op;
+}
+
+FGuid UAvenorHydrologyChannelModifier::GetCodeVersionKey() const
+{
+    return FStripTerrainOp::HydrologyVersion();
+}
+
 AAvenorStripTerrainGenerator::AAvenorStripTerrainGenerator()
 {
     PrimaryActorTick.bCanEverTick = false;
     SetIsSpatiallyLoaded(false);
     TerrainModifier = CreateDefaultSubobject<UAvenorStripTerrainModifier>(TEXT("StripTerrain"));
     SetRootComponent(TerrainModifier);
+    HydrologyChannelModifier =
+        CreateDefaultSubobject<UAvenorHydrologyChannelModifier>(
+            TEXT("HydrologyChannels")
+        );
+    HydrologyChannelModifier->SetupAttachment(TerrainModifier);
+    HydrologyChannelModifier->bIsEditorOnly = true;
     FastPreviewMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("FastTerrainPreview"));
     FastPreviewMesh->SetupAttachment(TerrainModifier);
     FastPreviewMesh->bIsEditorOnly = true;
@@ -8915,7 +9074,8 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
 #if WITH_EDITOR
     UE::MeshPartition::AMeshPartition* TargetMeshPartition =
         Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor);
-    if (!TargetMeshPartition || !TerrainModifier)
+    if (!TargetMeshPartition || !TerrainModifier
+        || !HydrologyChannelModifier)
     {
         if (bShowFailureDialog)
         {
@@ -8997,6 +9157,15 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
             }
         }
     }
+
+    HydrologyChannelModifier->Modify();
+    HydrologyChannelModifier->SetAffectedMeshPartition(nullptr);
+    HydrologyChannelModifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
+    HydrologyChannelModifier->SetPriorityLayer(PriorityLayers.Last());
+    // Refinement remesh is priority 0 and native water is priority 10.
+    // Paint the finished topology after both.
+    HydrologyChannelModifier->SetPriority(100.0);
+    HydrologyChannelModifier->PostEditChange();
 
     TargetMeshPartition->Modify();
     TargetMeshPartition->PostEditChange();
@@ -9802,6 +9971,10 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWorld()
     if (TerrainModifier)
     {
         TerrainModifier->SetAffectedMeshPartition(nullptr);
+    }
+    if (HydrologyChannelModifier)
+    {
+        HydrologyChannelModifier->SetAffectedMeshPartition(nullptr);
     }
     if (UE::MeshPartition::AMeshPartition* TargetMeshPartition =
         Cast<UE::MeshPartition::AMeshPartition>(MeshPartitionActor))
