@@ -167,6 +167,9 @@ struct FAvenorWaterTerrainSettings
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0"))
     double LakeShoreWidth = 24000.0;
 
+    UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "100.0", ClampMax = "50000.0", ToolTip = "Visible material shore width written directly to the LakeShore Mesh Partition channel from the baked lake polygon. Independent of the broader lake terrain-carving transition."))
+    double MaterialLakeShoreWidth = 6000.0;
+
     UPROPERTY(EditAnywhere, Category = "Water Terrain", meta = (Units = "cm", ClampMin = "0.0", ClampMax = "10000.0", ToolTip = "Lowers generated lake surfaces below the detected basin shoreline. 200 cm exposes roughly two metres of natural bank without changing the lake outline."))
     double LakeSurfaceInset = 200.0;
 
