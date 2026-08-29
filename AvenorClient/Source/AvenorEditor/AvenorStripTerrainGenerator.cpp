@@ -505,6 +505,8 @@ static void AddBroadMeanders(
 struct FRiverReach
 {
     TArray<FVector> Points;
+    TArray<double> PointWidths;
+    TArray<double> PointDepths;
     double Width = 500.0;
     double Depth = 250.0;
     double ValleyHalfWidth = 15000.0;
@@ -640,7 +642,7 @@ namespace UE::Avenor::Strip::BakedData
 {
 static constexpr uint32 ChunkMagic = 0x41564431;
 static constexpr int32 ChunkPayloadVersion = 5;
-static constexpr int32 GeneratorAlgorithmVersion = 40;
+static constexpr int32 GeneratorAlgorithmVersion = 41;
 
 static void ExtractFloatChunk(
     const TArray<double>& Source,
@@ -4813,11 +4815,69 @@ static void ExtractRivers(
         }
         FRiverReach River;
         River.Points = MoveTemp(Points);
+        River.PointWidths.Reserve(River.Points.Num());
+        River.PointDepths.Reserve(River.Points.Num());
+        const double HeadwaterDepth = FMath::Max(
+            120.0, MaximumDepth * 0.12
+        );
+        double PreviousPointWidth = 0.0;
+        double PreviousPointDepth = 0.0;
+        for (int32 PointIndex = 0; PointIndex < River.Points.Num(); ++PointIndex)
+        {
+            // CandidateReach.Cells follows the authoritative downstream D8
+            // route. Map the final smoothed/resampled spline monotonically
+            // along it so meander offsets cannot sample a dry neighbouring
+            // cell and make the river narrow downstream.
+            const double ReachAlpha = River.Points.Num() > 1
+                ? static_cast<double>(PointIndex)
+                    / static_cast<double>(River.Points.Num() - 1)
+                : 1.0;
+            const double SourceCellPosition = ReachAlpha
+                * FMath::Max(0, CandidateReach.Cells.Num() - 1);
+            const int32 SourceCellA = FMath::Clamp(
+                FMath::FloorToInt(SourceCellPosition),
+                0,
+                CandidateReach.Cells.Num() - 1
+            );
+            const int32 SourceCellB = FMath::Min(
+                SourceCellA + 1,
+                CandidateReach.Cells.Num() - 1
+            );
+            const double SourceAlpha = SourceCellPosition - SourceCellA;
+            const double LocalArea = FMath::Lerp(
+                Data.AccumulationD8[CandidateReach.Cells[SourceCellA]],
+                Data.AccumulationD8[CandidateReach.Cells[SourceCellB]],
+                SourceAlpha
+            );
+            const double LocalRiverAlpha = DrainageScaleAlpha(
+                LocalArea, MainRiverArea
+            );
+            const double PointWidth = FMath::Max(
+                PreviousPointWidth,
+                FMath::Lerp(
+                    HeadwaterWidth, MainRiverWidth, LocalRiverAlpha
+                )
+            );
+            const double PointDepth = FMath::Max(
+                PreviousPointDepth,
+                FMath::Lerp(
+                    HeadwaterDepth, MaximumDepth, LocalRiverAlpha
+                )
+            );
+            River.PointWidths.Add(PointWidth);
+            River.PointDepths.Add(PointDepth);
+            PreviousPointWidth = PointWidth;
+            PreviousPointDepth = PointDepth;
+        }
         River.DrainageArea = Area;
         River.StartLakeIndex = CandidateReach.StartLakeIndex;
         River.EndLakeIndex = CandidateReach.EndLakeIndex;
-        River.Width = FMath::Lerp(HeadwaterWidth, MainRiverWidth, RiverAlpha);
-        River.Depth = FMath::Lerp(FMath::Max(120.0, MaximumDepth * 0.12), MaximumDepth, RiverAlpha);
+        River.Width = River.PointWidths.IsEmpty()
+            ? FMath::Lerp(HeadwaterWidth, MainRiverWidth, RiverAlpha)
+            : River.PointWidths.Last();
+        River.Depth = River.PointDepths.IsEmpty()
+            ? FMath::Lerp(HeadwaterDepth, MaximumDepth, RiverAlpha)
+            : River.PointDepths.Last();
         River.ValleyHalfWidth = FMath::Lerp(HeadwaterValleyWidth, MainValleyWidth, RiverAlpha);
         // Erosion has already created the broad valley. Ordinary active rivers
         // only add modest channel/bank relief; canyon classification below is
@@ -7093,19 +7153,32 @@ static FMaterialWaterWeights SampleMaterialWaterWeights(
         }
 
         double Distance = TNumericLimits<double>::Max();
+        double LocalFullWidth = FMath::Max(200.0, River.Width);
         for (int32 PointIndex = 1; PointIndex < River.Points.Num(); ++PointIndex)
         {
-            Distance = FMath::Min(
-                Distance,
-                SegmentDistance(
-                    Position,
-                    FVector2D(River.Points[PointIndex - 1]),
-                    FVector2D(River.Points[PointIndex])
-                )
+            double SegmentAlpha = 0.0;
+            const double SegmentDistanceToPoint = SegmentDistance(
+                Position,
+                FVector2D(River.Points[PointIndex - 1]),
+                FVector2D(River.Points[PointIndex]),
+                &SegmentAlpha
             );
+            if (SegmentDistanceToPoint < Distance)
+            {
+                Distance = SegmentDistanceToPoint;
+                const double WidthA = River.PointWidths.IsValidIndex(
+                    PointIndex - 1
+                ) ? River.PointWidths[PointIndex - 1] : River.Width;
+                const double WidthB = River.PointWidths.IsValidIndex(
+                    PointIndex
+                ) ? River.PointWidths[PointIndex] : River.Width;
+                LocalFullWidth = FMath::Lerp(
+                    WidthA, WidthB, SegmentAlpha
+                );
+            }
         }
 
-        const double HalfWidth = FMath::Max(100.0, River.Width * 0.5);
+        const double HalfWidth = FMath::Max(100.0, LocalFullWidth * 0.5);
         const double BedFeather = FMath::Clamp(HalfWidth * 0.25, 100.0, 1000.0);
         const double BedWeight = 1.0 - Smooth01(
             (Distance - (HalfWidth - BedFeather)) /
@@ -7140,22 +7213,18 @@ static FMaterialWaterWeights SampleMaterialWaterWeights(
         const bool bInside = IsInsidePolygon(
             Position, Lake.Shoreline, &EdgeDistance
         );
-        const double ShoreWeight = 1.0 - Smooth01(
-            EdgeDistance / SafeLakeShoreWidth
-        );
-        Result.LakeShore = FMath::Max(
-            Result.LakeShore,
-            static_cast<float>(ShoreWeight)
-        );
-
         if (bInside)
         {
-            const double BedFeather = FMath::Clamp(
-                SafeLakeShoreWidth * 0.2, 100.0, 2000.0
+            Result.LakeBed = 1.0f;
+        }
+        else if (EdgeDistance < SafeLakeShoreWidth)
+        {
+            const double ShoreWeight = 1.0 - Smooth01(
+                EdgeDistance / SafeLakeShoreWidth
             );
-            Result.LakeBed = FMath::Max(
-                Result.LakeBed,
-                static_cast<float>(Smooth01(EdgeDistance / BedFeather))
+            Result.LakeShore = FMath::Max(
+                Result.LakeShore,
+                static_cast<float>(ShoreWeight)
             );
         }
     }
@@ -7186,8 +7255,15 @@ public:
             {
                 Bounds += FVector2D(Point);
             }
+            double MaximumFullWidth = River.Width;
+            for (double PointWidth : River.PointWidths)
+            {
+                MaximumFullWidth = FMath::Max(
+                    MaximumFullWidth, PointWidth
+                );
+            }
             const double Radius =
-                FMath::Max(100.0, River.Width * 0.5)
+                FMath::Max(100.0, MaximumFullWidth * 0.5)
                 + FMath::Max(100.0, MaterialRiverBankWidth);
             RiverMaterialBounds.Add(
                 River.Points.IsEmpty() ? Bounds : Bounds.ExpandBy(Radius)
@@ -7302,7 +7378,7 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("d614db31-c728-4a73-9057-ea2225098c7f")); }
+    static FGuid Version() { return FGuid(TEXT("4c76be4e-7a77-42f1-a5ce-b48b40dfa61b")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -7847,7 +7923,14 @@ static void EnforceDownhillRiverNetwork(
     }
 }
 
-static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVector>& Points, double FullWidth, double Depth)
+static void ConfigureRiverSpline(
+    UWaterSplineComponent& Spline,
+    const TArray<FVector>& Points,
+    const TArray<double>& PointWidths,
+    const TArray<double>& PointDepths,
+    double FallbackFullWidth,
+    double FallbackDepth
+)
 {
     ConfigureWaterSpline(Spline, Points, false);
     for (int32 Index = 0; Index < Points.Num(); ++Index)
@@ -7877,10 +7960,18 @@ static void ConfigureRiverSpline(UWaterSplineComponent& Spline, const TArray<FVe
     if (Metadata)
     {
         Metadata->Fixup(Spline.GetNumberOfSplinePoints(), &Spline);
-        const float MetadataWidth = static_cast<float>(FMath::Max(100.0, FullWidth));
-        const float WaterDepth = static_cast<float>(FMath::Max(1.0, Depth));
         for (int32 Index = 0; Index < Spline.GetNumberOfSplinePoints(); ++Index)
         {
+            const float MetadataWidth = static_cast<float>(FMath::Max(
+                100.0,
+                PointWidths.IsValidIndex(Index)
+                    ? PointWidths[Index] : FallbackFullWidth
+            ));
+            const float WaterDepth = static_cast<float>(FMath::Max(
+                1.0,
+                PointDepths.IsValidIndex(Index)
+                    ? PointDepths[Index] : FallbackDepth
+            ));
             if (Metadata->RiverWidth.Points.IsValidIndex(Index))
             {
                 Metadata->RiverWidth.Points[Index].OutVal = MetadataWidth;
@@ -8494,6 +8585,8 @@ bool AAvenorStripTerrainGenerator::BakeData(const TSharedPtr<const FAvenorStripD
     {
         FAvenorBakedRiverReach& Target = Asset->Rivers.AddDefaulted_GetRef();
         Target.Points = Source.Points;
+        Target.PointWidths = Source.PointWidths;
+        Target.PointDepths = Source.PointDepths;
         Target.Width = Source.Width;
         Target.Depth = Source.Depth;
         Target.BankWidth = WaterTerrain.RiverBankWidth;
@@ -8621,6 +8714,8 @@ TSharedPtr<const FAvenorStripData> AAvenorStripTerrainGenerator::LoadBakedData()
     {
         FRiverReach& Target = Data->Rivers.AddDefaulted_GetRef();
         Target.Points = Source.Points;
+        Target.PointWidths = Source.PointWidths;
+        Target.PointDepths = Source.PointDepths;
         Target.Width = Source.Width;
         Target.Depth = Source.Depth;
         Target.ValleyHalfWidth = Source.ValleyHalfWidth;
@@ -8927,8 +9022,12 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             OwnerTag))
         {
             ConfigureRiverSpline(
-                *River->GetWaterBodyComponent()->GetWaterSpline(), RiverPoints,
-                Reach.Width, Reach.Depth
+                *River->GetWaterBodyComponent()->GetWaterSpline(),
+                RiverPoints,
+                Reach.PointWidths,
+                Reach.PointDepths,
+                Reach.Width,
+                Reach.Depth
             );
             // Diagnostic mode: deliberately do not attach a native River
             // Modifier or perform a second-stage channel carve. The base
