@@ -229,6 +229,23 @@ public:
 };
 
 /**
+ * Final-priority material-channel pass. It runs after all refinement/remesh
+ * modifiers so newly-created water-edge vertices receive hydrology weights.
+ */
+UCLASS(ClassGroup = (Avenor), meta = (BlueprintSpawnableComponent))
+class AVENOREDITOR_API UAvenorHydrologyChannelModifier
+    : public UE::MeshPartition::UModifierComponent
+{
+    GENERATED_BODY()
+
+public:
+    virtual TArray<FBox> ComputeBounds() const override;
+    virtual TSharedPtr<const UE::MeshPartition::IModifierBackgroundOp>
+        CreateBackgroundOp(UE::MeshPartition::EBuildType BuildType) const override;
+    virtual FGuid GetCodeVersionKey() const override;
+};
+
+/**
  * Editor-only strip-world builder.
  *
  * Pipeline: broad landforms -> erosion -> drainage analysis -> Water Body
@@ -325,6 +342,9 @@ public:
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Status")
     TObjectPtr<UAvenorStripTerrainModifier> TerrainModifier = nullptr;
+
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Avenor|Status")
+    TObjectPtr<UAvenorHydrologyChannelModifier> HydrologyChannelModifier = nullptr;
 
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Avenor|Status")
     TObjectPtr<UProceduralMeshComponent> FastPreviewMesh = nullptr;
