@@ -7135,7 +7135,8 @@ static FMaterialWaterWeights SampleMaterialWaterWeights(
     double RiverBankWidth,
     double LakeShoreWidth,
     const TArray<FBox2D>& RiverMaterialBounds,
-    const TArray<FBox2D>& LakeMaterialBounds
+    const TArray<FBox2D>& LakeMaterialBounds,
+    const TArray<TArray<FVector>>& LakeMaterialPolygons
 )
 {
     FMaterialWaterWeights Result;
@@ -7201,8 +7202,8 @@ static FMaterialWaterWeights SampleMaterialWaterWeights(
 
     for (int32 LakeIndex = 0; LakeIndex < Data.Lakes.Num(); ++LakeIndex)
     {
-        const FAvenorBakedLakeBasin& Lake = Data.Lakes[LakeIndex];
-        if (Lake.Shoreline.Num() < 3
+        if (!LakeMaterialPolygons.IsValidIndex(LakeIndex)
+            || LakeMaterialPolygons[LakeIndex].Num() < 3
             || !LakeMaterialBounds.IsValidIndex(LakeIndex)
             || !LakeMaterialBounds[LakeIndex].IsInside(Position))
         {
@@ -7211,7 +7212,7 @@ static FMaterialWaterWeights SampleMaterialWaterWeights(
 
         double EdgeDistance = TNumericLimits<double>::Max();
         const bool bInside = IsInsidePolygon(
-            Position, Lake.Shoreline, &EdgeDistance
+            Position, LakeMaterialPolygons[LakeIndex], &EdgeDistance
         );
         if (bInside)
         {
@@ -7241,6 +7242,7 @@ public:
     {
         RiverMaterialBounds.Reset();
         LakeMaterialBounds.Reset();
+        LakeMaterialPolygons.Reset();
         const UAvenorTerrainData* Data = TerrainData.Get();
         if (!Data)
         {
@@ -7271,15 +7273,64 @@ public:
         }
 
         LakeMaterialBounds.Reserve(Data->Lakes.Num());
+        LakeMaterialPolygons.Reserve(Data->Lakes.Num());
         for (const FAvenorBakedLakeBasin& Lake : Data->Lakes)
         {
+            TArray<FVector>& Polygon =
+                LakeMaterialPolygons.AddDefaulted_GetRef();
+            constexpr int32 SamplesPerLakeSegment = 12;
+            const int32 PointCount = Lake.Shoreline.Num();
+            if (PointCount >= 3)
+            {
+                Polygon.Reserve(PointCount * SamplesPerLakeSegment);
+                for (int32 SegmentIndex = 0;
+                     SegmentIndex < PointCount; ++SegmentIndex)
+                {
+                    const int32 PreviousIndex =
+                        (SegmentIndex - 1 + PointCount) % PointCount;
+                    const int32 NextIndex =
+                        (SegmentIndex + 1) % PointCount;
+                    const int32 FollowingIndex =
+                        (SegmentIndex + 2) % PointCount;
+                    const FVector2D A(Lake.Shoreline[SegmentIndex]);
+                    const FVector2D B(Lake.Shoreline[NextIndex]);
+                    const FVector2D TangentA = (
+                        FVector2D(Lake.Shoreline[NextIndex])
+                        - FVector2D(Lake.Shoreline[PreviousIndex])
+                    ) * 0.5;
+                    const FVector2D TangentB = (
+                        FVector2D(Lake.Shoreline[FollowingIndex])
+                        - FVector2D(Lake.Shoreline[SegmentIndex])
+                    ) * 0.5;
+                    for (int32 SampleIndex = 0;
+                         SampleIndex < SamplesPerLakeSegment; ++SampleIndex)
+                    {
+                        const double Alpha =
+                            static_cast<double>(SampleIndex)
+                            / SamplesPerLakeSegment;
+                        const double Alpha2 = Alpha * Alpha;
+                        const double Alpha3 = Alpha2 * Alpha;
+                        const double H00 = 2.0 * Alpha3 - 3.0 * Alpha2 + 1.0;
+                        const double H10 = Alpha3 - 2.0 * Alpha2 + Alpha;
+                        const double H01 = -2.0 * Alpha3 + 3.0 * Alpha2;
+                        const double H11 = Alpha3 - Alpha2;
+                        const FVector2D CurvePoint =
+                            A * H00 + TangentA * H10
+                            + B * H01 + TangentB * H11;
+                        Polygon.Add(FVector(
+                            CurvePoint.X, CurvePoint.Y, 0.0
+                        ));
+                    }
+                }
+            }
+
             FBox2D Bounds(ForceInit);
-            for (const FVector& Point : Lake.Shoreline)
+            for (const FVector& Point : Polygon)
             {
                 Bounds += FVector2D(Point);
             }
             LakeMaterialBounds.Add(
-                Lake.Shoreline.IsEmpty()
+                Polygon.IsEmpty()
                     ? Bounds
                     : Bounds.ExpandBy(FMath::Max(100.0, MaterialLakeShoreWidth))
             );
@@ -7362,7 +7413,8 @@ public:
                     MaterialRiverBankWidth,
                     MaterialLakeShoreWidth,
                     RiverMaterialBounds,
-                    LakeMaterialBounds
+                    LakeMaterialBounds,
+                    LakeMaterialPolygons
                 );
             MeshView.SetVertexAttributeWeight(RiverBedChannel, Vertex, WaterWeights.RiverBed);
             MeshView.SetVertexAttributeWeight(RiverBankChannel, Vertex, WaterWeights.RiverBank);
@@ -7378,7 +7430,7 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("4c76be4e-7a77-42f1-a5ce-b48b40dfa61b")); }
+    static FGuid Version() { return FGuid(TEXT("590ce353-3701-4bec-b5ed-881a9b2149ad")); }
 
     FBox WorldBounds = FBox(ForceInit);
     double BaseWorldZ = 0.0;
@@ -7386,6 +7438,7 @@ public:
     double MaterialLakeShoreWidth = 6000.0;
     TArray<FBox2D> RiverMaterialBounds;
     TArray<FBox2D> LakeMaterialBounds;
+    TArray<TArray<FVector>> LakeMaterialPolygons;
     TStrongObjectPtr<UAvenorTerrainData> TerrainData;
 };
 
