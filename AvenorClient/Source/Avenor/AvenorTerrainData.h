@@ -135,6 +135,15 @@ struct AVENOR_API FAvenorBakedRiverReach
     UPROPERTY(VisibleAnywhere, Category = "River")
     TArray<FVector> Points;
 
+    /** Full wet-channel width at each spline control point. */
+    UPROPERTY(VisibleAnywhere, Category = "River")
+    TArray<double> PointWidths;
+
+    /** Water depth at each spline control point. */
+    UPROPERTY(VisibleAnywhere, Category = "River")
+    TArray<double> PointDepths;
+
+    /** Maximum/fallback full width for legacy baked data and broad bounds. */
     UPROPERTY(VisibleAnywhere, Category = "River")
     double Width = 500.0;
 
