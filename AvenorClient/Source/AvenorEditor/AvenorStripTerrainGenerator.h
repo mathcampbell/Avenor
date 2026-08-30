@@ -9,6 +9,8 @@
 struct FAvenorStripData;
 class UProceduralMeshComponent;
 class UAvenorTerrainData;
+class UMaterialInterface;
+class URuntimeVirtualTexture;
 
 UENUM(BlueprintType)
 enum class EAvenorStripLongAxis : uint8
@@ -288,6 +290,7 @@ public:
     void RefreshMeshTerrainInPlace();
     void ClearFastPreview();
     void ClearGeneratedWater();
+    void ClearGeneratedHydrologyMaskWriters();
     void ClearGeneratedRefinementSplines();
 
     FBox GetGenerationBounds() const;
@@ -324,6 +327,12 @@ public:
 
     UPROPERTY(EditAnywhere, Category = "Avenor|Water", meta = (ShowOnlyInnerProperties))
     FAvenorWaterTerrainSettings WaterTerrain;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Material Masks", meta = (ToolTip = "Runtime Virtual Texture receiving the topology-independent river/lake material masks. Use Base Color, Normal, Roughness, Specular format. BaseColor RGB stores RiverBed, RiverBank and LakeBed; Roughness stores LakeShore."))
+    TObjectPtr<URuntimeVirtualTexture> HydrologyRuntimeVirtualTexture = nullptr;
+
+    UPROPERTY(EditAnywhere, Category = "Avenor|Material Masks", meta = (ToolTip = "Additive, two-sided RVT writer material used by the generated invisible hydrology ribbon meshes. Feed Vertex Color RGB to Runtime Virtual Texture Output Base Color and Vertex Color A to Roughness."))
+    TObjectPtr<UMaterialInterface> HydrologyRuntimeVirtualTextureWriterMaterial = nullptr;
 
     UPROPERTY(EditAnywhere, AdvancedDisplay, Category = "Avenor|Refinement", meta = (ShowOnlyInnerProperties))
     FAvenorTerrainRefinementSettings Refinement;
