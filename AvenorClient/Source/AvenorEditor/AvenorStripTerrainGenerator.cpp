@@ -13,6 +13,7 @@
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Materials/MaterialInterface.h"
 #include "Modules/ModuleManager.h"
 #include "MeshPartition.h"
 #include "MeshPartitionMeshView.h"
@@ -32,6 +33,8 @@
 #include "WaterBrushEffects.h"
 #include "WaterCurveSettings.h"
 #include "WaterFalloffSettings.h"
+#include "VT/RuntimeVirtualTexture.h"
+#include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
@@ -48,6 +51,7 @@ namespace UE::Avenor::Strip
 {
 static const FName GeneratedWaterTag(TEXT("AvenorStripWater"));
 static const FName GeneratedRefinementTag(TEXT("AvenorStripRefinement"));
+static const FName GeneratedHydrologyMaskTag(TEXT("AvenorStripHydrologyMask"));
 static const FName ElevationChannel(TEXT("Elevation"));
 static const FName SlopeChannel(TEXT("Slope"));
 static const FName WetnessChannel(TEXT("Wetness"));
@@ -9208,6 +9212,7 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
     {
         return;
     }
+    ClearGeneratedHydrologyMaskWriters();
     const FName OwnerTag = MakeWaterOwnerTag(*this);
     TArray<AWaterBody*> ToDelete;
     for (TActorIterator<AWaterBody> It(World); It; ++It)
@@ -9233,6 +9238,39 @@ void AAvenorStripTerrainGenerator::ClearGeneratedWater()
 #endif
 }
 
+void AAvenorStripTerrainGenerator::ClearGeneratedHydrologyMaskWriters()
+{
+#if WITH_EDITOR
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+    const FName OwnerTag = MakeWaterOwnerTag(*this);
+    TArray<AActor*> ToDelete;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (!It->Tags.Contains(GeneratedHydrologyMaskTag))
+        {
+            continue;
+        }
+        bool bHasAnyOwnerTag = false;
+        for (const FName& Tag : It->Tags)
+        {
+            bHasAnyOwnerTag |= IsWaterOwnerTag(Tag);
+        }
+        if (It->Tags.Contains(OwnerTag) || !bHasAnyOwnerTag)
+        {
+            ToDelete.Add(*It);
+        }
+    }
+    for (AActor* Writer : ToDelete)
+    {
+        World->EditorDestroyActor(Writer, true);
+    }
+#endif
+}
+
 // ConfigureWaterTerrainSettings expects the transition width outside the
 // WaterBody spline edge, not a total radius from the centreline. Passing
 // half the water width again here double-counted the channel and produced a
@@ -9245,6 +9283,485 @@ static double ComputeRiverBankTransitionWidth(const FRiverReach& Reach)
         return FMath::Clamp(Reach.Width * 0.18, 150.0, 800.0);
     }
     return FMath::Clamp(Reach.Width * 0.08, 100.0, 400.0);
+}
+
+struct FAvenorHydrologyRvtMesh
+{
+    TArray<FVector> Vertices;
+    TArray<int32> Triangles;
+    TArray<FVector> Normals;
+    TArray<FVector2D> UVs;
+    TArray<FLinearColor> Colors;
+    TArray<FProcMeshTangent> Tangents;
+
+    int32 AddVertex(const FVector& Position, const FLinearColor& Color)
+    {
+        const int32 Index = Vertices.Add(Position);
+        Normals.Add(FVector::UpVector);
+        UVs.Add(FVector2D::ZeroVector);
+        Colors.Add(Color);
+        Tangents.Add(FProcMeshTangent(FVector::ForwardVector, false));
+        return Index;
+    }
+
+    void AddTriangle(int32 A, int32 B, int32 C)
+    {
+        const FVector2D AB(Vertices[B] - Vertices[A]);
+        const FVector2D AC(Vertices[C] - Vertices[A]);
+        if (FVector2D::CrossProduct(AB, AC) < 0.0)
+        {
+            Swap(B, C);
+        }
+        Triangles.Add(A);
+        Triangles.Add(B);
+        Triangles.Add(C);
+    }
+
+    void AddQuad(int32 A, int32 B, int32 C, int32 D)
+    {
+        AddTriangle(A, B, C);
+        AddTriangle(C, B, D);
+    }
+
+    bool IsEmpty() const
+    {
+        return Vertices.IsEmpty() || Triangles.IsEmpty();
+    }
+};
+
+static void AddRiverRvtRibbon(
+    FAvenorHydrologyRvtMesh& Mesh,
+    const TArray<FVector>& Points,
+    const TArray<double>& PointWidths,
+    double FallbackFullWidth,
+    double BankWidth
+)
+{
+    if (Points.Num() < 2)
+    {
+        return;
+    }
+
+    constexpr int32 CrossSectionVertices = 6;
+    const int32 StartVertex = Mesh.Vertices.Num();
+    const FLinearColor Clear(0.0f, 0.0f, 0.0f, 0.0f);
+    const FLinearColor BankOnly(0.0f, 1.0f, 0.0f, 0.0f);
+    const FLinearColor BedAndBank(1.0f, 1.0f, 0.0f, 0.0f);
+    for (int32 PointIndex = 0; PointIndex < Points.Num(); ++PointIndex)
+    {
+        const FVector2D Previous(Points[FMath::Max(0, PointIndex - 1)]);
+        const FVector2D Next(Points[FMath::Min(Points.Num() - 1, PointIndex + 1)]);
+        FVector2D Tangent = (Next - Previous).GetSafeNormal();
+        if (Tangent.IsNearlyZero())
+        {
+            Tangent = FVector2D(1.0, 0.0);
+        }
+        const FVector2D Normal(-Tangent.Y, Tangent.X);
+        const double FullWidth = FMath::Max(
+            200.0,
+            PointWidths.IsValidIndex(PointIndex)
+                ? PointWidths[PointIndex] : FallbackFullWidth
+        );
+        const double HalfWidth = FullWidth * 0.5;
+        const double BedFeather = FMath::Clamp(
+            HalfWidth * 0.25, 100.0, 1000.0
+        );
+        const double InnerBedRadius = FMath::Max(
+            0.0, HalfWidth - BedFeather
+        );
+        const double OuterRadius = HalfWidth + FMath::Max(100.0, BankWidth);
+        const double Offsets[CrossSectionVertices] = {
+            -OuterRadius,
+            -HalfWidth,
+            -InnerBedRadius,
+            InnerBedRadius,
+            HalfWidth,
+            OuterRadius
+        };
+        const FLinearColor CrossColors[CrossSectionVertices] = {
+            Clear, BankOnly, BedAndBank,
+            BedAndBank, BankOnly, Clear
+        };
+        for (int32 CrossIndex = 0;
+             CrossIndex < CrossSectionVertices; ++CrossIndex)
+        {
+            FVector Position = Points[PointIndex];
+            Position.X += Normal.X * Offsets[CrossIndex];
+            Position.Y += Normal.Y * Offsets[CrossIndex];
+            Position.Z += 100.0;
+            Mesh.AddVertex(Position, CrossColors[CrossIndex]);
+        }
+    }
+
+    for (int32 PointIndex = 0;
+         PointIndex + 1 < Points.Num(); ++PointIndex)
+    {
+        const int32 RowA = StartVertex
+            + PointIndex * CrossSectionVertices;
+        const int32 RowB = RowA + CrossSectionVertices;
+        for (int32 CrossIndex = 0;
+             CrossIndex + 1 < CrossSectionVertices; ++CrossIndex)
+        {
+            Mesh.AddQuad(
+                RowA + CrossIndex,
+                RowB + CrossIndex,
+                RowA + CrossIndex + 1,
+                RowB + CrossIndex + 1
+            );
+        }
+    }
+}
+
+static double HydrologyPolygonSignedArea(const TArray<FVector>& Polygon)
+{
+    double Area = 0.0;
+    for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+    {
+        const FVector2D A(Polygon[Index]);
+        const FVector2D B(Polygon[(Index + 1) % Polygon.Num()]);
+        Area += A.X * B.Y - B.X * A.Y;
+    }
+    return Area * 0.5;
+}
+
+static bool IsPointInsideHydrologyTriangle(
+    const FVector2D& Point,
+    const FVector2D& A,
+    const FVector2D& B,
+    const FVector2D& C
+)
+{
+    constexpr double Epsilon = 0.01;
+    const double AB = FVector2D::CrossProduct(B - A, Point - A);
+    const double BC = FVector2D::CrossProduct(C - B, Point - B);
+    const double CA = FVector2D::CrossProduct(A - C, Point - C);
+    return AB >= -Epsilon && BC >= -Epsilon && CA >= -Epsilon;
+}
+
+static void AddLakeRvtGeometry(
+    FAvenorHydrologyRvtMesh& FillMesh,
+    FAvenorHydrologyRvtMesh& ShoreMesh,
+    const TArray<FVector>& SourceShoreline,
+    double SurfaceHeight,
+    double TerrainBaseWorldZ,
+    double ShoreWidth
+)
+{
+    TArray<FVector> Polygon = SourceShoreline;
+    if (Polygon.Num() > 3
+        && FVector2D::Distance(
+            FVector2D(Polygon[0]), FVector2D(Polygon.Last())
+        ) < 1.0)
+    {
+        Polygon.Pop(EAllowShrinking::No);
+    }
+    if (Polygon.Num() < 3)
+    {
+        return;
+    }
+
+    const bool bCounterClockwise =
+        HydrologyPolygonSignedArea(Polygon) >= 0.0;
+    const int32 FillStart = FillMesh.Vertices.Num();
+    for (const FVector& SourcePoint : Polygon)
+    {
+        FillMesh.AddVertex(
+            FVector(
+                SourcePoint.X,
+                SourcePoint.Y,
+                TerrainBaseWorldZ + SurfaceHeight + 80.0
+            ),
+            FLinearColor(0.0f, 0.0f, 1.0f, 0.0f)
+        );
+    }
+
+    TArray<int32> Remaining;
+    Remaining.Reserve(Polygon.Num());
+    if (bCounterClockwise)
+    {
+        for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+        {
+            Remaining.Add(Index);
+        }
+    }
+    else
+    {
+        for (int32 Index = Polygon.Num() - 1; Index >= 0; --Index)
+        {
+            Remaining.Add(Index);
+        }
+    }
+
+    int32 EarGuard = Polygon.Num() * Polygon.Num();
+    while (Remaining.Num() > 3 && EarGuard-- > 0)
+    {
+        bool bRemovedEar = false;
+        for (int32 EarIndex = 0;
+             EarIndex < Remaining.Num(); ++EarIndex)
+        {
+            const int32 Previous = Remaining[
+                (EarIndex - 1 + Remaining.Num()) % Remaining.Num()
+            ];
+            const int32 Current = Remaining[EarIndex];
+            const int32 Next = Remaining[
+                (EarIndex + 1) % Remaining.Num()
+            ];
+            const FVector2D A(Polygon[Previous]);
+            const FVector2D B(Polygon[Current]);
+            const FVector2D C(Polygon[Next]);
+            if (FVector2D::CrossProduct(B - A, C - A) <= 0.01)
+            {
+                continue;
+            }
+            bool bContainsPoint = false;
+            for (int32 Test : Remaining)
+            {
+                if (Test == Previous || Test == Current || Test == Next)
+                {
+                    continue;
+                }
+                if (IsPointInsideHydrologyTriangle(
+                    FVector2D(Polygon[Test]), A, B, C
+                ))
+                {
+                    bContainsPoint = true;
+                    break;
+                }
+            }
+            if (bContainsPoint)
+            {
+                continue;
+            }
+            FillMesh.AddTriangle(
+                FillStart + Previous,
+                FillStart + Current,
+                FillStart + Next
+            );
+            Remaining.RemoveAt(EarIndex, 1, EAllowShrinking::No);
+            bRemovedEar = true;
+            break;
+        }
+        if (!bRemovedEar)
+        {
+            break;
+        }
+    }
+    if (Remaining.Num() == 3)
+    {
+        FillMesh.AddTriangle(
+            FillStart + Remaining[0],
+            FillStart + Remaining[1],
+            FillStart + Remaining[2]
+        );
+    }
+
+    const int32 ShoreStart = ShoreMesh.Vertices.Num();
+    const double SafeShoreWidth = FMath::Max(100.0, ShoreWidth);
+    for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+    {
+        const FVector2D Previous(Polygon[
+            (Index - 1 + Polygon.Num()) % Polygon.Num()
+        ]);
+        const FVector2D Current(Polygon[Index]);
+        const FVector2D Next(Polygon[(Index + 1) % Polygon.Num()]);
+        FVector2D Incoming = (Current - Previous).GetSafeNormal();
+        FVector2D Outgoing = (Next - Current).GetSafeNormal();
+        if (Incoming.IsNearlyZero())
+        {
+            Incoming = Outgoing;
+        }
+        if (Outgoing.IsNearlyZero())
+        {
+            Outgoing = Incoming;
+        }
+        const double WindingSign = bCounterClockwise ? 1.0 : -1.0;
+        const FVector2D PreviousOutward(
+            Incoming.Y * WindingSign,
+            -Incoming.X * WindingSign
+        );
+        const FVector2D NextOutward(
+            Outgoing.Y * WindingSign,
+            -Outgoing.X * WindingSign
+        );
+        FVector2D Miter =
+            (PreviousOutward + NextOutward).GetSafeNormal();
+        if (Miter.IsNearlyZero())
+        {
+            Miter = NextOutward;
+        }
+        const double Denominator = FMath::Max(
+            0.25,
+            FMath::Abs(FVector2D::DotProduct(Miter, NextOutward))
+        );
+        const double MiterDistance = FMath::Min(
+            SafeShoreWidth * 4.0,
+            SafeShoreWidth / Denominator
+        );
+        const double Z = TerrainBaseWorldZ + SurfaceHeight + 100.0;
+        ShoreMesh.AddVertex(
+            FVector(Current.X, Current.Y, Z),
+            FLinearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        );
+        ShoreMesh.AddVertex(
+            FVector(
+                Current.X + Miter.X * MiterDistance,
+                Current.Y + Miter.Y * MiterDistance,
+                Z
+            ),
+            FLinearColor(0.0f, 0.0f, 0.0f, 0.0f)
+        );
+    }
+    for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+    {
+        const int32 NextIndex = (Index + 1) % Polygon.Num();
+        ShoreMesh.AddQuad(
+            ShoreStart + Index * 2,
+            ShoreStart + Index * 2 + 1,
+            ShoreStart + NextIndex * 2,
+            ShoreStart + NextIndex * 2 + 1
+        );
+    }
+}
+
+static bool SpawnHydrologyRvtWriter(
+    AAvenorStripTerrainGenerator& Generator,
+    const FAvenorStripData& Data,
+    const TArray<TArray<FVector>>& ProjectedRiverPoints
+)
+{
+    UWorld* World = Generator.GetWorld();
+    if (!World || !Generator.HydrologyRuntimeVirtualTexture
+        || !Generator.HydrologyRuntimeVirtualTextureWriterMaterial)
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Avenor hydrology RVT writer skipped: assign both Hydrology Runtime Virtual Texture and Hydrology Runtime Virtual Texture Writer Material on the terrain generator.")
+        );
+        return false;
+    }
+
+    FAvenorHydrologyRvtMesh RiverMesh;
+    FAvenorHydrologyRvtMesh LakeFillMesh;
+    FAvenorHydrologyRvtMesh LakeShoreMesh;
+    for (int32 RiverIndex = 0;
+         RiverIndex < Data.Rivers.Num(); ++RiverIndex)
+    {
+        if (!ProjectedRiverPoints.IsValidIndex(RiverIndex))
+        {
+            continue;
+        }
+        const FRiverReach& River = Data.Rivers[RiverIndex];
+        AddRiverRvtRibbon(
+            RiverMesh,
+            ProjectedRiverPoints[RiverIndex],
+            River.PointWidths,
+            River.Width,
+            Generator.WaterTerrain.MaterialRiverBankWidth
+        );
+    }
+    for (const FLakeBasin& Lake : Data.Lakes)
+    {
+        AddLakeRvtGeometry(
+            LakeFillMesh,
+            LakeShoreMesh,
+            Lake.Shoreline,
+            Lake.SurfaceHeight,
+            Generator.GetActorLocation().Z,
+            Generator.WaterTerrain.MaterialLakeShoreWidth
+        );
+    }
+
+    if (RiverMesh.IsEmpty() && LakeFillMesh.IsEmpty()
+        && LakeShoreMesh.IsEmpty())
+    {
+        return false;
+    }
+
+    AActor* WriterActor = World->SpawnActor<AActor>(
+        AActor::StaticClass(), FTransform::Identity
+    );
+    if (!WriterActor)
+    {
+        return false;
+    }
+    WriterActor->SetActorLabel(TEXT("Avenor_Hydrology_RVT_Writer"));
+    WriterActor->SetFolderPath(TEXT("Avenor/Generated/MaterialMasks"));
+    WriterActor->Tags.AddUnique(GeneratedHydrologyMaskTag);
+    WriterActor->Tags.AddUnique(MakeWaterOwnerTag(Generator));
+    WriterActor->SetActorEnableCollision(false);
+
+    USceneComponent* Root = NewObject<USceneComponent>(
+        WriterActor,
+        USceneComponent::StaticClass(),
+        TEXT("HydrologyRvtRoot"),
+        RF_Transactional
+    );
+    WriterActor->SetRootComponent(Root);
+    WriterActor->AddInstanceComponent(Root);
+    Root->SetMobility(EComponentMobility::Static);
+    Root->RegisterComponent();
+
+    UProceduralMeshComponent* MaskMesh =
+        NewObject<UProceduralMeshComponent>(
+            WriterActor,
+            UProceduralMeshComponent::StaticClass(),
+            TEXT("HydrologyRvtMesh"),
+            RF_Transactional
+        );
+    MaskMesh->SetupAttachment(Root);
+    WriterActor->AddInstanceComponent(MaskMesh);
+    MaskMesh->SetMobility(EComponentMobility::Static);
+    MaskMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    MaskMesh->SetGenerateOverlapEvents(false);
+    MaskMesh->SetCanEverAffectNavigation(false);
+    MaskMesh->SetCastShadow(false);
+    MaskMesh->RuntimeVirtualTextures.Add(
+        Generator.HydrologyRuntimeVirtualTexture
+    );
+    MaskMesh->VirtualTextureRenderPassType =
+        ERuntimeVirtualTextureMainPassType::Exclusive;
+    MaskMesh->RegisterComponent();
+
+    int32 SectionIndex = 0;
+    auto CreateSection = [&](const FAvenorHydrologyRvtMesh& Section)
+    {
+        if (Section.IsEmpty())
+        {
+            return;
+        }
+        MaskMesh->CreateMeshSection_LinearColor(
+            SectionIndex,
+            Section.Vertices,
+            Section.Triangles,
+            Section.Normals,
+            Section.UVs,
+            Section.Colors,
+            Section.Tangents,
+            false
+        );
+        MaskMesh->SetMaterial(
+            SectionIndex,
+            Generator.HydrologyRuntimeVirtualTextureWriterMaterial
+        );
+        ++SectionIndex;
+    };
+    CreateSection(RiverMesh);
+    CreateSection(LakeFillMesh);
+    CreateSection(LakeShoreMesh);
+
+    MaskMesh->MarkRenderStateDirty();
+    MaskMesh->MarkPackageDirty();
+    WriterActor->MarkPackageDirty();
+    UE_LOG(
+        LogTemp,
+        Display,
+        TEXT("Avenor hydrology RVT writer generated: %d river vertices, %d lake-bed vertices, %d lake-shore vertices."),
+        RiverMesh.Vertices.Num(),
+        LakeFillMesh.Vertices.Num(),
+        LakeShoreMesh.Vertices.Num()
+    );
+    return true;
 }
 
 void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAvenorStripData>& Data)
@@ -9393,6 +9910,7 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ReroutedRiverPoints
         );
     }
+    SpawnHydrologyRvtWriter(*this, *Data, ProjectedRiverPoints);
 #endif
 }
 
