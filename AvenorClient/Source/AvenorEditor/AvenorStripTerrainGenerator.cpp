@@ -7612,10 +7612,10 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("44c9e50d-b436-4ba3-8585-dcc7440cf126")); }
+    static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("ad47503b-33d5-4ef4-a101-ae45fd96312b"));
+        return FGuid(TEXT("3198cf9d-da4b-4278-b990-2f2aab54a375"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -9660,13 +9660,19 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
     Progress.EnterProgressFrame(1.0f, FText::FromString(TEXT("Placing spline remesh modifiers")));
 
     const FName OwnerTag = MakeWaterOwnerTag(*this);
-    const double SourceMeshWorldZ = TargetMeshPartition->GetActorLocation().Z;
+    const double TerrainBaseWorldZ = GetActorLocation().Z;
     auto ToRemeshPoints = [&](const TArray<FVector>& Source)
     {
         TArray<FVector> Result = Source;
         for (FVector& Point : Result)
         {
-            Point.Z = SourceMeshWorldZ;
+            // Baked feature Z is terrain-relative, exactly like the points
+            // consumed by CreateWaterActors. Preserve that height and add the
+            // generator's world datum. Flattening every refinement spline to
+            // the Mesh Partition actor's Z placed its 3D influence tube well
+            // below elevated terrain, so the remesher had no triangles to
+            // tessellate and hydrology was painted onto the coarse base grid.
+            Point.Z += TerrainBaseWorldZ;
         }
         return Result;
     };
