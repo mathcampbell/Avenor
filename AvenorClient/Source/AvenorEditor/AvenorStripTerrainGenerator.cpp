@@ -7612,10 +7612,10 @@ public:
     }
 
     // Mesh Partition's DDC must be invalidated whenever channel generation changes.
-    static FGuid Version() { return FGuid(TEXT("d2dcc5be-af51-41f4-bb8a-db18332ff0b8")); }
+    static FGuid Version() { return FGuid(TEXT("44c9e50d-b436-4ba3-8585-dcc7440cf126")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("167e882d-a7c2-4572-b069-8bcfa5746c41"));
+        return FGuid(TEXT("ad47503b-33d5-4ef4-a101-ae45fd96312b"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -9124,11 +9124,22 @@ bool AAvenorStripTerrainGenerator::BindModifiersAndRefresh(bool bShowFailureDial
             for (UE::MeshPartition::USplineRemeshModifier* Modifier : Modifiers)
             {
                 Modifier->Modify();
-                Modifier->UpdateSplineData();
                 Modifier->SetAffectedMeshPartition(nullptr);
                 Modifier->BP_SetAffectedMegaMesh(TargetMeshPartition);
                 Modifier->SetPriorityLayer(PriorityLayers.Last());
                 Modifier->SetPriority(0.0);
+
+                // Update after the target partition and ordering are final.
+                // The previous order updated the spline while it was still
+                // detached, and unlike the water/hydrology modifiers never
+                // sent PostEditChange. That allowed Mesh Partition to reuse
+                // the coarse 250k-vertex section instead of tessellating the
+                // river and shore envelope.
+                Modifier->UpdateSplineData();
+                Modifier->PostEditChange();
+                Modifier->ReregisterComponent();
+                Modifier->UpdateSplineData();
+                Modifier->MarkPackageDirty();
                 ++BoundRefinementModifiers;
             }
         }
@@ -9564,8 +9575,15 @@ static bool SpawnRefinementSpline(
         World.EditorDestroyActor(RefinementActor, true);
         return false;
     }
+    // Register only after every tessellation and spline property has been
+    // assigned, then explicitly notify the experimental Mesh Partition
+    // pipeline. Without the editor notification UE 5.8 can retain the
+    // unrefined section even though the modifier component exists.
     Modifier->RegisterComponent();
     Modifier->UpdateSplineData();
+    Modifier->PostEditChange();
+    Modifier->MarkPackageDirty();
+    RefinementActor->MarkPackageDirty();
     return true;
 }
 #endif
