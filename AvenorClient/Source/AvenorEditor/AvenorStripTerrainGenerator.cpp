@@ -36,6 +36,10 @@
 #include "VT/RuntimeVirtualTexture.h"
 #include "Components/SceneComponent.h"
 #include "Components/SplineComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
 #include "ProceduralMeshComponent.h"
 #include "Modifiers/MeshPartitionSplineRemeshModifier.h"
 #include "Modifiers/MeshPartitionRemeshModifier.h"
@@ -9329,6 +9333,134 @@ struct FAvenorHydrologyRvtMesh
     }
 };
 
+
+static UStaticMesh* BuildHydrologyRvtStaticMesh(
+    UObject* Outer,
+    const TArray<const FAvenorHydrologyRvtMesh*>& Sections,
+    UMaterialInterface* Material
+)
+{
+    if (!Outer || !Material)
+    {
+        return nullptr;
+    }
+
+    FMeshDescription MeshDescription;
+    FStaticMeshAttributes Attributes(MeshDescription);
+    Attributes.Register();
+
+    TVertexAttributesRef<FVector3f> VertexPositions =
+        Attributes.GetVertexPositions();
+    TVertexInstanceAttributesRef<FVector3f> VertexInstanceNormals =
+        Attributes.GetVertexInstanceNormals();
+    TVertexInstanceAttributesRef<FVector3f> VertexInstanceTangents =
+        Attributes.GetVertexInstanceTangents();
+    TVertexInstanceAttributesRef<float> VertexInstanceBinormalSigns =
+        Attributes.GetVertexInstanceBinormalSigns();
+    TVertexInstanceAttributesRef<FVector4f> VertexInstanceColors =
+        Attributes.GetVertexInstanceColors();
+    TVertexInstanceAttributesRef<FVector2f> VertexInstanceUVs =
+        Attributes.GetVertexInstanceUVs();
+    VertexInstanceUVs.SetNumChannels(1);
+
+    FPolygonGroupID PolygonGroup = MeshDescription.CreatePolygonGroup();
+    int32 AddedTriangles = 0;
+    for (const FAvenorHydrologyRvtMesh* Section : Sections)
+    {
+        if (!Section || Section->IsEmpty())
+        {
+            continue;
+        }
+
+        TArray<FVertexID> VertexIds;
+        VertexIds.SetNumUninitialized(Section->Vertices.Num());
+        for (int32 VertexIndex = 0;
+             VertexIndex < Section->Vertices.Num();
+             ++VertexIndex)
+        {
+            const FVertexID VertexId = MeshDescription.CreateVertex();
+            VertexIds[VertexIndex] = VertexId;
+            VertexPositions[VertexId] =
+                FVector3f(Section->Vertices[VertexIndex]);
+        }
+
+        for (int32 TriangleIndex = 0;
+             TriangleIndex + 2 < Section->Triangles.Num();
+             TriangleIndex += 3)
+        {
+            const int32 SourceIndices[3] = {
+                Section->Triangles[TriangleIndex],
+                Section->Triangles[TriangleIndex + 1],
+                Section->Triangles[TriangleIndex + 2]
+            };
+            if (!VertexIds.IsValidIndex(SourceIndices[0])
+                || !VertexIds.IsValidIndex(SourceIndices[1])
+                || !VertexIds.IsValidIndex(SourceIndices[2]))
+            {
+                continue;
+            }
+
+            TArray<FVertexInstanceID, TInlineAllocator<3>> VertexInstances;
+            for (int32 Corner = 0; Corner < 3; ++Corner)
+            {
+                const int32 SourceIndex = SourceIndices[Corner];
+                const FVertexInstanceID InstanceId =
+                    MeshDescription.CreateVertexInstance(
+                        VertexIds[SourceIndex]
+                    );
+                const FLinearColor& Color = Section->Colors[SourceIndex];
+                VertexInstanceNormals[InstanceId] =
+                    FVector3f(Section->Normals[SourceIndex]);
+                VertexInstanceTangents[InstanceId] = FVector3f(
+                    Section->Tangents[SourceIndex].TangentX
+                );
+                VertexInstanceBinormalSigns[InstanceId] =
+                    Section->Tangents[SourceIndex].bFlipTangentY
+                        ? -1.0f : 1.0f;
+                VertexInstanceColors[InstanceId] = FVector4f(
+                    Color.R, Color.G, Color.B, Color.A
+                );
+                VertexInstanceUVs.Set(
+                    InstanceId, 0, FVector2f(Section->UVs[SourceIndex])
+                );
+                VertexInstances.Add(InstanceId);
+            }
+            MeshDescription.CreatePolygon(PolygonGroup, VertexInstances);
+            ++AddedTriangles;
+        }
+    }
+
+    if (AddedTriangles == 0)
+    {
+        return nullptr;
+    }
+
+    UStaticMesh* StaticMesh = NewObject<UStaticMesh>(
+        Outer, NAME_None, RF_Transient
+    );
+    StaticMesh->GetStaticMaterials().Add(
+        FStaticMaterial(
+            Material,
+            TEXT("HydrologyRVTWriter"),
+            TEXT("HydrologyRVTWriter")
+        )
+    );
+
+    UStaticMesh::FBuildMeshDescriptionsParams BuildParams;
+    BuildParams.bBuildSimpleCollision = false;
+    BuildParams.bFastBuild = true;
+    BuildParams.bCommitMeshDescription = false;
+    BuildParams.bMarkPackageDirty = false;
+
+    TArray<const FMeshDescription*> MeshDescriptions;
+    MeshDescriptions.Add(&MeshDescription);
+    StaticMesh->BuildFromMeshDescriptions(
+        MeshDescriptions, BuildParams
+    );
+    StaticMesh->CalculateExtendedBounds();
+    return StaticMesh;
+}
+
 static void AddRiverRvtRibbon(
     FAvenorHydrologyRvtMesh& Mesh,
     const TArray<FVector>& Points,
@@ -9702,16 +9834,32 @@ static bool SpawnHydrologyRvtWriter(
     Root->SetMobility(EComponentMobility::Static);
     Root->RegisterComponent();
 
-    UProceduralMeshComponent* MaskMesh =
-        NewObject<UProceduralMeshComponent>(
+    TArray<const FAvenorHydrologyRvtMesh*> Sections;
+    Sections.Add(&RiverMesh);
+    Sections.Add(&LakeFillMesh);
+    Sections.Add(&LakeShoreMesh);
+    UStaticMesh* StaticMaskMesh = BuildHydrologyRvtStaticMesh(
+        WriterActor,
+        Sections,
+        Generator.HydrologyRuntimeVirtualTextureWriterMaterial
+    );
+    if (!StaticMaskMesh)
+    {
+        World->EditorDestroyActor(WriterActor, true);
+        return false;
+    }
+
+    UStaticMeshComponent* MaskMesh =
+        NewObject<UStaticMeshComponent>(
             WriterActor,
-            UProceduralMeshComponent::StaticClass(),
+            UStaticMeshComponent::StaticClass(),
             TEXT("HydrologyRvtMesh"),
             RF_Transactional
         );
     MaskMesh->SetupAttachment(Root);
     WriterActor->AddInstanceComponent(MaskMesh);
     MaskMesh->SetMobility(EComponentMobility::Static);
+    MaskMesh->SetStaticMesh(StaticMaskMesh);
     MaskMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     MaskMesh->SetGenerateOverlapEvents(false);
     MaskMesh->SetCanEverAffectNavigation(false);
@@ -9722,34 +9870,6 @@ static bool SpawnHydrologyRvtWriter(
     MaskMesh->VirtualTextureRenderPassType =
         ERuntimeVirtualTextureMainPassType::Exclusive;
     MaskMesh->RegisterComponent();
-
-    int32 SectionIndex = 0;
-    auto CreateSection = [&](const FAvenorHydrologyRvtMesh& Section)
-    {
-        if (Section.IsEmpty())
-        {
-            return;
-        }
-        MaskMesh->CreateMeshSection_LinearColor(
-            SectionIndex,
-            Section.Vertices,
-            Section.Triangles,
-            Section.Normals,
-            Section.UVs,
-            Section.Colors,
-            Section.Tangents,
-            false
-        );
-        MaskMesh->SetMaterial(
-            SectionIndex,
-            Generator.HydrologyRuntimeVirtualTextureWriterMaterial
-        );
-        ++SectionIndex;
-    };
-    CreateSection(RiverMesh);
-    CreateSection(LakeFillMesh);
-    CreateSection(LakeShoreMesh);
-
     MaskMesh->MarkRenderStateDirty();
     MaskMesh->MarkPackageDirty();
     WriterActor->MarkPackageDirty();
