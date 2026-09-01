@@ -9860,6 +9860,12 @@ static bool SpawnHydrologyRvtWriter(
     WriterActor->AddInstanceComponent(MaskMesh);
     MaskMesh->SetMobility(EComponentMobility::Static);
     MaskMesh->SetStaticMesh(StaticMaskMesh);
+    // The generated mesh owns a material slot, but make the component
+    // override explicit. This guarantees the RVT render proxy uses the
+    // writer material even when the transient static mesh is rebuilt.
+    MaskMesh->SetMaterial(
+        0, Generator.HydrologyRuntimeVirtualTextureWriterMaterial
+    );
     MaskMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     MaskMesh->SetGenerateOverlapEvents(false);
     MaskMesh->SetCanEverAffectNavigation(false);
@@ -9870,13 +9876,20 @@ static bool SpawnHydrologyRvtWriter(
     MaskMesh->VirtualTextureRenderPassType =
         ERuntimeVirtualTextureMainPassType::Exclusive;
     MaskMesh->RegisterComponent();
-    MaskMesh->MarkRenderStateDirty();
+    // Force a fresh static-mesh scene proxy after all RVT state, geometry and
+    // the explicit material override are in place. This is required when a
+    // writer is regenerated in an already-open World Partition editor world.
+    MaskMesh->RecreateRenderState_Concurrent();
     MaskMesh->MarkPackageDirty();
     WriterActor->MarkPackageDirty();
     UE_LOG(
         LogTemp,
         Display,
-        TEXT("Avenor hydrology RVT writer generated: %d river vertices, %d lake-bed vertices, %d lake-shore vertices."),
+        TEXT("Avenor hydrology RVT writer generated and registered: %s | component %s | %d sections | %d RVT bindings | %d river vertices, %d lake-bed vertices, %d lake-shore vertices."),
+        *WriterActor->GetPathName(),
+        *MaskMesh->GetPathName(),
+        MaskMesh->GetNumMaterials(),
+        MaskMesh->RuntimeVirtualTextures.Num(),
         RiverMesh.Vertices.Num(),
         LakeFillMesh.Vertices.Num(),
         LakeShoreMesh.Vertices.Num()
