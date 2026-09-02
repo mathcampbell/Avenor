@@ -9461,6 +9461,87 @@ static UStaticMesh* BuildHydrologyRvtStaticMesh(
     return StaticMesh;
 }
 
+// The WaterBody spline uses this exact tangent rule. Reusing it for the RVT
+// writer means the riverbed/bank mask follows the visible water curve instead
+// of cutting across each pair of hydrology control points as a straight strip.
+static FVector GetRiverSplineTangent(
+    const TArray<FVector>& Points,
+    int32 PointIndex
+)
+{
+    const int32 PreviousIndex = FMath::Max(0, PointIndex - 1);
+    const int32 NextIndex = FMath::Min(Points.Num() - 1, PointIndex + 1);
+    FVector Tangent = (Points[NextIndex] - Points[PreviousIndex]) * 0.5;
+    if (PointIndex == 0 && Points.Num() > 1)
+    {
+        Tangent = Points[1] - Points[0];
+    }
+    else if (PointIndex + 1 == Points.Num() && Points.Num() > 1)
+    {
+        Tangent = Points[PointIndex] - Points[PointIndex - 1];
+    }
+    Tangent.Z = 0.0;
+    return Tangent;
+}
+
+static void ResampleRiverRvtSpline(
+    const TArray<FVector>& ControlPoints,
+    const TArray<double>& ControlWidths,
+    double FallbackFullWidth,
+    TArray<FVector>& OutPoints,
+    TArray<double>& OutWidths
+)
+{
+    OutPoints.Reset();
+    OutWidths.Reset();
+    if (ControlPoints.Num() < 2)
+    {
+        return;
+    }
+
+    // This is only render geometry written to the RVT. At 2.5 m it is smooth
+    // at normal viewing distance, but remains inexpensive at world scale.
+    constexpr double SampleSpacingCm = 250.0;
+    for (int32 SegmentIndex = 0;
+         SegmentIndex + 1 < ControlPoints.Num();
+         ++SegmentIndex)
+    {
+        const FVector& Start = ControlPoints[SegmentIndex];
+        const FVector& End = ControlPoints[SegmentIndex + 1];
+        const FVector StartTangent = GetRiverSplineTangent(
+            ControlPoints, SegmentIndex
+        );
+        const FVector EndTangent = GetRiverSplineTangent(
+            ControlPoints, SegmentIndex + 1
+        );
+        const int32 Steps = FMath::Max(
+            1,
+            FMath::CeilToInt(
+                FVector::Distance(Start, End) / SampleSpacingCm
+            )
+        );
+        const double StartWidth = ControlWidths.IsValidIndex(SegmentIndex)
+            ? ControlWidths[SegmentIndex] : FallbackFullWidth;
+        const double EndWidth = ControlWidths.IsValidIndex(SegmentIndex + 1)
+            ? ControlWidths[SegmentIndex + 1] : FallbackFullWidth;
+
+        for (int32 StepIndex = 0; StepIndex <= Steps; ++StepIndex)
+        {
+            if (SegmentIndex > 0 && StepIndex == 0)
+            {
+                continue;
+            }
+
+            const float Alpha = static_cast<float>(StepIndex)
+                / static_cast<float>(Steps);
+            OutPoints.Add(FMath::CubicInterp(
+                Start, StartTangent, End, EndTangent, Alpha
+            ));
+            OutWidths.Add(FMath::Lerp(StartWidth, EndWidth, Alpha));
+        }
+    }
+}
+
 static void AddRiverRvtRibbon(
     FAvenorHydrologyRvtMesh& Mesh,
     const TArray<FVector>& Points,
@@ -9469,7 +9550,12 @@ static void AddRiverRvtRibbon(
     double BankWidth
 )
 {
-    if (Points.Num() < 2)
+    TArray<FVector> CurvePoints;
+    TArray<double> CurveWidths;
+    ResampleRiverRvtSpline(
+        Points, PointWidths, FallbackFullWidth, CurvePoints, CurveWidths
+    );
+    if (CurvePoints.Num() < 2)
     {
         return;
     }
@@ -9479,10 +9565,14 @@ static void AddRiverRvtRibbon(
     const FLinearColor Clear(0.0f, 0.0f, 0.0f, 0.0f);
     const FLinearColor BankOnly(0.0f, 1.0f, 0.0f, 0.0f);
     const FLinearColor BedAndBank(1.0f, 1.0f, 0.0f, 0.0f);
-    for (int32 PointIndex = 0; PointIndex < Points.Num(); ++PointIndex)
+    for (int32 PointIndex = 0; PointIndex < CurvePoints.Num(); ++PointIndex)
     {
-        const FVector2D Previous(Points[FMath::Max(0, PointIndex - 1)]);
-        const FVector2D Next(Points[FMath::Min(Points.Num() - 1, PointIndex + 1)]);
+        const FVector2D Previous(
+            CurvePoints[FMath::Max(0, PointIndex - 1)]
+        );
+        const FVector2D Next(
+            CurvePoints[FMath::Min(CurvePoints.Num() - 1, PointIndex + 1)]
+        );
         FVector2D Tangent = (Next - Previous).GetSafeNormal();
         if (Tangent.IsNearlyZero())
         {
@@ -9491,8 +9581,8 @@ static void AddRiverRvtRibbon(
         const FVector2D Normal(-Tangent.Y, Tangent.X);
         const double FullWidth = FMath::Max(
             200.0,
-            PointWidths.IsValidIndex(PointIndex)
-                ? PointWidths[PointIndex] : FallbackFullWidth
+            CurveWidths.IsValidIndex(PointIndex)
+                ? CurveWidths[PointIndex] : FallbackFullWidth
         );
         const double HalfWidth = FullWidth * 0.5;
         const double BedFeather = FMath::Clamp(
@@ -9517,7 +9607,7 @@ static void AddRiverRvtRibbon(
         for (int32 CrossIndex = 0;
              CrossIndex < CrossSectionVertices; ++CrossIndex)
         {
-            FVector Position = Points[PointIndex];
+            FVector Position = CurvePoints[PointIndex];
             Position.X += Normal.X * Offsets[CrossIndex];
             Position.Y += Normal.Y * Offsets[CrossIndex];
             Position.Z += 100.0;
@@ -9526,7 +9616,8 @@ static void AddRiverRvtRibbon(
     }
 
     for (int32 PointIndex = 0;
-         PointIndex + 1 < Points.Num(); ++PointIndex)
+         PointIndex + 1 < CurvePoints.Num();
+         ++PointIndex)
     {
         const int32 RowA = StartVertex
             + PointIndex * CrossSectionVertices;
