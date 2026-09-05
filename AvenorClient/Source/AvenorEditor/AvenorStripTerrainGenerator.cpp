@@ -10,6 +10,7 @@
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "Editor.h"
 #include "Engine/Blueprint.h"
+#include "Engine/Level.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -9364,6 +9365,8 @@ static UStaticMesh* BuildHydrologyRvtStaticMesh(
     VertexInstanceUVs.SetNumChannels(1);
 
     FPolygonGroupID PolygonGroup = MeshDescription.CreatePolygonGroup();
+    Attributes.GetPolygonGroupMaterialSlotNames()[PolygonGroup] =
+        TEXT("HydrologyRVTWriter");
     int32 AddedTriangles = 0;
     for (const FAvenorHydrologyRvtMesh* Section : Sections)
     {
@@ -9435,8 +9438,10 @@ static UStaticMesh* BuildHydrologyRvtStaticMesh(
         return nullptr;
     }
 
+    // Keep the mesh as a serialized child of the writer actor. A transient
+    // mesh leaves the saved component without geometry after reopening the map.
     UStaticMesh* StaticMesh = NewObject<UStaticMesh>(
-        Outer, NAME_None, RF_Transient
+        Outer, TEXT("HydrologyRvtStaticMesh"), RF_Transactional
     );
     StaticMesh->GetStaticMaterials().Add(
         FStaticMaterial(
@@ -9448,9 +9453,11 @@ static UStaticMesh* BuildHydrologyRvtStaticMesh(
 
     UStaticMesh::FBuildMeshDescriptionsParams BuildParams;
     BuildParams.bBuildSimpleCollision = false;
-    BuildParams.bFastBuild = true;
-    BuildParams.bCommitMeshDescription = false;
-    BuildParams.bMarkPackageDirty = false;
+    // Use the editor build path and retain source bulk data so PostLoad can
+    // rebuild render data even when the derived-data cache is unavailable.
+    BuildParams.bFastBuild = false;
+    BuildParams.bCommitMeshDescription = true;
+    BuildParams.bMarkPackageDirty = true;
 
     TArray<const FMeshDescription*> MeshDescriptions;
     MeshDescriptions.Add(&MeshDescription);
@@ -9901,8 +9908,11 @@ static bool SpawnHydrologyRvtWriter(
         return false;
     }
 
+    FActorSpawnParameters SpawnParameters;
+    SpawnParameters.OverrideLevel = Generator.GetLevel();
+    SpawnParameters.ObjectFlags = RF_Transactional;
     AActor* WriterActor = World->SpawnActor<AActor>(
-        AActor::StaticClass(), FTransform::Identity
+        AActor::StaticClass(), FTransform::Identity, SpawnParameters
     );
     if (!WriterActor)
     {
@@ -9953,7 +9963,7 @@ static bool SpawnHydrologyRvtWriter(
     MaskMesh->SetStaticMesh(StaticMaskMesh);
     // The generated mesh owns a material slot, but make the component
     // override explicit. This guarantees the RVT render proxy uses the
-    // writer material even when the transient static mesh is rebuilt.
+    // writer material even when the saved static mesh is rebuilt.
     MaskMesh->SetMaterial(
         0, Generator.HydrologyRuntimeVirtualTextureWriterMaterial
     );
@@ -9973,6 +9983,10 @@ static bool SpawnHydrologyRvtWriter(
     MaskMesh->RecreateRenderState_Concurrent();
     MaskMesh->MarkPackageDirty();
     WriterActor->MarkPackageDirty();
+    if (ULevel* WriterLevel = WriterActor->GetLevel())
+    {
+        WriterLevel->MarkPackageDirty();
+    }
     UE_LOG(
         LogTemp,
         Display,
