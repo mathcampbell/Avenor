@@ -5314,92 +5314,118 @@ static bool IsHotDryBiomeAtPosition(
         0, Data.Rows - 1
     );
     const int32 Cell = Data.Index(X, Y);
-    return Data.Biome.IsValidIndex(Cell)
-        && static_cast<EAvenorBiomeClass>(Data.Biome[Cell])
-            == EAvenorBiomeClass::HotDry;
+    // DesertMask is deliberately included as well as the classified biome:
+    // the final climate pass can retain an Oasis or edge classification in a
+    // cell whose underlying terrain is still true desert. A permanent river
+    // must not use that narrow classification seam to cross the desert.
+    return (Data.Biome.IsValidIndex(Cell)
+            && static_cast<EAvenorBiomeClass>(Data.Biome[Cell])
+                == EAvenorBiomeClass::HotDry)
+        || Data.SampleGrid(Data.DesertMask, Position) > 0.42;
 }
 
-// Surface drainage should terminate on entering a true Hot Dry biome.  Oases
-// are deliberately generated first, then the selected reach is ended at that
-// pool; all other desert-bound reaches are clipped at the biome boundary.
-// This prevents a visually wet trunk river from continuing across desert
-// terrain just because its upstream catchment happened to be humid.
+// Surface drainage must not continue into true Hot Dry terrain. Oases are
+// independent local basins, not a permission for a through-going river. Test
+// every segment at sub-cell intervals because a smoothed spline can otherwise
+// leap across a narrow desert region without a control point ever landing in
+// it; cut the reach precisely at the last non-desert sample.
 static void TerminateRiversInHotDryBiomes(
-    FAvenorStripData& Data,
-    const TMap<int32, int32>& OasisLakeByReach,
-    const TMap<int32, int32>& OasisPointByReach)
+    FAvenorStripData& Data)
 {
-    int32 TerminatedAtOasis = 0;
     int32 ClippedAtBoundary = 0;
     int32 RemovedEntirely = 0;
     TArray<FRiverReach> KeptRivers;
     KeptRivers.Reserve(Data.Rivers.Num());
 
-    for (int32 ReachIndex = 0; ReachIndex < Data.Rivers.Num(); ++ReachIndex)
+    for (FRiverReach& SourceRiver : Data.Rivers)
     {
-        FRiverReach River = MoveTemp(Data.Rivers[ReachIndex]);
-        int32 FirstHotDryPoint = INDEX_NONE;
-        for (int32 PointIndex = 0; PointIndex < River.Points.Num(); ++PointIndex)
-        {
-            if (IsHotDryBiomeAtPosition(Data, FVector2D(River.Points[PointIndex])))
-            {
-                FirstHotDryPoint = PointIndex;
-                break;
-            }
-        }
-        if (FirstHotDryPoint == INDEX_NONE)
-        {
-            KeptRivers.Add(MoveTemp(River));
-            continue;
-        }
-
-        const int32* OasisLakeIndex = OasisLakeByReach.Find(ReachIndex);
-        const int32* OasisPointIndex = OasisPointByReach.Find(ReachIndex);
-        int32 KeepThrough = FirstHotDryPoint - 1;
-        if (OasisLakeIndex && OasisPointIndex
-            && Data.Lakes.IsValidIndex(*OasisLakeIndex))
-        {
-            KeepThrough = FMath::Clamp(
-                *OasisPointIndex, FirstHotDryPoint, River.Points.Num() - 1
-            );
-        }
-
-        if (KeepThrough < 1)
+        FRiverReach River = MoveTemp(SourceRiver);
+        if (River.Points.Num() < 2
+            || IsHotDryBiomeAtPosition(Data, FVector2D(River.Points[0])))
         {
             ++RemovedEntirely;
             continue;
         }
 
-        River.Points.SetNum(KeepThrough + 1);
-        River.PointWidths.SetNum(KeepThrough + 1);
-        River.PointDepths.SetNum(KeepThrough + 1);
-        if (OasisLakeIndex && Data.Lakes.IsValidIndex(*OasisLakeIndex))
+        int32 CutSegment = INDEX_NONE;
+        double CutAlpha = 0.0;
+        for (int32 SegmentIndex = 0;
+             SegmentIndex + 1 < River.Points.Num(); ++SegmentIndex)
         {
-            const FLakeBasin& Oasis = Data.Lakes[*OasisLakeIndex];
-            FVector2D ClosestShore = FVector2D(Oasis.Shoreline[0]);
-            double ClosestDistance = TNumericLimits<double>::Max();
-            for (const FVector& ShorePoint : Oasis.Shoreline)
-            {
-                const double Distance = FVector2D::DistSquared(
-                    FVector2D(River.Points.Last()), FVector2D(ShorePoint)
-                );
-                if (Distance < ClosestDistance)
-                {
-                    ClosestDistance = Distance;
-                    ClosestShore = FVector2D(ShorePoint);
-                }
-            }
-            River.Points.Last() = FVector(
-                ClosestShore.X, ClosestShore.Y, Oasis.SurfaceHeight
+            const FVector Start = River.Points[SegmentIndex];
+            const FVector End = River.Points[SegmentIndex + 1];
+            const double SegmentLength = FVector::Dist2D(Start, End);
+            const int32 Samples = FMath::Max(
+                1, FMath::CeilToInt(SegmentLength / FMath::Max(100.0, Data.CellSize * 0.35))
             );
-            River.EndLakeIndex = *OasisLakeIndex;
-            ++TerminatedAtOasis;
+            double PreviousSafeAlpha = 0.0;
+            for (int32 SampleIndex = 1;
+                 SampleIndex <= Samples; ++SampleIndex)
+            {
+                const double Alpha = static_cast<double>(SampleIndex) / Samples;
+                const FVector Candidate = FMath::Lerp(Start, End, Alpha);
+                if (!IsHotDryBiomeAtPosition(Data, FVector2D(Candidate)))
+                {
+                    PreviousSafeAlpha = Alpha;
+                    continue;
+                }
+
+                // Binary search the edge so the material bank and physical
+                // channel finish at the climate boundary rather than a full
+                // analysis-cell early.
+                double Low = PreviousSafeAlpha;
+                double High = Alpha;
+                for (int32 Iteration = 0; Iteration < 8; ++Iteration)
+                {
+                    const double Mid = (Low + High) * 0.5;
+                    const FVector MidPoint = FMath::Lerp(Start, End, Mid);
+                    if (IsHotDryBiomeAtPosition(Data, FVector2D(MidPoint)))
+                    {
+                        High = Mid;
+                    }
+                    else
+                    {
+                        Low = Mid;
+                    }
+                }
+                CutSegment = SegmentIndex;
+                CutAlpha = Low;
+                break;
+            }
+            if (CutSegment != INDEX_NONE)
+            {
+                break;
+            }
         }
-        else
+        if (CutSegment == INDEX_NONE)
         {
-            River.EndLakeIndex = INDEX_NONE;
-            ++ClippedAtBoundary;
+            KeptRivers.Add(MoveTemp(River));
+            continue;
         }
+
+        const FVector SegmentStart = River.Points[CutSegment];
+        const FVector SegmentEnd = River.Points[CutSegment + 1];
+        const double WidthA = River.PointWidths.IsValidIndex(CutSegment)
+            ? River.PointWidths[CutSegment] : River.Width;
+        const double WidthB = River.PointWidths.IsValidIndex(CutSegment + 1)
+            ? River.PointWidths[CutSegment + 1] : River.Width;
+        const double DepthA = River.PointDepths.IsValidIndex(CutSegment)
+            ? River.PointDepths[CutSegment] : River.Depth;
+        const double DepthB = River.PointDepths.IsValidIndex(CutSegment + 1)
+            ? River.PointDepths[CutSegment + 1] : River.Depth;
+        River.Points.SetNum(CutSegment + 1);
+        River.PointWidths.SetNum(CutSegment + 1);
+        River.PointDepths.SetNum(CutSegment + 1);
+        River.Points.Add(FMath::Lerp(SegmentStart, SegmentEnd, CutAlpha));
+        River.PointWidths.Add(FMath::Lerp(WidthA, WidthB, CutAlpha));
+        River.PointDepths.Add(FMath::Lerp(DepthA, DepthB, CutAlpha));
+        if (River.Points.Num() < 2)
+        {
+            ++RemovedEntirely;
+            continue;
+        }
+        River.EndLakeIndex = INDEX_NONE;
+        ++ClippedAtBoundary;
         River.Width = River.PointWidths.Last();
         River.Depth = River.PointDepths.Last();
         River.Bounds = FBox2D(ForceInit);
@@ -5411,12 +5437,12 @@ static void TerminateRiversInHotDryBiomes(
         KeptRivers.Add(MoveTemp(River));
     }
     Data.Rivers = MoveTemp(KeptRivers);
-    if (TerminatedAtOasis + ClippedAtBoundary + RemovedEntirely > 0)
+    if (ClippedAtBoundary + RemovedEntirely > 0)
     {
         UE_LOG(
             LogTemp, Display,
-            TEXT("Avenor desert drainage: %d reaches ended at oases, %d clipped at Hot Dry boundaries, %d fully discarded."),
-            TerminatedAtOasis, ClippedAtBoundary, RemovedEntirely
+            TEXT("Avenor desert drainage: %d reaches clipped at true-desert boundaries, %d fully discarded; oases remain standalone basins."),
+            ClippedAtBoundary, RemovedEntirely
         );
     }
 }
@@ -7350,9 +7376,6 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Generator.DesertOasisRadius,
             OasisLakeByReach, OasisPointByReach
         );
-        TerminateRiversInHotDryBiomes(
-            *Data, OasisLakeByReach, OasisPointByReach
-        );
     }
     if (Generator.bGenerateOcean)
     {
@@ -7369,6 +7392,13 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
     RefineClimateFromHydrology(
         *Data, AuthoritativeRiverNetwork, Generator
     );
+    // This must run after the final climate classification. In particular,
+    // river/lake moisture can change the biome state after oasis placement;
+    // evaluating earlier let spline segments survive into true Hot Dry land.
+    if (Generator.bGenerateRivers)
+    {
+        TerminateRiversInHotDryBiomes(*Data);
+    }
     return Data;
 }
 
@@ -7812,6 +7842,7 @@ public:
             int32 LakeBedVertices = 0;
             int32 LakeShoreVertices = 0;
             int32 RiverCarvedVertices = 0;
+            double MaximumAppliedRiverCarve = 0.0;
             float MaximumRiverBed = 0.0f;
             float MaximumRiverBank = 0.0f;
             float MaximumLakeBed = 0.0f;
@@ -7839,9 +7870,15 @@ public:
                             XY,
                             BaseWorldZ + static_cast<double>(FinalHeight)
                         );
-                    RiverCarvedVertices += CarvedWorldHeight
-                        < BaseWorldZ + static_cast<double>(FinalHeight) - 0.1
-                        ? 1 : 0;
+                    const double AppliedCarve = FMath::Max(
+                        0.0,
+                        BaseWorldZ + static_cast<double>(FinalHeight)
+                            - CarvedWorldHeight
+                    );
+                    RiverCarvedVertices += AppliedCarve > 0.1 ? 1 : 0;
+                    MaximumAppliedRiverCarve = FMath::Max(
+                        MaximumAppliedRiverCarve, AppliedCarve
+                    );
                     WorldPosition.Z = CarvedWorldHeight;
                     MeshView.SetVertexPos(
                         Vertex,
@@ -7897,9 +7934,10 @@ public:
                 UE_LOG(
                     LogTemp,
                     Display,
-                    TEXT("Avenor FINAL MP hydrology pass: vertices %d | river carve %d, RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | XY [%.0f, %.0f]-[%.0f, %.0f]"),
+                    TEXT("Avenor FINAL MP hydrology pass: vertices %d | river carve %d max %.1f cm, RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | XY [%.0f, %.0f]-[%.0f, %.0f]"),
                     MeshView.VertexCount(),
                     RiverCarvedVertices,
+                    MaximumAppliedRiverCarve,
                     RiverBedVertices,
                     MaximumRiverBed,
                     RiverBankVertices,
@@ -8067,7 +8105,7 @@ public:
     static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("1d553d22-7d04-4b83-9ce5-1ce84fa50924"));
+        return FGuid(TEXT("88e652b2-e100-4b30-b0e8-963b3af4f59b"));
     }
 
     bool bHydrologyChannelsOnly = false;
