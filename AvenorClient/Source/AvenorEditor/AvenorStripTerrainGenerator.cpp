@@ -10438,16 +10438,6 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             UphillRiverSegments
         );
     }
-    if (DownhillCorrections > 0)
-    {
-        UE_LOG(
-            LogTemp, Display,
-            TEXT("Avenor river terrain projection: final downhill enforcement corrected %d segments (maximum %.1f cm); %d uphill segments remain."),
-            DownhillCorrections,
-            MaximumDownhillCorrection,
-            RemainingUphillSegments
-        );
-    }
     else
     {
         LastRiverProjectionStatus = FString::Printf(
@@ -10461,6 +10451,16 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             TEXT("Avenor river terrain projection: all %d points snapped to rendered terrain; %d moved laterally to a descending surface course; none rise downstream."),
             SnappedRiverPoints,
             ReroutedRiverPoints
+        );
+    }
+    if (DownhillCorrections > 0)
+    {
+        UE_LOG(
+            LogTemp, Display,
+            TEXT("Avenor river terrain projection: final downhill enforcement corrected %d segments (maximum %.1f cm); %d uphill segments remain."),
+            DownhillCorrections,
+            MaximumDownhillCorrection,
+            RemainingUphillSegments
         );
     }
     SpawnHydrologyRvtWriter(*this, *Data, ProjectedRiverPoints);
