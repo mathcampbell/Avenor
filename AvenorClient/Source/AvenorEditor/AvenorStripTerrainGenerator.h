@@ -251,9 +251,10 @@ public:
  * Editor-only strip-world builder.
  *
  * Pipeline: broad landforms -> erosion -> drainage analysis -> Water Body
- * splines -> native Mesh Partition water modifiers. Only the broad eroded
- * surface is written by UAvenorStripTerrainModifier; water is never carved
- * twice.
+ * splines -> native Mesh Partition water modifiers. The broad modifier writes
+ * the landform; the final hydrology modifier overwrites native water heightmap
+ * shelves with Avenor's smooth, width/depth-aware river profile after local
+ * remeshing.
  */
 UCLASS(BlueprintType)
 class AVENOREDITOR_API AAvenorStripTerrainGenerator : public AActor

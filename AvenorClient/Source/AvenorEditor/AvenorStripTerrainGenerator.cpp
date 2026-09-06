@@ -7380,6 +7380,29 @@ struct FMaterialWaterWeights
     float LakeShore = 0.0f;
 };
 
+// This is intentionally a terrain profile, rather than a WaterBody falloff.
+// Natural alluvial banks normally have a much longer horizontal run than the
+// wet channel is deep; a narrow upstream stream keeps a tighter profile while
+// a trunk river gets a broad, walkable shoulder.  Canyons are the one explicit
+// exception, but even those retain a continuous (not stepped) transition.
+static double ComputePostRefinementRiverBankRun(
+    double FullWidth,
+    double Depth,
+    bool bIsCanyon
+)
+{
+    const double HalfWidth = FMath::Max(100.0, FullWidth * 0.5);
+    const double SlopeRun = FMath::Max(
+        Depth * (bIsCanyon ? 3.5 : 7.0),
+        HalfWidth * (bIsCanyon ? 0.55 : 0.90)
+    );
+    return FMath::Clamp(
+        SlopeRun,
+        bIsCanyon ? 150.0 : 250.0,
+        bIsCanyon ? 3000.0 : 10000.0
+    );
+}
+
 static FMaterialWaterWeights SampleMaterialWaterWeights(
     const UAvenorTerrainData& Data,
     const FVector2D& Position,
@@ -7492,6 +7515,7 @@ public:
     void BuildMaterialWaterBounds()
     {
         RiverMaterialBounds.Reset();
+        RiverCarveBounds.Reset();
         LakeMaterialBounds.Reset();
         LakeMaterialPolygons.Reset();
         const UAvenorTerrainData* Data = TerrainData.Get();
@@ -7501,6 +7525,7 @@ public:
         }
 
         RiverMaterialBounds.Reserve(Data->Rivers.Num());
+        RiverCarveBounds.Reserve(Data->Rivers.Num());
         for (const FAvenorBakedRiverReach& River : Data->Rivers)
         {
             FBox2D Bounds(ForceInit);
@@ -7520,6 +7545,20 @@ public:
                 + FMath::Max(100.0, MaterialRiverBankWidth);
             RiverMaterialBounds.Add(
                 River.Points.IsEmpty() ? Bounds : Bounds.ExpandBy(Radius)
+            );
+
+            double MaximumDepth = River.Depth;
+            for (double PointDepth : River.PointDepths)
+            {
+                MaximumDepth = FMath::Max(MaximumDepth, PointDepth);
+            }
+            const double CarveRadius =
+                FMath::Max(100.0, MaximumFullWidth * 0.5)
+                + ComputePostRefinementRiverBankRun(
+                    MaximumFullWidth, MaximumDepth, River.bIsCanyon
+                );
+            RiverCarveBounds.Add(
+                River.Points.IsEmpty() ? Bounds : Bounds.ExpandBy(CarveRadius)
             );
         }
 
@@ -7588,6 +7627,142 @@ public:
         }
     }
 
+    /**
+     * Computes the final river-only terrain height.  The final Mesh
+     * Partition modifier owns this so it can replace the WaterBody's coarse
+     * heightmap result after spline remeshing has created usable topology.
+     * Taking the lowest proposed channel makes shared endpoints form one
+     * continuous confluence instead of two competing end caps.
+     */
+    double SamplePostRefinementRiverHeight(
+        const UAvenorTerrainData& Data,
+        const FVector2D& Position,
+        double ExistingHeight
+    ) const
+    {
+        double Result = ExistingHeight;
+        for (int32 RiverIndex = 0; RiverIndex < Data.Rivers.Num(); ++RiverIndex)
+        {
+            const FAvenorBakedRiverReach& River = Data.Rivers[RiverIndex];
+            if (River.Points.Num() < 2
+                || !RiverCarveBounds.IsValidIndex(RiverIndex)
+                || !RiverCarveBounds[RiverIndex].IsInside(Position))
+            {
+                continue;
+            }
+
+            double NearestDistance = TNumericLimits<double>::Max();
+            int32 NearestSegment = INDEX_NONE;
+            double NearestAlpha = 0.0;
+            for (int32 PointIndex = 1;
+                 PointIndex < River.Points.Num(); ++PointIndex)
+            {
+                double SegmentAlpha = 0.0;
+                const double Distance = SegmentDistance(
+                    Position,
+                    FVector2D(River.Points[PointIndex - 1]),
+                    FVector2D(River.Points[PointIndex]),
+                    &SegmentAlpha
+                );
+                if (Distance < NearestDistance)
+                {
+                    NearestDistance = Distance;
+                    NearestSegment = PointIndex - 1;
+                    NearestAlpha = SegmentAlpha;
+                }
+            }
+            if (NearestSegment == INDEX_NONE)
+            {
+                continue;
+            }
+
+            const int32 NextPoint = NearestSegment + 1;
+            const double WidthA = River.PointWidths.IsValidIndex(NearestSegment)
+                ? River.PointWidths[NearestSegment] : River.Width;
+            const double WidthB = River.PointWidths.IsValidIndex(NextPoint)
+                ? River.PointWidths[NextPoint] : River.Width;
+            const double DepthA = River.PointDepths.IsValidIndex(NearestSegment)
+                ? River.PointDepths[NearestSegment] : River.Depth;
+            const double DepthB = River.PointDepths.IsValidIndex(NextPoint)
+                ? River.PointDepths[NextPoint] : River.Depth;
+            const double FullWidth = FMath::Max(
+                100.0, FMath::Lerp(WidthA, WidthB, NearestAlpha)
+            );
+            const double Depth = FMath::Max(
+                25.0, FMath::Lerp(DepthA, DepthB, NearestAlpha)
+            );
+            const double HalfWidth = FullWidth * 0.5;
+            const double BankRun = ComputePostRefinementRiverBankRun(
+                FullWidth, Depth, River.bIsCanyon
+            );
+            if (NearestDistance >= HalfWidth + BankRun)
+            {
+                continue;
+            }
+
+            // Small streams have a tighter V/U hybrid, while larger rivers
+            // retain a broader submerged floor. Both branches meet the dry
+            // bank with a zero-slope Smooth01 transition.
+            const double BroadChannelAlpha = Smooth01(FMath::Clamp(
+                (FullWidth - 600.0) / 4400.0, 0.0, 1.0
+            ));
+            const double EdgeDepthFraction = River.bIsCanyon
+                ? 0.65 : FMath::Lerp(0.22, 0.55, BroadChannelAlpha);
+            double CarveDepth = 0.0;
+            if (NearestDistance <= HalfWidth)
+            {
+                const double CrossAlpha = NearestDistance / HalfWidth;
+                CarveDepth = Depth * FMath::Lerp(
+                    1.0,
+                    EdgeDepthFraction,
+                    Smooth01(CrossAlpha)
+                );
+            }
+            else
+            {
+                const double BankAlpha = (NearestDistance - HalfWidth) / BankRun;
+                CarveDepth = Depth * EdgeDepthFraction
+                    * (1.0 - Smooth01(BankAlpha));
+            }
+
+            // Let a river arrive at, or leave, a lake by yielding its own
+            // profile over a generous mouth length. The lake's existing
+            // polygonal bed is already present in ExistingHeight, so this
+            // avoids a trench terminating at the shoreline.
+            const bool bAtStartLake = River.StartLakeIndex != INDEX_NONE
+                && NearestSegment == 0;
+            const bool bAtEndLake = River.EndLakeIndex != INDEX_NONE
+                && NextPoint + 1 == River.Points.Num();
+            if (bAtStartLake || bAtEndLake)
+            {
+                const FVector2D SegmentStart(River.Points[NearestSegment]);
+                const FVector2D SegmentEnd(River.Points[NextPoint]);
+                const double SegmentLength = FMath::Max(
+                    1.0, FVector2D::Distance(SegmentStart, SegmentEnd)
+                );
+                const double MouthLength = FMath::Clamp(
+                    FullWidth * 2.5, 1000.0, 12000.0
+                );
+                const double MouthFraction = FMath::Clamp(
+                    MouthLength / SegmentLength, 0.0, 1.0
+                );
+                const double EndpointAlpha = bAtStartLake
+                    ? 1.0 - NearestAlpha : NearestAlpha;
+                const double ReleaseAlpha = MouthFraction > UE_DOUBLE_SMALL_NUMBER
+                    ? Smooth01(EndpointAlpha / MouthFraction) : 1.0;
+                CarveDepth *= 1.0 - ReleaseAlpha;
+            }
+
+            const double WaterDatum = BaseWorldZ + FMath::Lerp(
+                River.Points[NearestSegment].Z,
+                River.Points[NextPoint].Z,
+                NearestAlpha
+            );
+            Result = FMath::Min(Result, WaterDatum - CarveDepth);
+        }
+        return Result;
+    }
+
     virtual void GetInstancesInBounds(const FBox& InBounds, TArray<FInstanceInfo>& OutInstances) const override
     {
         if (!WorldBounds.Intersect(InBounds))
@@ -7630,23 +7805,49 @@ public:
         }
         if (bHydrologyChannelsOnly)
         {
+            FAvenorTerrainHeightChunkCache ChunkCache;
             FBox2D SectionXYBounds(ForceInit);
             int32 RiverBedVertices = 0;
             int32 RiverBankVertices = 0;
             int32 LakeBedVertices = 0;
             int32 LakeShoreVertices = 0;
+            int32 RiverCarvedVertices = 0;
             float MaximumRiverBed = 0.0f;
             float MaximumRiverBank = 0.0f;
             float MaximumLakeBed = 0.0f;
             float MaximumLakeShore = 0.0f;
             for (int32 Vertex = 0; Vertex < MeshView.VertexCount(); ++Vertex)
             {
-                const FVector3d WorldPosition =
+                FVector3d WorldPosition =
                     MeshTransform.TransformPosition(
                         MeshView.GetVertexPos(Vertex)
                     );
                 const FVector2D XY(WorldPosition.X, WorldPosition.Y);
                 SectionXYBounds += XY;
+                // Start from the authoritative broad terrain/lake surface,
+                // rather than the preceding native WaterBody heightmap.
+                // This makes the post-refinement profile deterministic and
+                // removes the stepped shelves produced by that heightmap.
+                float FinalHeight = 0.0f;
+                if (Data->SampleFinalHeight(
+                    XY, FinalHeight, ChunkCache, nullptr
+                ))
+                {
+                    const double CarvedWorldHeight =
+                        SamplePostRefinementRiverHeight(
+                            *Data,
+                            XY,
+                            BaseWorldZ + static_cast<double>(FinalHeight)
+                        );
+                    RiverCarvedVertices += CarvedWorldHeight
+                        < BaseWorldZ + static_cast<double>(FinalHeight) - 0.1
+                        ? 1 : 0;
+                    WorldPosition.Z = CarvedWorldHeight;
+                    MeshView.SetVertexPos(
+                        Vertex,
+                        MeshTransform.InverseTransformPosition(WorldPosition)
+                    );
+                }
                 const FMaterialWaterWeights WaterWeights =
                     SampleMaterialWaterWeights(
                         *Data,
@@ -7690,14 +7891,15 @@ public:
                     MaximumLakeShore, WaterWeights.LakeShore
                 );
             }
-            if (RiverBedVertices > 0 || RiverBankVertices > 0
+            if (RiverCarvedVertices > 0 || RiverBedVertices > 0 || RiverBankVertices > 0
                 || LakeBedVertices > 0 || LakeShoreVertices > 0)
             {
                 UE_LOG(
                     LogTemp,
                     Display,
-                    TEXT("Avenor FINAL MP hydrology pass: vertices %d | RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | XY [%.0f, %.0f]-[%.0f, %.0f]"),
+                    TEXT("Avenor FINAL MP hydrology pass: vertices %d | river carve %d, RiverBed %d max %.3f, RiverBank %d max %.3f, LakeBed %d max %.3f, LakeShore %d max %.3f | XY [%.0f, %.0f]-[%.0f, %.0f]"),
                     MeshView.VertexCount(),
+                    RiverCarvedVertices,
                     RiverBedVertices,
                     MaximumRiverBed,
                     RiverBankVertices,
@@ -7865,7 +8067,7 @@ public:
     static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("3198cf9d-da4b-4278-b990-2f2aab54a375"));
+        return FGuid(TEXT("1d553d22-7d04-4b83-9ce5-1ce84fa50924"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -7874,6 +8076,7 @@ public:
     double MaterialRiverBankWidth = 3000.0;
     double MaterialLakeShoreWidth = 6000.0;
     TArray<FBox2D> RiverMaterialBounds;
+    TArray<FBox2D> RiverCarveBounds;
     TArray<FBox2D> LakeMaterialBounds;
     TArray<TArray<FVector>> LakeMaterialPolygons;
     TStrongObjectPtr<UAvenorTerrainData> TerrainData;
@@ -7985,10 +8188,18 @@ static int32 ProjectRiverSplineToRenderedTerrain(
         {
             return false;
         }
+        // The hydrology modifier may already have cut the finished channel
+        // by the time water actors are rebuilt. Never snap a water datum down
+        // onto that bed: retain the baked flow elevation (or a necessary
+        // clearance above unrelated terrain) so the water occupies the carved
+        // channel instead of following its floor.
         OutPoint = FVector(
             SourcePoint.X,
             SourcePoint.Y,
-            TerrainHit->ImpactPoint.Z + SurfaceClearance
+            FMath::Max(
+                SourcePoint.Z,
+                TerrainHit->ImpactPoint.Z + SurfaceClearance
+            )
         );
         return true;
     };
@@ -10759,11 +10970,14 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
                 RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
                 FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
             );
-        // Cover the wet channel and its bank transition. Otherwise the outer
-        // falloff ramp lands on the coarse base mesh and produces faceted,
-        // terraced banks.
+        // Cover the wet channel and the full natural bank run. The final
+        // hydrology modifier forms this profile after remeshing; if its dry
+        // shoulder falls outside this envelope it is forced onto the coarse
+        // base mesh and reads as a serrated terrace.
         const double CarveCoverageRadius =
-            River.Width * 0.5 + ComputeRiverBankTransitionWidth(River);
+            River.Width * 0.5 + ComputePostRefinementRiverBankRun(
+                River.Width, River.Depth, River.bIsCanyon
+            );
         const double CoverageRadius = River.bIsCanyon
             ? FMath::Min(
                 CarveCoverageRadius + RefinementCoverageMargin,
