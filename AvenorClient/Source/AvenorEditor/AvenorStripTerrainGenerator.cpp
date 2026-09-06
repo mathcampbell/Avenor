@@ -4827,8 +4827,14 @@ static void ExtractRivers(
         River.Points = MoveTemp(Points);
         River.PointWidths.Reserve(River.Points.Num());
         River.PointDepths.Reserve(River.Points.Num());
-        const double HeadwaterDepth = FMath::Max(
-            120.0, MaximumDepth * 0.12
+        // Do not make a headwater a small copy of a trunk river.  Natural
+        // alluvial channels obey a hydraulic-geometry relationship: width
+        // increases faster than depth as discharge builds downstream.  This
+        // keeps steep tributaries shallow enough for exposed gravel/rock and
+        // step-pool detail, while a broad downstream channel still gains the
+        // depth required for a proper river bed.
+        const double HeadwaterDepth = FMath::Clamp(
+            MaximumDepth * 0.035, 35.0, 90.0
         );
         double PreviousPointWidth = 0.0;
         double PreviousPointDepth = 0.0;
@@ -4868,11 +4874,18 @@ static void ExtractRivers(
                     HeadwaterWidth, MainRiverWidth, LocalRiverAlpha
                 )
             );
+            const double WidthFraction = FMath::Clamp(
+                PointWidth / FMath::Max(HeadwaterWidth, MainRiverWidth),
+                0.0, 1.0
+            );
+            const double HydraulicDepth = FMath::Lerp(
+                HeadwaterDepth,
+                MaximumDepth,
+                FMath::Pow(WidthFraction, 0.82)
+            );
             const double PointDepth = FMath::Max(
                 PreviousPointDepth,
-                FMath::Lerp(
-                    HeadwaterDepth, MaximumDepth, LocalRiverAlpha
-                )
+                HydraulicDepth
             );
             River.PointWidths.Add(PointWidth);
             River.PointDepths.Add(PointDepth);
@@ -4897,7 +4910,15 @@ static void ExtractRivers(
             FMath::Min(MaximumValleyDepth * 0.24, River.Depth * 0.90),
             RiverAlpha
         );
-        River.ChannelSteepness = ChannelSteepness;
+        // Small, high-gradient tributaries read as a narrow, irregular bed;
+        // lowland trunk rivers as a gentler, broader cross section.  The
+        // modifier still owns the actual smooth transition, while this data
+        // records the physically appropriate carve character per reach.
+        River.ChannelSteepness = FMath::Lerp(
+            ChannelSteepness * 1.35,
+            ChannelSteepness * 0.72,
+            RiverAlpha
+        );
         const double SteepValley = Smooth01(FMath::Clamp(
             (MeanSlope - 0.025) / 0.10, 0.0, 1.0
         ));
@@ -4938,6 +4959,77 @@ static void ExtractRivers(
         Data.Rivers.Add(MoveTemp(River));
     }
 
+    auto RemapProfilesToFinalSpline = [](
+        const TArray<FVector>& SourcePoints,
+        const TArray<double>& SourceWidths,
+        const TArray<double>& SourceDepths,
+        const TArray<FVector>& FinalPoints,
+        TArray<double>& OutWidths,
+        TArray<double>& OutDepths)
+    {
+        OutWidths.Reset(FinalPoints.Num());
+        OutDepths.Reset(FinalPoints.Num());
+        if (FinalPoints.IsEmpty())
+        {
+            return;
+        }
+        TArray<double> SourceDistance;
+        SourceDistance.SetNumZeroed(SourcePoints.Num());
+        for (int32 Index = 1; Index < SourcePoints.Num(); ++Index)
+        {
+            SourceDistance[Index] = SourceDistance[Index - 1]
+                + FVector::Distance(SourcePoints[Index - 1], SourcePoints[Index]);
+        }
+        TArray<double> FinalDistance;
+        FinalDistance.SetNumZeroed(FinalPoints.Num());
+        for (int32 Index = 1; Index < FinalPoints.Num(); ++Index)
+        {
+            FinalDistance[Index] = FinalDistance[Index - 1]
+                + FVector::Distance(FinalPoints[Index - 1], FinalPoints[Index]);
+        }
+        const double SourceLength = SourceDistance.IsEmpty() ? 0.0 : SourceDistance.Last();
+        const double FinalLength = FinalDistance.IsEmpty() ? 0.0 : FinalDistance.Last();
+        int32 SourceIndex = 0;
+        double PreviousWidth = 100.0;
+        double PreviousDepth = 1.0;
+        for (int32 Index = 0; Index < FinalPoints.Num(); ++Index)
+        {
+            const double TargetDistance = FinalLength > UE_DOUBLE_SMALL_NUMBER
+                ? SourceLength * FinalDistance[Index] / FinalLength : 0.0;
+            while (SourceIndex + 1 < SourceDistance.Num()
+                && SourceDistance[SourceIndex + 1] < TargetDistance)
+            {
+                ++SourceIndex;
+            }
+            const int32 NextSourceIndex = FMath::Min(
+                SourceIndex + 1, SourcePoints.Num() - 1
+            );
+            const double SegmentLength = SourceDistance.IsValidIndex(NextSourceIndex)
+                ? SourceDistance[NextSourceIndex] - SourceDistance[SourceIndex] : 0.0;
+            const double Alpha = SegmentLength > UE_DOUBLE_SMALL_NUMBER
+                ? FMath::Clamp(
+                    (TargetDistance - SourceDistance[SourceIndex]) / SegmentLength,
+                    0.0, 1.0
+                ) : 0.0;
+            const double WidthA = SourceWidths.IsValidIndex(SourceIndex)
+                ? SourceWidths[SourceIndex] : PreviousWidth;
+            const double WidthB = SourceWidths.IsValidIndex(NextSourceIndex)
+                ? SourceWidths[NextSourceIndex] : WidthA;
+            const double DepthA = SourceDepths.IsValidIndex(SourceIndex)
+                ? SourceDepths[SourceIndex] : PreviousDepth;
+            const double DepthB = SourceDepths.IsValidIndex(NextSourceIndex)
+                ? SourceDepths[NextSourceIndex] : DepthA;
+            PreviousWidth = FMath::Max(100.0, FMath::Max(
+                PreviousWidth, FMath::Lerp(WidthA, WidthB, Alpha)
+            ));
+            PreviousDepth = FMath::Max(1.0, FMath::Max(
+                PreviousDepth, FMath::Lerp(DepthA, DepthB, Alpha)
+            ));
+            OutWidths.Add(PreviousWidth);
+            OutDepths.Add(PreviousDepth);
+        }
+    };
+
     // This runs after all the meander/valley-following work above, on the
     // final points that decide what the water spline actually looks like -
     // at FeaturePointSpacing*4 (20m with the 5m default) it was routinely
@@ -4956,6 +5048,9 @@ static void ExtractRivers(
     );
     for (FRiverReach& River : Data.Rivers)
     {
+        const TArray<FVector> ProfileSourcePoints = River.Points;
+        const TArray<double> ProfileSourceWidths = River.PointWidths;
+        const TArray<double> ProfileSourceDepths = River.PointDepths;
         AnchorRiverToLakes(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
@@ -4963,16 +5058,25 @@ static void ExtractRivers(
             River.Points, SimplificationTolerance, false
         );
         CutOffSelfIntersections(River.Points);
-    }
-
-    // Lake endpoints retain their authoritative common water datum. All other
-    // final river-point heights are projected onto the rendered terrain after
-    // Mesh Partition has completed its terrain/refinement refresh.
-    for (FRiverReach& River : Data.Rivers)
-    {
         AddLevelLakeJunctionPads(
             Data, River.Points, River.StartLakeIndex, River.EndLakeIndex
         );
+        // Simplification and lake pads change the point count.  Keep the
+        // hydraulic profile in the same parameterisation as the final
+        // spline; otherwise narrow headwater metadata can be assigned to a
+        // wide downstream point (or vice versa).
+        RemapProfilesToFinalSpline(
+            ProfileSourcePoints, ProfileSourceWidths, ProfileSourceDepths,
+            River.Points, River.PointWidths, River.PointDepths
+        );
+        if (!River.PointWidths.IsEmpty())
+        {
+            River.Width = River.PointWidths.Last();
+        }
+        if (!River.PointDepths.IsEmpty())
+        {
+            River.Depth = River.PointDepths.Last();
+        }
         River.Bounds = FBox2D(ForceInit);
         for (const FVector& Point : River.Points)
         {
@@ -4995,9 +5099,13 @@ static void PlaceDesertOases(
     FAvenorStripData& Data,
     int32 Seed,
     int32 MaxOasisCount,
-    double OasisRadius
+    double OasisRadius,
+    TMap<int32, int32>& OutOasisLakeByReach,
+    TMap<int32, int32>& OutOasisPointByReach
 )
 {
+    OutOasisLakeByReach.Reset();
+    OutOasisPointByReach.Reset();
     if (MaxOasisCount <= 0 || Data.Rivers.Num() == 0)
     {
         return;
@@ -5062,9 +5170,10 @@ static void PlaceDesertOases(
         {
             continue;
         }
-        const FVector2D ChosenPosition(
-            Reach.Points[Candidates[Random.RandRange(0, Candidates.Num() - 1)]]
-        );
+        const int32 ChosenPointIndex = Candidates[
+            Random.RandRange(0, Candidates.Num() - 1)
+        ];
+        const FVector2D ChosenPosition(Reach.Points[ChosenPointIndex]);
 
         bool bTooClose = false;
         for (const FVector2D& Placed : PlacedPositions)
@@ -5170,7 +5279,9 @@ static void PlaceDesertOases(
         {
             Oasis.Bounds += FVector2D(ShorePoint);
         }
-        Data.Lakes.Add(MoveTemp(Oasis));
+        const int32 OasisLakeIndex = Data.Lakes.Add(MoveTemp(Oasis));
+        OutOasisLakeByReach.Add(ReachIndex, OasisLakeIndex);
+        OutOasisPointByReach.Add(ReachIndex, ChosenPointIndex);
 
         PlacedPositions.Add(ChosenPosition);
         ++PlacedCount;
@@ -5182,6 +5293,130 @@ static void PlaceDesertOases(
             LogTemp, Display,
             TEXT("Avenor desert oases: placed %d of a requested %d, along non-canyon desert river reaches."),
             PlacedCount, MaxOasisCount
+        );
+    }
+}
+
+static bool IsHotDryBiomeAtPosition(
+    const FAvenorStripData& Data,
+    const FVector2D& Position)
+{
+    if (Data.Biome.IsEmpty() || Data.Columns <= 0 || Data.Rows <= 0)
+    {
+        return false;
+    }
+    const int32 X = FMath::Clamp(
+        FMath::RoundToInt((Position.X - Data.Bounds.Min.X) / Data.CellSize),
+        0, Data.Columns - 1
+    );
+    const int32 Y = FMath::Clamp(
+        FMath::RoundToInt((Position.Y - Data.Bounds.Min.Y) / Data.CellSize),
+        0, Data.Rows - 1
+    );
+    const int32 Cell = Data.Index(X, Y);
+    return Data.Biome.IsValidIndex(Cell)
+        && static_cast<EAvenorBiomeClass>(Data.Biome[Cell])
+            == EAvenorBiomeClass::HotDry;
+}
+
+// Surface drainage should terminate on entering a true Hot Dry biome.  Oases
+// are deliberately generated first, then the selected reach is ended at that
+// pool; all other desert-bound reaches are clipped at the biome boundary.
+// This prevents a visually wet trunk river from continuing across desert
+// terrain just because its upstream catchment happened to be humid.
+static void TerminateRiversInHotDryBiomes(
+    FAvenorStripData& Data,
+    const TMap<int32, int32>& OasisLakeByReach,
+    const TMap<int32, int32>& OasisPointByReach)
+{
+    int32 TerminatedAtOasis = 0;
+    int32 ClippedAtBoundary = 0;
+    int32 RemovedEntirely = 0;
+    TArray<FRiverReach> KeptRivers;
+    KeptRivers.Reserve(Data.Rivers.Num());
+
+    for (int32 ReachIndex = 0; ReachIndex < Data.Rivers.Num(); ++ReachIndex)
+    {
+        FRiverReach River = MoveTemp(Data.Rivers[ReachIndex]);
+        int32 FirstHotDryPoint = INDEX_NONE;
+        for (int32 PointIndex = 0; PointIndex < River.Points.Num(); ++PointIndex)
+        {
+            if (IsHotDryBiomeAtPosition(Data, FVector2D(River.Points[PointIndex])))
+            {
+                FirstHotDryPoint = PointIndex;
+                break;
+            }
+        }
+        if (FirstHotDryPoint == INDEX_NONE)
+        {
+            KeptRivers.Add(MoveTemp(River));
+            continue;
+        }
+
+        const int32* OasisLakeIndex = OasisLakeByReach.Find(ReachIndex);
+        const int32* OasisPointIndex = OasisPointByReach.Find(ReachIndex);
+        int32 KeepThrough = FirstHotDryPoint - 1;
+        if (OasisLakeIndex && OasisPointIndex
+            && Data.Lakes.IsValidIndex(*OasisLakeIndex))
+        {
+            KeepThrough = FMath::Clamp(
+                *OasisPointIndex, FirstHotDryPoint, River.Points.Num() - 1
+            );
+        }
+
+        if (KeepThrough < 1)
+        {
+            ++RemovedEntirely;
+            continue;
+        }
+
+        River.Points.SetNum(KeepThrough + 1);
+        River.PointWidths.SetNum(KeepThrough + 1);
+        River.PointDepths.SetNum(KeepThrough + 1);
+        if (OasisLakeIndex && Data.Lakes.IsValidIndex(*OasisLakeIndex))
+        {
+            const FLakeBasin& Oasis = Data.Lakes[*OasisLakeIndex];
+            FVector2D ClosestShore = FVector2D(Oasis.Shoreline[0]);
+            double ClosestDistance = TNumericLimits<double>::Max();
+            for (const FVector& ShorePoint : Oasis.Shoreline)
+            {
+                const double Distance = FVector2D::DistSquared(
+                    FVector2D(River.Points.Last()), FVector2D(ShorePoint)
+                );
+                if (Distance < ClosestDistance)
+                {
+                    ClosestDistance = Distance;
+                    ClosestShore = FVector2D(ShorePoint);
+                }
+            }
+            River.Points.Last() = FVector(
+                ClosestShore.X, ClosestShore.Y, Oasis.SurfaceHeight
+            );
+            River.EndLakeIndex = *OasisLakeIndex;
+            ++TerminatedAtOasis;
+        }
+        else
+        {
+            River.EndLakeIndex = INDEX_NONE;
+            ++ClippedAtBoundary;
+        }
+        River.Width = River.PointWidths.Last();
+        River.Depth = River.PointDepths.Last();
+        River.Bounds = FBox2D(ForceInit);
+        for (const FVector& Point : River.Points)
+        {
+            River.Bounds += FVector2D(Point);
+        }
+        River.Bounds = River.Bounds.ExpandBy(River.ValleyHalfWidth);
+        KeptRivers.Add(MoveTemp(River));
+    }
+    Data.Rivers = MoveTemp(KeptRivers);
+    if (TerminatedAtOasis + ClippedAtBoundary + RemovedEntirely > 0)
+    {
+        UE_LOG(
+            LogTemp, Display,
+            TEXT("Avenor desert drainage: %d reaches ended at oases, %d clipped at Hot Dry boundaries, %d fully discarded."),
+            TerminatedAtOasis, ClippedAtBoundary, RemovedEntirely
         );
     }
 }
@@ -7108,9 +7343,15 @@ static TSharedPtr<FAvenorStripData> GenerateData(const AAvenorStripTerrainGenera
             Generator.bGenerateMesasAndCanyons, Generator.CanyonStartArea,
             Generator.RiverChannelSteepness
         );
+        TMap<int32, int32> OasisLakeByReach;
+        TMap<int32, int32> OasisPointByReach;
         PlaceDesertOases(
             *Data, Generator.Seed, Generator.MaximumDesertOases,
-            Generator.DesertOasisRadius
+            Generator.DesertOasisRadius,
+            OasisLakeByReach, OasisPointByReach
+        );
+        TerminateRiversInHotDryBiomes(
+            *Data, OasisLakeByReach, OasisPointByReach
         );
     }
     if (Generator.bGenerateOcean)
@@ -8010,7 +8251,10 @@ static void EnforceDownhillRiverNetwork(
     double& OutMaximumCorrection
 )
 {
-    constexpr double UphillTolerance = 10.0;
+    // Water may be level over a short pool, but it must never rise in its
+    // declared downstream direction.  Keep only a numerical tolerance here;
+    // this is a final safety net after the corridor solver.
+    constexpr double UphillTolerance = 0.01;
     OutCorrectedSegments = 0;
     OutRemainingUphillSegments = 0;
     OutMaximumCorrection = 0.0;
@@ -8041,7 +8285,6 @@ static void EnforceDownhillRiverNetwork(
 
         const FRiverReach& Reach = Data.Rivers[ReachIndex];
         const bool bLockedStart = Data.Lakes.IsValidIndex(Reach.StartLakeIndex);
-        const bool bLockedEnd = Data.Lakes.IsValidIndex(Reach.EndLakeIndex);
         const TArray<int32>* Incoming = ReachesEndingAt.Find(
             RiverEndpointKey(Points[0])
         );
@@ -8086,10 +8329,6 @@ static void EnforceDownhillRiverNetwork(
 
         for (int32 PointIndex = 1; PointIndex < Points.Num(); ++PointIndex)
         {
-            if (bLockedEnd && PointIndex + 1 == Points.Num())
-            {
-                continue;
-            }
             if (Points[PointIndex].Z > Points[PointIndex - 1].Z)
             {
                 const double Correction =
@@ -10110,6 +10349,22 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         ReroutedRiverPoints += ReachReroutedPoints;
     }
 
+    // Projection uses a descending corridor whenever possible, but a missed
+    // trace or a lake/confluence datum can still leave an individual rise.
+    // Run the directed-network pass on the actual rendered-terrain points
+    // which will drive both WaterBodyRiver and the RVT writer.
+    int32 DownhillCorrections = 0;
+    int32 RemainingUphillSegments = 0;
+    double MaximumDownhillCorrection = 0.0;
+    EnforceDownhillRiverNetwork(
+        *Data,
+        ProjectedRiverPoints,
+        DownhillCorrections,
+        RemainingUphillSegments,
+        MaximumDownhillCorrection
+    );
+    UphillRiverSegments += RemainingUphillSegments;
+
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
     {
         const FRiverReach& Reach = Data->Rivers[Index];
@@ -10181,6 +10436,16 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ReroutedRiverPoints,
             MissedRiverPoints,
             UphillRiverSegments
+        );
+    }
+    if (DownhillCorrections > 0)
+    {
+        UE_LOG(
+            LogTemp, Display,
+            TEXT("Avenor river terrain projection: final downhill enforcement corrected %d segments (maximum %.1f cm); %d uphill segments remain."),
+            DownhillCorrections,
+            MaximumDownhillCorrection,
+            RemainingUphillSegments
         );
     }
     else
