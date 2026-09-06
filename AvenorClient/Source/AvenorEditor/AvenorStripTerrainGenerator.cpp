@@ -10055,6 +10055,28 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 *Lake, true, Data->Lakes[Index].ModifierBedDepth,
                 Data->Lakes[Index].BankBlendWidth, WaterTerrain
             );
+            // MeshPartitionWater is the bridge between the native WaterBody
+            // and the Mesh Partition terrain.  A lake without its
+            // LakeModifier retains the legacy Water-system mesh behaviour
+            // and does not participate correctly in the Mesh Partition
+            // height/weight pipeline.
+            if (UClass* LakeModifierClass =
+                    FindWaterModifierClass(TEXT("LakeModifier")))
+            {
+                if (!AddNativeWaterModifier(
+                        *Lake,
+                        *TargetMeshPartition,
+                        PriorityLayers.Last(),
+                        *LakeModifierClass))
+                {
+                    UE_LOG(
+                        LogTemp,
+                        Error,
+                        TEXT("Avenor water: failed to attach LakeModifier to %s."),
+                        *Lake->GetActorLabel()
+                    );
+                }
+            }
             Lake->PostEditChange();
         }
     }
@@ -10105,12 +10127,40 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 Reach.Width,
                 Reach.Depth
             );
-            // Diagnostic mode: deliberately do not attach a native River
-            // Modifier or perform a second-stage channel carve. The base
-            // erosion pass owns the valley for now; the visible Water Body
-            // and its refinement spline let us validate routing, Z and width
-            // independently. A shallow bed modifier can be reintroduced once
-            // those source geometries are proven correct.
+            // The broad erosion pass establishes the valley.  Once the
+            // refinement spline has supplied local topology, the native
+            // RiverModifier adds the narrower, parameterised channel and
+            // its eased bank transition to that refined terrain.
+            ConfigureWaterTerrainSettings(
+                *River,
+                false,
+                Reach.Depth,
+                ComputeRiverBankTransitionWidth(Reach),
+                WaterTerrain
+            );
+            // A WaterBodyRiver needs the MeshPartitionWater RiverModifier to
+            // translate its spline height/shape into Mesh Partition. Without
+            // it UE falls back to the legacy Water-system path, which can
+            // produce invalid vertical water geometry over mesh terrain.
+            // The base erosion pass still owns the broad valley; this is the
+            // second, detailed carve over the refinement topology.
+            if (UClass* RiverModifierClass =
+                    FindWaterModifierClass(TEXT("RiverModifier")))
+            {
+                if (!AddNativeWaterModifier(
+                        *River,
+                        *TargetMeshPartition,
+                        PriorityLayers.Last(),
+                        *RiverModifierClass))
+                {
+                    UE_LOG(
+                        LogTemp,
+                        Error,
+                        TEXT("Avenor water: failed to attach RiverModifier to %s."),
+                        *River->GetActorLabel()
+                    );
+                }
+            }
             River->PostEditChange();
         }
     }
