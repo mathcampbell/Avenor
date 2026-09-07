@@ -7547,6 +7547,7 @@ public:
     {
         RiverMaterialBounds.Reset();
         RiverCarveBounds.Reset();
+        HydrologyFeatureBounds.Reset();
         LakeMaterialBounds.Reset();
         LakeMaterialPolygons.Reset();
         const UAvenorTerrainData* Data = TerrainData.Get();
@@ -7591,6 +7592,46 @@ public:
             RiverCarveBounds.Add(
                 River.Points.IsEmpty() ? Bounds : Bounds.ExpandBy(CarveRadius)
             );
+            // Do not use one axis-aligned box for a whole meandering river:
+            // it can cover a vast diagonal rectangle and wakes nearly every
+            // terrain section. Small groups keep the final pass spatial.
+            constexpr int32 SegmentsPerHydrologyEnvelope = 16;
+            for (int32 SegmentStart = 0;
+                 SegmentStart + 1 < River.Points.Num();
+                 SegmentStart += SegmentsPerHydrologyEnvelope)
+            {
+                const int32 SegmentEnd = FMath::Min(
+                    River.Points.Num() - 1,
+                    SegmentStart + SegmentsPerHydrologyEnvelope
+                );
+                FBox2D SegmentBounds(ForceInit);
+                double SegmentWidth = River.Width;
+                double SegmentDepth = River.Depth;
+                for (int32 PointIndex = SegmentStart;
+                     PointIndex <= SegmentEnd; ++PointIndex)
+                {
+                    SegmentBounds += FVector2D(River.Points[PointIndex]);
+                    if (River.PointWidths.IsValidIndex(PointIndex))
+                    {
+                        SegmentWidth = FMath::Max(
+                            SegmentWidth, River.PointWidths[PointIndex]
+                        );
+                    }
+                    if (River.PointDepths.IsValidIndex(PointIndex))
+                    {
+                        SegmentDepth = FMath::Max(
+                            SegmentDepth, River.PointDepths[PointIndex]
+                        );
+                    }
+                }
+                const double SegmentRadius = FMath::Max(
+                    SegmentWidth * 0.5 + MaterialRiverBankWidth,
+                    SegmentWidth * 0.5 + ComputePostRefinementRiverBankRun(
+                        SegmentWidth, SegmentDepth, River.bIsCanyon
+                    )
+                );
+                HydrologyFeatureBounds.Add(SegmentBounds.ExpandBy(SegmentRadius));
+            }
         }
 
         LakeMaterialBounds.Reserve(Data->Lakes.Num());
@@ -7655,6 +7696,10 @@ public:
                     ? Bounds
                     : Bounds.ExpandBy(FMath::Max(100.0, MaterialLakeShoreWidth))
             );
+            if (!Polygon.IsEmpty())
+            {
+                HydrologyFeatureBounds.Add(LakeMaterialBounds.Last());
+            }
         }
     }
 
@@ -7803,6 +7848,38 @@ public:
     {
         if (!WorldBounds.Intersect(InBounds))
         {
+            return;
+        }
+        if (bHydrologyChannelsOnly)
+        {
+            // Do not make the final mask/carve pass touch the whole world.
+            // It only has work inside a feature's local river/lake envelope;
+            // declaring WorldBounds here made every Mesh Partition section
+            // rebuild and tested every vertex against every river.
+            int32 InstanceID = 0;
+            for (const FBox2D& FeatureBounds : HydrologyFeatureBounds)
+            {
+                const FBox FeatureWorldBounds(
+                    FVector(FeatureBounds.Min.X, FeatureBounds.Min.Y, WorldBounds.Min.Z),
+                    FVector(FeatureBounds.Max.X, FeatureBounds.Max.Y, WorldBounds.Max.Z)
+                );
+                if (!FeatureWorldBounds.Intersect(InBounds))
+                {
+                    continue;
+                }
+                FInstanceInfo& Instance = OutInstances.AddDefaulted_GetRef();
+                Instance.InstanceID = InstanceID++;
+                Instance.Bounds = FeatureWorldBounds;
+                Instance.ReadViewComponents = UE::MeshPartition::EMeshViewComponents::VertexPos;
+                Instance.WriteViewComponents = static_cast<UE::MeshPartition::EMeshViewComponents>(
+                    UE::MeshPartition::EMeshViewComponents::VertexPos |
+                    UE::MeshPartition::EMeshViewComponents::VertexAttributeWeight
+                );
+                Instance.UsedChannels = {
+                    RiverBedChannel, RiverBankChannel,
+                    LakeBedChannel, LakeShoreChannel
+                };
+            }
             return;
         }
         FInstanceInfo& Instance = OutInstances.AddDefaulted_GetRef();
@@ -8111,7 +8188,7 @@ public:
     static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("bfea1d72-e49d-4df5-b338-678b559982d1"));
+        return FGuid(TEXT("46622659-5d5c-4e18-a8de-5d8f6b5df9f7"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -8121,6 +8198,7 @@ public:
     double MaterialLakeShoreWidth = 6000.0;
     TArray<FBox2D> RiverMaterialBounds;
     TArray<FBox2D> RiverCarveBounds;
+    TArray<FBox2D> HydrologyFeatureBounds;
     TArray<FBox2D> LakeMaterialBounds;
     TArray<TArray<FVector>> LakeMaterialPolygons;
     TStrongObjectPtr<UAvenorTerrainData> TerrainData;
@@ -8734,7 +8812,8 @@ static void ConfigureWaterTerrainSettings(
     double ChannelDepth,
     double BankOrShoreWidth,
     const FAvenorWaterTerrainSettings& Settings,
-    double EdgeOffsetScale = 1.0
+    double EdgeOffsetScale = 1.0,
+    bool bNativeTerrainCarve = true
 )
 {
     // EdgeOffsetScale narrows the flat dry-bank shelf before the falloff ramp
@@ -8754,9 +8833,16 @@ static void ConfigureWaterTerrainSettings(
         Water.GetWaterCurveSettings()
     );
     Curve.bUseCurveChannel = true;
-    Curve.ChannelDepth = static_cast<float>(FMath::Max(100.0, ChannelDepth));
+    // MeshPartitionWater still needs this WaterBody configuration to build
+    // the water surface.  Its river height operation must not also reshape
+    // the terrain though: the final Avenor modifier owns the one continuous
+    // post-refinement profile. A zero-depth native channel leaves rendering
+    // active without creating a competing coarse trench.
+    Curve.ChannelDepth = bNativeTerrainCarve
+        ? static_cast<float>(FMath::Max(100.0, ChannelDepth)) : 0.0f;
     Curve.ChannelEdgeOffset = static_cast<float>(DryBankWidth);
-    Curve.CurveRampWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
+    Curve.CurveRampWidth = bNativeTerrainCarve
+        ? static_cast<float>(FMath::Max(100.0, BankOrShoreWidth)) : 1.0f;
 
     FWaterBodyHeightmapSettings& Heightmap = const_cast<FWaterBodyHeightmapSettings&>(
         Water.GetWaterHeightmapSettings()
@@ -8768,19 +8854,25 @@ static void ConfigureWaterTerrainSettings(
         ? EWaterBrushBlendType::AlphaBlend
         : EWaterBrushBlendType::Min;
     Heightmap.FalloffSettings.FalloffMode = EWaterBrushFalloffMode::Width;
-    Heightmap.FalloffSettings.FalloffWidth = static_cast<float>(FMath::Max(100.0, BankOrShoreWidth));
+    Heightmap.FalloffSettings.FalloffWidth = bNativeTerrainCarve
+        ? static_cast<float>(FMath::Max(100.0, BankOrShoreWidth)) : 1.0f;
     Heightmap.FalloffSettings.EdgeOffset = static_cast<float>(DryBankWidth);
     Heightmap.FalloffSettings.ZOffset = 0.0f;
-    Heightmap.Effects.Blurring.bBlurShape = Settings.BlurRadius > 0;
-    Heightmap.Effects.Blurring.Radius = FMath::Clamp(Settings.BlurRadius, 0, 16);
+    Heightmap.Effects.Blurring.bBlurShape = bNativeTerrainCarve && Settings.BlurRadius > 0;
+    Heightmap.Effects.Blurring.Radius = bNativeTerrainCarve
+        ? FMath::Clamp(Settings.BlurRadius, 0, 16) : 0;
     const float Roughness = static_cast<float>(FMath::Clamp(Settings.EdgeRoughness, 0.0, 1.0));
-    Heightmap.Effects.CurlNoise.Curl1Amount = Roughness * (bLake ? 1800.0f : 600.0f);
+    Heightmap.Effects.CurlNoise.Curl1Amount = bNativeTerrainCarve
+        ? Roughness * (bLake ? 1800.0f : 600.0f) : 0.0f;
     Heightmap.Effects.CurlNoise.Curl1Tiling = bLake ? 65000.0f : 30000.0f;
-    Heightmap.Effects.CurlNoise.Curl2Amount = Roughness * (bLake ? 650.0f : 250.0f);
+    Heightmap.Effects.CurlNoise.Curl2Amount = bNativeTerrainCarve
+        ? Roughness * (bLake ? 650.0f : 250.0f) : 0.0f;
     Heightmap.Effects.CurlNoise.Curl2Tiling = bLake ? 18000.0f : 9000.0f;
     Heightmap.Effects.Displacement.DisplacementHeight = 0.0f;
-    Heightmap.Effects.SmoothBlending.InnerSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.2);
-    Heightmap.Effects.SmoothBlending.OuterSmoothDistance = static_cast<float>(BankOrShoreWidth * 0.35);
+    Heightmap.Effects.SmoothBlending.InnerSmoothDistance = bNativeTerrainCarve
+        ? static_cast<float>(BankOrShoreWidth * 0.2) : 0.0f;
+    Heightmap.Effects.SmoothBlending.OuterSmoothDistance = bNativeTerrainCarve
+        ? static_cast<float>(BankOrShoreWidth * 0.35) : 0.0f;
 
     TMap<FName, FWaterBodyWeightmapSettings>& Weightmaps =
         const_cast<TMap<FName, FWaterBodyWeightmapSettings>&>(Water.GetLayerWeightmapSettings());
@@ -10646,7 +10738,9 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
                 false,
                 Reach.Depth,
                 ComputeRiverBankTransitionWidth(Reach),
-                WaterTerrain
+                WaterTerrain,
+                1.0,
+                false
             );
             // A WaterBodyRiver needs the MeshPartitionWater RiverModifier to
             // translate its spline height/shape into Mesh Partition. Without
