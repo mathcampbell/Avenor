@@ -1,6 +1,7 @@
 #include "AvenorStripTerrainGenerator.h"
 
 #include "AvenorTerrainData.h"
+#include "AvenorRiverProfile.h"
 
 #include "Algo/Reverse.h"
 #include "ActorFactories/ActorFactory.h"
@@ -7755,6 +7756,7 @@ public:
                     * (1.0 - Smooth01(BankAlpha));
             }
 
+            double MouthWeight = 1.0;
             // Let a river arrive at, or leave, a lake by yielding its own
             // profile over a generous mouth length. The lake's existing
             // polygonal bed is already present in ExistingHeight, so this
@@ -7776,11 +7778,10 @@ public:
                 const double MouthFraction = FMath::Clamp(
                     MouthLength / SegmentLength, 0.0, 1.0
                 );
-                const double EndpointAlpha = bAtStartLake
-                    ? 1.0 - NearestAlpha : NearestAlpha;
-                const double ReleaseAlpha = MouthFraction > UE_DOUBLE_SMALL_NUMBER
-                    ? Smooth01(EndpointAlpha / MouthFraction) : 1.0;
-                CarveDepth *= 1.0 - ReleaseAlpha;
+                const double DistanceFromEndpoint = bAtStartLake
+                    ? NearestAlpha : 1.0 - NearestAlpha;
+                MouthWeight = MouthFraction > UE_DOUBLE_SMALL_NUMBER
+                    ? Smooth01(DistanceFromEndpoint / MouthFraction) : 1.0;
             }
 
             const double WaterDatum = BaseWorldZ + FMath::Lerp(
@@ -7788,7 +7789,12 @@ public:
                 River.Points[NextPoint].Z,
                 NearestAlpha
             );
-            Result = FMath::Min(Result, WaterDatum - CarveDepth);
+            const double BankAlpha = FMath::Max(
+                0.0, (NearestDistance - HalfWidth) / BankRun
+            );
+            Result = FMath::Min(Result, AvenorRiverProfile::BlendCarve(
+                ExistingHeight, WaterDatum - CarveDepth, BankAlpha, MouthWeight
+            ));
         }
         return Result;
     }
@@ -8105,7 +8111,7 @@ public:
     static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("88e652b2-e100-4b30-b0e8-963b3af4f59b"));
+        return FGuid(TEXT("bfea1d72-e49d-4df5-b338-678b559982d1"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -11008,14 +11014,18 @@ void AAvenorStripTerrainGenerator::GenerateRefinementSplines()
                 RefinementEdgeLengthHeadwater, RefinementEdgeLengthMainRiver,
                 FMath::Clamp(River.DrainageArea / FMath::Max(0.01, MainRiverArea), 0.0, 1.0)
             );
-        // Cover the wet channel and the full natural bank run. The final
-        // hydrology modifier forms this profile after remeshing; if its dry
-        // shoulder falls outside this envelope it is forced onto the coarse
-        // base mesh and reads as a serrated terrace.
+        // Keep the expensive fine remesh tightly around the wet channel.
+        // The final hydrology modifier still evaluates the full smooth bank
+        // run, but remeshing that entire outer shoulder for every reach
+        // multiplied the total refined area and made full regeneration far
+        // too slow. The existing broad terrain supplies the far-bank shape.
+        double MaximumWidth = River.Width;
+        for (double PointWidth : River.PointWidths)
+        {
+            MaximumWidth = FMath::Max(MaximumWidth, PointWidth);
+        }
         const double CarveCoverageRadius =
-            River.Width * 0.5 + ComputePostRefinementRiverBankRun(
-                River.Width, River.Depth, River.bIsCanyon
-            );
+            MaximumWidth * 0.5 + ComputeRiverBankTransitionWidth(River);
         const double CoverageRadius = River.bIsCanyon
             ? FMath::Min(
                 CarveCoverageRadius + RefinementCoverageMargin,
