@@ -112,6 +112,53 @@ static double Smooth01(double Value)
     return T * T * (3.0 - 2.0 * T);
 }
 
+// A river's longitudinal datum must be one continuous downhill profile.
+// Sampling independent terrain cells produces correct local ground contact,
+// but can turn a coarse source grid into visible terrace drops. Preserve the
+// endpoints (including confluences/lakes) and distribute the total fall by
+// travelled distance instead. This cannot introduce an uphill segment.
+static bool SmoothStrictlyDownhillRiverProfile(TArray<FVector>& Points)
+{
+    if (Points.Num() < 2)
+    {
+        return false;
+    }
+    const double StartHeight = Points[0].Z;
+    const double EndHeight = FMath::Min(
+        static_cast<double>(Points.Last().Z), StartHeight
+    );
+    TArray<double> Distances;
+    Distances.SetNumZeroed(Points.Num());
+    for (int32 Index = 1; Index < Points.Num(); ++Index)
+    {
+        Distances[Index] = Distances[Index - 1] + FVector::Dist2D(
+            Points[Index - 1], Points[Index]
+        );
+    }
+    const double TotalLength = Distances.Last();
+    if (TotalLength <= UE_DOUBLE_SMALL_NUMBER)
+    {
+        for (FVector& Point : Points)
+        {
+            Point.Z = EndHeight;
+        }
+        return true;
+    }
+    bool bChanged = false;
+    for (int32 Index = 1; Index < Points.Num(); ++Index)
+    {
+        const double Alpha = Distances[Index] / TotalLength;
+        const double SmoothedHeight = FMath::Lerp(
+            StartHeight, EndHeight, Alpha
+        );
+        bChanged |= !FMath::IsNearlyEqual(
+            static_cast<double>(Points[Index].Z), SmoothedHeight, 0.01
+        );
+        Points[Index].Z = SmoothedHeight;
+    }
+    return bChanged;
+}
+
 static double Quintic(double Value)
 {
     const double T = FMath::Clamp(Value, 0.0, 1.0);
@@ -4788,17 +4835,14 @@ static void ExtractRivers(
             false
         );
         CutOffSelfIntersections(Points);
-        // WaterSpline Z is a surface datum, while Data.Height is the final
-        // ground surface. Keep the water only a few centimetres above that
-        // sampled mesh to avoid coplanar flicker without creating a visible
-        // floating ribbon. The rendered-mesh raycast later replaces this
-        // analysis-grid estimate wherever collision data is available.
-        constexpr double RiverSurfaceClearance = 35.0;
+        // This is the pre-detail-carve river surface datum.  It must start
+        // exactly on the solved terrain surface: the later refined profile
+        // lowers the bed beneath it. An arbitrary clearance here produced
+        // floating splines and made the water overtop its intended banks.
         for (FVector& Point : Points)
         {
             const FVector2D Position(Point);
-            Point.Z = Data.SampleGrid(Data.Height, Position)
-                + RiverSurfaceClearance;
+            Point.Z = Data.SampleGrid(Data.Height, Position);
         }
         if (Data.Lakes.IsValidIndex(CandidateReach.StartLakeIndex))
         {
@@ -5070,6 +5114,7 @@ static void ExtractRivers(
             ProfileSourcePoints, ProfileSourceWidths, ProfileSourceDepths,
             River.Points, River.PointWidths, River.PointDepths
         );
+        SmoothStrictlyDownhillRiverProfile(River.Points);
         if (!River.PointWidths.IsEmpty())
         {
             River.Width = River.PointWidths.Last();
@@ -8188,7 +8233,7 @@ public:
     static FGuid Version() { return FGuid(TEXT("ed20b816-c8f5-4afb-a35c-77b10533e42a")); }
     static FGuid HydrologyVersion()
     {
-        return FGuid(TEXT("46622659-5d5c-4e18-a8de-5d8f6b5df9f7"));
+        return FGuid(TEXT("e9186842-0fbd-4fe5-9194-dffb5cf46fa0"));
     }
 
     bool bHydrologyChannelsOnly = false;
@@ -8268,7 +8313,6 @@ static int32 ProjectRiverSplineToRenderedTerrain(
     int32& OutReroutedPoints
 )
 {
-    constexpr double SurfaceClearance = 35.0;
     constexpr double TraceHalfHeight = 5000000.0;
     constexpr double UphillTolerance = 1.0;
     OutMissedPoints = 0;
@@ -8310,18 +8354,14 @@ static int32 ProjectRiverSplineToRenderedTerrain(
         {
             return false;
         }
-        // The hydrology modifier may already have cut the finished channel
-        // by the time water actors are rebuilt. Never snap a water datum down
-        // onto that bed: retain the baked flow elevation (or a necessary
-        // clearance above unrelated terrain) so the water occupies the carved
-        // channel instead of following its floor.
+        // Use the rendered terrain only to choose a viable XY route. The
+        // water elevation is restored from OriginalPoints after solving: it
+        // is the pre-detail-carve, downhill datum shared with the final
+        // terrain profile, not the already-carved bed height.
         OutPoint = FVector(
             SourcePoint.X,
             SourcePoint.Y,
-            FMath::Max(
-                SourcePoint.Z,
-                TerrainHit->ImpactPoint.Z + SurfaceClearance
-            )
+            TerrainHit->ImpactPoint.Z
         );
         return true;
     };
@@ -8510,6 +8550,10 @@ static int32 ProjectRiverSplineToRenderedTerrain(
         Points = MoveTemp(Solution);
         for (int32 Index = 0; Index < Points.Num(); ++Index)
         {
+            // Preserve the authoritative pre-detail-carve water datum. A
+            // raycast after the carve would otherwise snap this to the river
+            // floor or lift it above the bank, depending on rebuild order.
+            Points[Index].Z = OriginalPoints[Index].Z;
             const bool bLockedDatum =
                 (Index == 0 && bKeepStartDatum)
                 || (Index + 1 == Points.Num() && bKeepEndDatum);
@@ -8546,6 +8590,7 @@ static int32 ProjectRiverSplineToRenderedTerrain(
             if (TraceTerrain(OriginalPoints[Index], Grounded))
             {
                 Points[Index] = Grounded;
+                Points[Index].Z = OriginalPoints[Index].Z;
                 ++SnappedPoints;
             }
             else
@@ -8767,7 +8812,6 @@ static void ConfigureRiverSpline(
         {
             Tangent = Points[Index] - Points[Index - 1];
         }
-        Tangent.Z = 0.0;
         Spline.SetTangentsAtSplinePoint(
             Index,
             Tangent,
@@ -10710,6 +10754,31 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
         RemainingUphillSegments,
         MaximumDownhillCorrection
     );
+    int32 SmoothedRiverProfiles = 0;
+    for (TArray<FVector>& RiverPoints : ProjectedRiverPoints)
+    {
+        SmoothedRiverProfiles += SmoothStrictlyDownhillRiverProfile(
+            RiverPoints
+        ) ? 1 : 0;
+    }
+    // Keep a final network-wide guard after smoothing. The smoother preserves
+    // endpoints, so this should normally be a no-op; it is a strict safety
+    // net for malformed links or future endpoint edits.
+    int32 PostSmoothCorrections = 0;
+    int32 PostSmoothUphillSegments = 0;
+    double PostSmoothMaximumCorrection = 0.0;
+    EnforceDownhillRiverNetwork(
+        *Data,
+        ProjectedRiverPoints,
+        PostSmoothCorrections,
+        PostSmoothUphillSegments,
+        PostSmoothMaximumCorrection
+    );
+    DownhillCorrections += PostSmoothCorrections;
+    RemainingUphillSegments += PostSmoothUphillSegments;
+    MaximumDownhillCorrection = FMath::Max(
+        MaximumDownhillCorrection, PostSmoothMaximumCorrection
+    );
     UphillRiverSegments += RemainingUphillSegments;
 
     for (int32 Index = 0; Index < Data->Rivers.Num(); ++Index)
@@ -10802,11 +10871,12 @@ void AAvenorStripTerrainGenerator::CreateWaterActors(const TSharedPtr<const FAve
             ReroutedRiverPoints
         );
     }
-    if (DownhillCorrections > 0)
+    if (SmoothedRiverProfiles > 0 || DownhillCorrections > 0)
     {
         UE_LOG(
             LogTemp, Display,
-            TEXT("Avenor river terrain projection: final downhill enforcement corrected %d segments (maximum %.1f cm); %d uphill segments remain."),
+            TEXT("Avenor river terrain projection: smoothed %d longitudinal profiles; final downhill enforcement corrected %d segments (maximum %.1f cm); %d uphill segments remain."),
+            SmoothedRiverProfiles,
             DownhillCorrections,
             MaximumDownhillCorrection,
             RemainingUphillSegments
